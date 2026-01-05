@@ -21,6 +21,7 @@ const CLARIFICATIONS = [
 export default function Page() {
   const [profession, setProfession] = useState("");
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [quickReplies, setQuickReplies] = useState<string[]>([]);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [stage, setStage] = useState<Stage>("start");
@@ -39,7 +40,6 @@ export default function Page() {
 
   async function start() {
     if (!profession.trim()) return;
-
     const r = await fetch("/api/sessions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -48,28 +48,46 @@ export default function Page() {
 
     const data = await r.json();
     setSessionId(data.session_id);
-    setStage("choose_flow");
-    setMessages([
-      {
-        role: "assistant",
-        text:
-          "Привет 🙂 Отлично — получил запрос. У тебя есть готовый текст вакансии, или только список задач?",
-      },
-    ]);
+
+    // immediately call backend chat start
+    const resp = await fetch("/api/chat/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: data.session_id, type: "start" }),
+    });
+    const body = await resp.json();
+    if (body.reply) setMessages([{ role: "assistant", text: body.reply }]);
+    setQuickReplies(body.quick_replies || []);
+    if (body.should_show_free_result) setStage("free_result");
+    else if ((body.quick_replies || []).length) setStage("choose_flow");
   }
 
   function pushAssistantOnce(text: string) {
     setMessages((m) => [...m, { role: "assistant", text }]);
   }
 
+  async function sendToChat(text: string) {
+    if (!sessionId) return;
+    const r = await fetch("/api/chat/message", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: sessionId, type: "user", text }),
+    });
+    const data = await r.json();
+    if (data.reply) setMessages((m) => [...m, { role: "assistant", text: data.reply }]);
+    setQuickReplies(data.quick_replies || []);
+    if (data.should_show_free_result) setStage("free_result");
+    // try to infer stage from reply text
+    const low = (data.reply || "").toLowerCase();
+    if (low.includes("вставь") && low.includes("ваканс")) setStage("vacancy_text");
+    else if (low.includes("опиши") || low.includes("задач")) setStage("tasks");
+    else if (low.includes("уточн")) setStage("clarifications");
+  }
+
   function handleChoose(hasVacancy: boolean) {
-    if (hasVacancy) {
-      setStage("vacancy_text");
-      pushAssistantOnce("Отлично. Вставь текст вакансии сюда, я посмотрю и дам бесплатный краткий результат.");
-    } else {
-      setStage("tasks");
-      pushAssistantOnce("Хорошо. Опиши, пожалуйста, задачи — тезисно, 3–10 пунктов.");
-    }
+    const text = hasVacancy ? "Есть текст вакансии" : "Нет вакансии, есть задачи";
+    setMessages((m) => [...m, { role: "user", text }]);
+    sendToChat(text);
   }
 
   function startClarifications() {
@@ -84,52 +102,7 @@ export default function Page() {
     const trimmed = text.trim();
     setMessages((m) => [...m, { role: "user", text: trimmed }]);
     setInput("");
-
-    // реакция ассистента в зависимости от стадии
-    if (stage === "vacancy_text") {
-      setTimeout(() => {
-        pushAssistantOnce("Понял, спасибо. Нужны пара уточнений, чтобы дать полезный бесплатный результат.");
-        startClarifications();
-      }, 300);
-      return;
-    }
-
-    if (stage === "tasks") {
-      setTimeout(() => {
-        pushAssistantOnce("Отлично, получил задачи. Несколько уточнений — это поможет собрать бесплатный результат.");
-        startClarifications();
-      }, 300);
-      return;
-    }
-
-    if (stage === "clarifications") {
-      // сохраняем ответ на текущее уточнение
-      setClarAnswers((a) => {
-        const next = [...a, trimmed];
-        return next;
-      });
-
-      const nextIdx = clarIdx + 1;
-      setClarIdx(nextIdx);
-
-      if (nextIdx < CLARIFICATIONS.length) {
-        setTimeout(() => {
-          pushAssistantOnce(`Спасибо. Следующее: ${CLARIFICATIONS[nextIdx]}`);
-        }, 250);
-      } else {
-        // завершили уточнения — идём к бесплатному результату
-        setTimeout(() => {
-          pushAssistantOnce("Готово — формирую короткий бесплатный результат для тебя.");
-          setStage("free_result");
-        }, 400);
-      }
-      return;
-    }
-
-    // если уже в free_result или choose_flow, даём нейтральный отзыв
-    setTimeout(() => {
-      pushAssistantOnce("Спасибо — записал. Нажми на нужную кнопку, чтобы продолжить.");
-    }, 200);
+    sendToChat(trimmed);
   }
 
   // Enter отправляет сообщение
@@ -215,21 +188,21 @@ export default function Page() {
               </div>
             ))}
 
-            {/* быстрые кнопки для выбора потока */}
-            {stage === "choose_flow" && (
-              <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-                <button
-                  onClick={() => handleChoose(true)}
-                  style={{ padding: 8, borderRadius: 8 }}
-                >
-                  Есть текст вакансии
-                </button>
-                <button
-                  onClick={() => handleChoose(false)}
-                  style={{ padding: 8, borderRadius: 8 }}
-                >
-                  Нет вакансии, есть задачи
-                </button>
+            {/* быстрые кнопки (quick replies) */}
+            {quickReplies.length > 0 && (
+              <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+                {quickReplies.map((q, idx) => (
+                  <button
+                    key={idx}
+                    onClick={() => {
+                      setMessages((m) => [...m, { role: "user", text: q }]);
+                      sendToChat(q);
+                    }}
+                    style={{ padding: 8, borderRadius: 8 }}
+                  >
+                    {q}
+                  </button>
+                ))}
               </div>
             )}
 
