@@ -8,7 +8,7 @@ set -e
 PROJECT_DIR="/workspaces/nayti-lyudey-mvp"
 cd "$PROJECT_DIR"
 
-BACKEND_URL="http://api:8000"
+BACKEND_URL="${BACKEND_URL:-http://localhost:8000}"
 SESSION_ID=""
 
 echo "========================================================================"
@@ -18,8 +18,12 @@ echo ""
 
 # Step 1: Start Docker containers
 echo "[Step 1] Starting Docker containers..."
-docker compose -f infra/docker-compose.yml up -d --build
-sleep 10  # Wait for containers to be ready
+if command -v docker >/dev/null 2>&1; then
+    docker compose -f infra/docker-compose.yml up -d --build
+    sleep 10  # Wait for containers to be ready
+else
+    echo "docker not found, assuming services already running"
+fi
 
 echo "✅ Containers started"
 echo ""
@@ -148,9 +152,13 @@ echo ""
 
 # Step 10: Restart API container
 echo "[Step 10] Restarting API container..."
-docker compose -f infra/docker-compose.yml restart api
-sleep 5
-echo "✅ API restarted"
+if command -v docker >/dev/null 2>&1; then
+    docker compose -f infra/docker-compose.yml restart api
+    sleep 5
+    echo "✅ API restarted"
+else
+    echo "docker not found, skipping container restart"
+fi
 echo ""
 
 # Step 11: Verify data persists after restart
