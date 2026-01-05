@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  docker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & start stack
+        run: docker compose -f infra/docker-compose.yml up -d --build
+
+      - name: Wait for API
+        run: |
+          for i in {1..60}; do
+            curl -sf http://localhost:8000/health >/dev/null && break
+            sleep 2
+          done
+          curl -sf http://localhost:8000/health
+          curl -sf http://localhost:8000/health/db
+
+      - name: Stage 6 tests
+        run: bash tests/test-stage6.sh
+
+      - name: Stage 5 tests (optional, but good)
+        run: bash tests/test-stage5.sh
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f infra/docker-compose.yml down -v
