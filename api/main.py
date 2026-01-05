@@ -3,9 +3,17 @@ from pydantic import BaseModel
 import uuid
 import re
 from datetime import datetime
+from db import init_db, health_check, create_session as db_create_session
+from db import get_session, update_session, add_message, get_session_messages
 
 app = FastAPI()
 SESSIONS = {}
+
+# Initialize database on startup
+try:
+    init_db()
+except Exception as e:
+    print(f"Warning: Database initialization failed: {e}")
 
 class SessionCreate(BaseModel):
     profession_query: str
@@ -239,6 +247,22 @@ def chat_message(body: ChatMessage):
 
     # Ensure session exists
     session = ensure_session(sid)
+    
+    # Try to load from database
+    try:
+        db_session = get_session(sid)
+        if db_session:
+            session = {
+                "profession_query": db_session.get("profession_query", ""),
+                "state": db_session.get("chat_state", "awaiting_flow"),
+                "vacancy_text": None,
+                "tasks": None,
+                "clarifications": [],
+                "vacancy_kb": db_session.get("vacancy_kb", make_empty_vacancy_kb()),
+            }
+            SESSIONS[sid] = session
+    except Exception as e:
+        print(f"Warning: Failed to load session from DB: {e}")
 
     # default response
     reply = ""
@@ -252,7 +276,22 @@ def chat_message(body: ChatMessage):
         reply = "Привет 🙂 Супер, что ты решил подойти к найму спокойно. Есть текст вакансии или только описание задач?"
         quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
         should_show_free_result = False
+        
+        # Save to DB
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"])
+        except Exception as e:
+            print(f"Warning: Failed to save message to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
+
+    # Save user message
+    if text:
+        try:
+            add_message(sid, "user", text)
+        except Exception as e:
+            print(f"Warning: Failed to save user message to DB: {e}")
 
     # user messages
     if state == "awaiting_flow":
@@ -266,6 +305,13 @@ def chat_message(body: ChatMessage):
         else:
             reply = "Не совсем понял. Есть текст вакансии или только задачи?"
             quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_vacancy_text":
@@ -302,6 +348,13 @@ def chat_message(body: ChatMessage):
             reply = "Спасибо — пара уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
         else:
             reply = "Пожалуйста, вставь текст вакансии целиком (подробнее, >200 символов)."
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_tasks":
@@ -325,6 +378,13 @@ def chat_message(body: ChatMessage):
         update_meta(kb)
         
         reply = "Спасибо — пару уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_clarifications":
@@ -364,10 +424,23 @@ def chat_message(body: ChatMessage):
         
         reply = "Готово! Я собрал бесплатный результат ниже 🙂"
         should_show_free_result = True
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save final state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
 
     # fallback
     reply = "Хорошо, записал."
+    try:
+        add_message(sid, "assistant", reply)
+        update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+    except Exception as e:
+        print(f"Warning: Failed to save fallback to DB: {e}")
+    
     return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
 @app.get("/health")
@@ -375,11 +448,26 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/health/db")
+def health_db():
+    """Check database connectivity."""
+    db_ok = health_check()
+    return {"ok": db_ok}
+
+
 @app.get("/vacancy")
 def get_vacancy(session_id: str):
     """Get vacancy knowledge base for a session."""
     session = ensure_session(session_id)
     kb = session.get("vacancy_kb", make_empty_vacancy_kb())
+    
+    # Also try to load from database
+    try:
+        db_session = get_session(session_id)
+        if db_session and db_session.get("vacancy_kb"):
+            kb = db_session["vacancy_kb"]
+    except Exception as e:
+        print(f"Warning: Failed to load vacancy from DB: {e}")
     
     return {
         "session_id": session_id,
@@ -396,16 +484,45 @@ def get_free_report(session_id: str):
     kb = session.get("vacancy_kb", make_empty_vacancy_kb())
     profession_query = session.get("profession_query", "")
     
+    # Try to load from database first
+    try:
+        db_session = get_session(session_id)
+        if db_session:
+            if db_session.get("free_report"):
+                # Return cached report
+                return {
+                    "session_id": session_id,
+                    "free_report": db_session["free_report"],
+                    "cached": True,
+                    "kb_meta": {
+                        "missing_fields": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["missing_fields"],
+                        "filled_fields_count": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["filled_fields_count"],
+                    },
+                }
+            if db_session.get("vacancy_kb"):
+                kb = db_session["vacancy_kb"]
+            if db_session.get("profession_query"):
+                profession_query = db_session["profession_query"]
+    except Exception as e:
+        print(f"Warning: Failed to load report from DB: {e}")
+    
     # Generate free report
     free_report = generate_free_report(kb, profession_query)
     
-    # Optionally cache in session (but not required)
+    # Cache in session
     session["free_report"] = free_report
     session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
+    
+    # Save to database
+    try:
+        update_session(session_id, free_report=free_report)
+    except Exception as e:
+        print(f"Warning: Failed to save report to DB: {e}")
     
     return {
         "session_id": session_id,
         "free_report": free_report,
+        "cached": False,
         "generated_at_iso": session["free_report_generated_at"],
         "kb_meta": {
             "missing_fields": kb["meta"]["missing_fields"],
@@ -580,8 +697,11 @@ def generate_free_report(kb, profession_query=""):
 
 
 @app.post("/sessions")
-def create_session(body: SessionCreate):
+def create_session_endpoint(body: SessionCreate):
+    """Create a new session and persist to database."""
     session_id = str(uuid.uuid4())
+    
+    # Create in-memory session for backward compatibility
     SESSIONS[session_id] = {
         "profession_query": body.profession_query,
         "state": "awaiting_flow",
@@ -590,4 +710,12 @@ def create_session(body: SessionCreate):
         "clarifications": [],
         "vacancy_kb": make_empty_vacancy_kb(),
     }
+    
+    # Also save to database
+    try:
+        kb = make_empty_vacancy_kb()
+        db_create_session(session_id, body.profession_query, kb)
+    except Exception as e:
+        print(f"Warning: Failed to save session to DB: {e}")
+    
     return {"session_id": session_id}

@@ -1,10 +1,10 @@
-# 📑 Stage 4.1 — Complete Documentation Index
+# 📑 Stage 4.1 & Stage 5 — Complete Documentation Index
 
 ## 🎯 Start Here
 
 **First time?** → Read [STAGE4_QUICKSTART.md](stages/stage4/STAGE4_QUICKSTART.md)
 
-**Just want overview?** → Read [STAGE4_SUMMARY.md](stages/stage4/STAGE4_SUMMARY.md) (5 min)
+**Just want Stage 5 overview?** → Read [STAGE5_SUMMARY.md](stages/stage5/STAGE5_SUMMARY.md) (5 min)
 
 **Need technical details?** → Read [STAGE4_IMPLEMENTATION.md](stages/stage4/STAGE4_IMPLEMENTATION.md) (15 min)
 
@@ -20,6 +20,8 @@
 |------|------|---------|-----------|
 | **[STAGE4_SUMMARY.md](stages/stage4/STAGE4_SUMMARY.md)** | 5.3K | Executive summary with completed work checklist | 5 min |
 | **[STAGE4_IMPLEMENTATION.md](stages/stage4/STAGE4_IMPLEMENTATION.md)** | 11K | Technical architecture and implementation details | 15 min |
+| **[STAGE5_SUMMARY.md](stages/stage5/STAGE5_SUMMARY.md)** | 6.5K | Postgres persistence overview | 5 min |
+| **[STAGE5_IMPLEMENTATION.md](stages/stage5/STAGE5_IMPLEMENTATION.md)** | 12K | Database design and integration details | 15 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |
 
 ### Status & Navigation Files
@@ -36,9 +38,10 @@
 
 | File | Size | Tests | Status |
 |------|------|-------|--------|
-| **[test-free-report.py](test-free-report.py)** | 16K | 6 unit tests | ✅ 6/6 PASS |
-| **[test-stage4.sh](test-stage4.sh)** | 6.0K | 10 integration scenarios | ✅ Syntax OK |
-| **[test-parsing.py](test-parsing.py)** | 4.9K | 13 compatibility tests | ✅ 13/13 PASS |
+| **[test-free-report.py](../../tests/test-free-report.py)** | 16K | 6 unit tests | ✅ 6/6 PASS |
+| **[test-stage4.sh](../../tests/test-stage4.sh)** | 6.0K | 10 integration scenarios | ✅ Syntax OK |
+| **[test-parsing.py](../../tests/test-parsing.py)** | 4.9K | 13 compatibility tests | ✅ 13/13 PASS |
+| **[test-stage5.sh](../../tests/test-stage5.sh)** | 5.5K | Postgres persistence test | ✅ NEW |
 
 ---
 
