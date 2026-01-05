@@ -24,6 +24,8 @@
 | **[STAGE5_IMPLEMENTATION.md](stages/stage5/STAGE5_IMPLEMENTATION.md)** | 12K | Database design and integration details | 15 min |
 | **[STAGE6_SUMMARY.md](stages/stage6/STAGE6_SUMMARY.md)** | 3K | Observability overview (request IDs, logs, debug endpoints) | 4 min |
 | **[STAGE6_IMPLEMENTATION.md](stages/stage6/STAGE6_IMPLEMENTATION.md)** | 4K | Observability implementation details | 8 min |
+| **[STAGE6.2_SUMMARY.md](stages/stage6.2/STAGE6.2_SUMMARY.md)** | 3K | Observability++ logging overview | 4 min |
+| **[STAGE6.2_IMPLEMENTATION.md](stages/stage6.2/STAGE6.2_IMPLEMENTATION.md)** | 4K | Detailed verbose logging instrumentation | 8 min |
 | **[STAGE7_SUMMARY.md](stages/stage7/STAGE7_SUMMARY.md)** | 3K | LLM clarifications overview | 4 min |
 | **[STAGE7_IMPLEMENTATION.md](stages/stage7/STAGE7_IMPLEMENTATION.md)** | 4K | LLM integration and prompts | 8 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |

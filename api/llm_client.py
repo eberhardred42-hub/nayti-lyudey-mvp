@@ -86,9 +86,11 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
     _log_event(
         "llm_response",
         provider="openai_compat",
+        model=LLM_MODEL,
         request_id=request_id,
         session_id=session_id,
         duration_ms=duration_ms,
+        llm_response_chars=len(raw),
     )
     try:
         parsed = json.loads(raw)
@@ -104,6 +106,15 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
     try:
         return json.loads(content)
     except Exception as e:
+        _log_event(
+            "llm_invalid_output",
+            level="error",
+            provider="openai_compat",
+            model=LLM_MODEL,
+            request_id=request_id,
+            session_id=session_id,
+            error=f"invalid_content_json {e}",
+        )
         raise RuntimeError(f"invalid_content_json {e}")
 
 
@@ -124,6 +135,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     _log_event(
         "llm_request",
         provider=provider,
+        model=LLM_MODEL,
         request_id=request_id,
         session_id=session_id,
         prompt_chars=len(prompt),
@@ -141,6 +153,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
             "llm_error",
             level="error",
             provider=provider,
+            model=LLM_MODEL,
             request_id=request_id,
             session_id=session_id,
             error=str(e),
@@ -151,10 +164,25 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     _log_event(
         "llm_response",
         provider=provider,
+        model=LLM_MODEL,
         request_id=request_id,
         session_id=session_id,
         duration_ms=duration_ms,
+        llm_response_chars=len(json.dumps(result)) if isinstance(result, dict) else None,
     )
+
+    if not isinstance(result, dict):
+        _log_event(
+            "llm_invalid_output",
+            level="error",
+            provider=provider,
+            model=LLM_MODEL,
+            request_id=request_id,
+            session_id=session_id,
+            error="result_not_dict",
+        )
+        questions, quick_replies = _template_from_missing(missing_fields)
+        return {"questions": questions[:3], "quick_replies": quick_replies[:6]}
 
     questions = result.get("questions") if isinstance(result, dict) else []
     quick_replies = result.get("quick_replies") if isinstance(result, dict) else []
