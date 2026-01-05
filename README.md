@@ -1,0 +1,1 @@
+# nayti-lyudey-mvp
