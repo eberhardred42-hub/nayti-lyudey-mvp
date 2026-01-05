@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+import json
+import time
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
 import re
@@ -9,11 +11,64 @@ from db import get_session, update_session, add_message, get_session_messages
 app = FastAPI()
 SESSIONS = {}
 
+
+def log_event(event: str, level: str = "info", **fields):
+    payload = {
+        "event": event,
+        "level": level,
+        "ts": datetime.utcnow().isoformat() + "Z",
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        if isinstance(value, datetime):
+            payload[key] = value.isoformat()
+        else:
+            payload[key] = value
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def get_request_id_from_request(request: Request) -> str:
+    return getattr(request.state, "request_id", "unknown")
+
+
+def compute_duration_ms(start_time: float) -> float:
+    return round((time.perf_counter() - start_time) * 1000, 2)
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    start_time = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        duration_ms = compute_duration_ms(start_time)
+        log_event(
+            "request_error",
+            level="error",
+            request_id=request_id,
+            route=str(request.url.path),
+            method=request.method,
+            duration_ms=duration_ms,
+            error=str(exc),
+        )
+        raise
+    response.headers["X-Request-Id"] = request_id
+    return response
+
 # Initialize database on startup
 try:
     init_db()
 except Exception as e:
-    print(f"Warning: Database initialization failed: {e}")
+    log_event(
+        "db_error",
+        level="error",
+        route="startup",
+        method="system",
+        error=str(e),
+    )
 
 class SessionCreate(BaseModel):
     profession_query: str
@@ -118,6 +173,13 @@ def compute_missing_fields(kb):
     return missing
 
 
+def to_iso(dt_value):
+    """Convert datetime to ISO string if applicable."""
+    if isinstance(dt_value, datetime):
+        return dt_value.isoformat()
+    return dt_value
+
+
 def update_meta(kb):
     """Update meta fields: filled_fields_count, missing_fields, last_updated_iso."""
     kb["meta"]["filled_fields_count"] = count_filled_fields(kb)
@@ -129,78 +191,92 @@ def parse_work_format(text):
     """Simple heuristic for work_format from text."""
     low = text.lower()
     if "удал" in low or "remote" in low:
-        return "remote"
-    elif "гибрид" in low:
-        return "hybrid"
-    elif "офис" in low or "office" in low:
-        return "office"
-    return None
-
-
-def parse_employment_type(text):
-    """Simple heuristic for employment_type from text."""
-    low = text.lower()
-    if "фулл" in low or "full" in low:
-        return "full-time"
-    elif "парт" in low or "part" in low:
-        return "part-time"
-    elif "проект" in low or "project" in low:
-        return "project"
-    return None
-
-
-def parse_salary(text):
-    """Parse salary from text, return (min, max, comment)."""
-    low = text.lower()
+        @app.get("/report/free")
+        def get_free_report(session_id: str, request: Request):
+            """Generate and return a free report from the vacancy KB."""
+            start_time = time.perf_counter()
+            request_id = get_request_id_from_request(request)
+            session = ensure_session(session_id)
+            kb = session.get("vacancy_kb", make_empty_vacancy_kb())
+            profession_query = session.get("profession_query", "")
     
-    # Find all numbers, including check for 'к' suffix
-    # Handle patterns: 200к, 200 000, 200-300к, etc.
-    pattern = r'(\d+(?:\s\d+)*)\s*[кК]?'
-    
-    numbers = []
-    found_k = False
-    
-    # Simple approach: split by common delimiters and find numbers
-    import re
-    # Look for number patterns with possible 'к' suffix
-    parts = re.split(r'[-\s,;|]', low)
-    
-    for part in parts:
-        part = part.strip()
-        if not part:
-            continue
-        
-        # Check if ends with 'к'
-        has_k = part.endswith('к') or part.endswith('k')
-        
-        # Extract just digits
-        digits = ''.join(c for c in part if c.isdigit())
-        if digits:
+            # Try to load from database first
             try:
-                num = int(digits)
-                if has_k:
-                    num *= 1000
-                    found_k = True
-                numbers.append(num)
-            except:
-                pass
+                db_session = get_session(session_id)
+                if db_session:
+                    if db_session.get("free_report"):
+                        log_event(
+                            "free_report_cache_hit",
+                            request_id=request_id,
+                            session_id=session_id,
+                            route=str(request.url.path),
+                            method=request.method,
+                            duration_ms=compute_duration_ms(start_time),
+                        )
+                        return {
+                            "session_id": session_id,
+                            "free_report": db_session["free_report"],
+                            "cached": True,
+                            "kb_meta": {
+                                "missing_fields": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["missing_fields"],
+                                "filled_fields_count": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["filled_fields_count"],
+                            },
+                        }
+                    if db_session.get("vacancy_kb"):
+                        kb = db_session["vacancy_kb"]
+                    if db_session.get("profession_query"):
+                        profession_query = db_session.get("profession_query")
+            except Exception as e:
+                log_event(
+                    "db_error",
+                    level="error",
+                    request_id=request_id,
+                    session_id=session_id,
+                    route=str(request.url.path),
+                    method=request.method,
+                    error=str(e),
+                )
     
-    if not numbers:
-        return None, None, None
+            # Generate free report
+            free_report = generate_free_report(kb, profession_query)
     
-    # If we found 'к' and have small numbers without it, multiply them too
-    if found_k and any(n < 1000 for n in numbers):
-        numbers = [n * 1000 if n < 1000 else n for n in numbers]
+            # Cache in session
+            session["free_report"] = free_report
+            session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
     
-    # Remove duplicates and sort
-    numbers = sorted(set(numbers))
+            # Save to database
+            try:
+                update_session(session_id, free_report=free_report)
+            except Exception as e:
+                log_event(
+                    "db_error",
+                    level="error",
+                    request_id=request_id,
+                    session_id=session_id,
+                    route=str(request.url.path),
+                    method=request.method,
+                    error=str(e),
+                )
     
-    if len(numbers) == 1:
-        return None, None, f"около {numbers[0]:,} руб"
-    elif len(numbers) >= 2:
-        return numbers[0], numbers[-1], None
+            log_event(
+                "free_report_generated",
+                request_id=request_id,
+                session_id=session_id,
+                route=str(request.url.path),
+                method=request.method,
+                duration_ms=compute_duration_ms(start_time),
+            )
     
-    return None, None, None
+            return {
+                "session_id": session_id,
+                "free_report": free_report,
+                "cached": False,
+                "generated_at_iso": session["free_report_generated_at"],
+                "kb_meta": {
+                    "missing_fields": kb["meta"]["missing_fields"],
+                    "filled_fields_count": kb["meta"]["filled_fields_count"],
+                },
+            }
 
 
 def parse_location(text):
@@ -240,7 +316,9 @@ def ensure_session(sid: str, profession_query: str | None = None):
 
 
 @app.post("/chat/message")
-def chat_message(body: ChatMessage):
+def chat_message(body: ChatMessage, request: Request):
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
     sid = body.session_id
     msg_type = body.type
     text = (body.text or "").strip()
@@ -262,7 +340,36 @@ def chat_message(body: ChatMessage):
             }
             SESSIONS[sid] = session
     except Exception as e:
-        print(f"Warning: Failed to load session from DB: {e}")
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=sid,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
+
+    log_event(
+        "chat_message_received",
+        request_id=request_id,
+        session_id=sid,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+        message_type=msg_type,
+    )
+
+    def log_reply(event_name="chat_reply_sent", **extra_fields):
+        log_event(
+            event_name,
+            request_id=request_id,
+            session_id=sid,
+            route=str(request.url.path),
+            method=request.method,
+            duration_ms=compute_duration_ms(start_time),
+            **extra_fields,
+        )
 
     # default response
     reply = ""
@@ -282,8 +389,17 @@ def chat_message(body: ChatMessage):
             add_message(sid, "assistant", reply)
             update_session(sid, chat_state=session["state"])
         except Exception as e:
-            print(f"Warning: Failed to save message to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
         
+        log_reply(state=session["state"])
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
 
     # Save user message
@@ -291,7 +407,15 @@ def chat_message(body: ChatMessage):
         try:
             add_message(sid, "user", text)
         except Exception as e:
-            print(f"Warning: Failed to save user message to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
 
     # user messages
     if state == "awaiting_flow":
@@ -310,8 +434,17 @@ def chat_message(body: ChatMessage):
             add_message(sid, "assistant", reply)
             update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
         except Exception as e:
-            print(f"Warning: Failed to save state to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
         
+        log_reply(state=session["state"])
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_vacancy_text":
@@ -344,6 +477,14 @@ def chat_message(body: ChatMessage):
                 kb["responsibilities"]["tasks"] = ["См. текст вакансии выше"]
             
             update_meta(kb)
+            log_event(
+                "vacancy_kb_updated",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                duration_ms=compute_duration_ms(start_time),
+            )
             
             reply = "Спасибо — пара уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
         else:
@@ -353,8 +494,17 @@ def chat_message(body: ChatMessage):
             add_message(sid, "assistant", reply)
             update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
         except Exception as e:
-            print(f"Warning: Failed to save state to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
         
+        log_reply(state=session["state"])
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_tasks":
@@ -376,6 +526,14 @@ def chat_message(body: ChatMessage):
                 kb["responsibilities"]["tasks"] = tasks[:10]
         
         update_meta(kb)
+        log_event(
+            "vacancy_kb_updated",
+            request_id=request_id,
+            session_id=sid,
+            route=str(request.url.path),
+            method=request.method,
+            duration_ms=compute_duration_ms(start_time),
+        )
         
         reply = "Спасибо — пару уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
         
@@ -383,8 +541,17 @@ def chat_message(body: ChatMessage):
             add_message(sid, "assistant", reply)
             update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
         except Exception as e:
-            print(f"Warning: Failed to save state to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
         
+        log_reply(state=session["state"])
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_clarifications":
@@ -421,6 +588,14 @@ def chat_message(body: ChatMessage):
             kb["company"]["company_location_region"] = region
         
         update_meta(kb)
+        log_event(
+            "vacancy_kb_updated",
+            request_id=request_id,
+            session_id=sid,
+            route=str(request.url.path),
+            method=request.method,
+            duration_ms=compute_duration_ms(start_time),
+        )
         
         reply = "Готово! Я собрал бесплатный результат ниже 🙂"
         should_show_free_result = True
@@ -429,8 +604,17 @@ def chat_message(body: ChatMessage):
             add_message(sid, "assistant", reply)
             update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
         except Exception as e:
-            print(f"Warning: Failed to save final state to DB: {e}")
+            log_event(
+                "db_error",
+                level="error",
+                request_id=request_id,
+                session_id=sid,
+                route=str(request.url.path),
+                method=request.method,
+                error=str(e),
+            )
         
+        log_reply(state=session["state"], should_show_free_result=should_show_free_result)
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
 
     # fallback
@@ -439,8 +623,17 @@ def chat_message(body: ChatMessage):
         add_message(sid, "assistant", reply)
         update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
     except Exception as e:
-        print(f"Warning: Failed to save fallback to DB: {e}")
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=sid,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
     
+    log_reply(state=session.get("state"))
     return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
 @app.get("/health")
@@ -456,8 +649,10 @@ def health_db():
 
 
 @app.get("/vacancy")
-def get_vacancy(session_id: str):
+def get_vacancy(session_id: str, request: Request):
     """Get vacancy knowledge base for a session."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
     session = ensure_session(session_id)
     kb = session.get("vacancy_kb", make_empty_vacancy_kb())
     
@@ -467,7 +662,24 @@ def get_vacancy(session_id: str):
         if db_session and db_session.get("vacancy_kb"):
             kb = db_session["vacancy_kb"]
     except Exception as e:
-        print(f"Warning: Failed to load vacancy from DB: {e}")
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
+    
+    log_event(
+        "vacancy_kb_read",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+    )
     
     return {
         "session_id": session_id,
@@ -697,8 +909,10 @@ def generate_free_report(kb, profession_query=""):
 
 
 @app.post("/sessions")
-def create_session_endpoint(body: SessionCreate):
+def create_session_endpoint(body: SessionCreate, request: Request):
     """Create a new session and persist to database."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
     session_id = str(uuid.uuid4())
     
     # Create in-memory session for backward compatibility
@@ -716,6 +930,108 @@ def create_session_endpoint(body: SessionCreate):
         kb = make_empty_vacancy_kb()
         db_create_session(session_id, body.profession_query, kb)
     except Exception as e:
-        print(f"Warning: Failed to save session to DB: {e}")
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
     
+    log_event(
+        "session_created",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+    )
     return {"session_id": session_id}
+
+
+@app.get("/debug/session")
+def debug_session(session_id: str, request: Request):
+    """Read-only session debug endpoint."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
+    db_session = get_session(session_id)
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    kb = db_session.get("vacancy_kb") or make_empty_vacancy_kb()
+    response = {
+        "session_id": session_id,
+        "profession_query": db_session.get("profession_query"),
+        "chat_state": db_session.get("chat_state"),
+        "kb_meta": kb.get("meta", {}),
+        "has_free_report": bool(db_session.get("free_report")),
+        "updated_at": to_iso(db_session.get("updated_at")),
+    }
+    log_event(
+        "debug_session_read",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+    )
+    return response
+
+
+@app.get("/debug/messages")
+def debug_messages(session_id: str, request: Request, limit: int = 50):
+    """Read-only messages debug endpoint."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
+    db_session = get_session(session_id)
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    msgs = get_session_messages(session_id, limit=limit)
+    normalized = []
+    for msg in msgs:
+        normalized.append({
+            "role": msg.get("role"),
+            "text": msg.get("text"),
+            "created_at": to_iso(msg.get("created_at")),
+        })
+    response = {"session_id": session_id, "messages": normalized}
+    log_event(
+        "debug_messages_read",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+        messages_returned=len(normalized),
+    )
+    return response
+
+
+@app.get("/debug/report/free")
+def debug_report_free(session_id: str, request: Request):
+    """Read-only free report debug endpoint."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
+    db_session = get_session(session_id)
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    free_report = db_session.get("free_report")
+    cached = bool(free_report)
+    headline = free_report.get("headline") if cached else None
+    response = {
+        "session_id": session_id,
+        "cached": cached,
+        "headline": headline,
+        "generated_at_iso": to_iso(db_session.get("updated_at")) if cached else None,
+    }
+    log_event(
+        "debug_report_free_read",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+        cached=cached,
+    )
+    return response

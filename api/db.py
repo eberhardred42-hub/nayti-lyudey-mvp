@@ -186,17 +186,23 @@ def add_message(session_id: str, role: str, text: str) -> int:
         return msg_id
 
 
-def get_session_messages(session_id: str) -> List[Dict[str, Any]]:
-    """Retrieve all messages for a session in order."""
+def get_session_messages(session_id: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+    """Retrieve messages for a session in chronological order with optional limit."""
     with get_db_connection() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cur.execute("""
+        params = [session_id]
+        limit_clause = ""
+        if limit:
+            limit_clause = " LIMIT %s"
+            params.append(limit)
+        
+        cur.execute(f"""
             SELECT id, session_id, role, text, created_at
             FROM messages
             WHERE session_id = %s
-            ORDER BY created_at ASC
-        """, (session_id,))
+            ORDER BY created_at ASC{limit_clause}
+        """, params)
         
         messages = cur.fetchall()
         return [dict(msg) for msg in messages]
