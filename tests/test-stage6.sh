@@ -8,6 +8,7 @@ cd "$PROJECT_DIR"
 # Requires running docker compose or already running services.
 
 BASE_URL=${BASE_URL:-http://localhost:8000}
+ML_URL=${ML_URL:-http://localhost:8001}
 HEADERS_FILE_1="/tmp/stage6_headers_1.txt"
 HEADERS_FILE_2="/tmp/stage6_headers_2.txt"
 
@@ -23,10 +24,32 @@ else
   echo "docker not found, assuming services already running"
 fi
 
+step "Wait for API readiness"
+READY=0
+for i in $(seq 1 60); do
+  if curl -fsS "$BASE_URL/health" >/dev/null 2>&1; then
+    READY=1
+    break
+  fi
+  echo "waiting for API... ($i/60)"
+  sleep 1
+done
+if [ "$READY" -ne 1 ]; then
+  echo "API did not become ready in time"
+  if command -v docker >/dev/null 2>&1; then
+    docker compose -f infra/docker-compose.yml logs --no-color --tail=200 api || true
+  fi
+  exit 1
+fi
+
 step "Create session"
-SESSION_JSON=$(curl -s -X POST -H "Content-Type: application/json" \
+SESSION_RAW=$(curl -s -w "\n%{http_code}" -X POST -H "Content-Type: application/json" \
   -d '{"profession_query":"stage6 observability"}' \
   "$BASE_URL/sessions")
+SESSION_JSON=$(echo "$SESSION_RAW" | head -n1)
+SESSION_CODE=$(echo "$SESSION_RAW" | tail -n1)
+echo "Session create response code: $SESSION_CODE"
+echo "Session create body: $SESSION_JSON"
 SESSION_ID=$(echo "$SESSION_JSON" | python3 - <<'PY'
 import json,sys
 try:
@@ -38,6 +61,9 @@ PY
 )
 if [ -z "$SESSION_ID" ]; then
   echo "Session creation failed"
+  if command -v docker >/dev/null 2>&1; then
+    docker compose -f infra/docker-compose.yml logs --no-color --tail=200 api || true
+  fi
   exit 1
 fi
 step "Session created: $SESSION_ID"
