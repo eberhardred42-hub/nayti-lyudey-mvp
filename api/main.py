@@ -7,6 +7,7 @@ import re
 from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
+from llm_client import generate_questions_and_quick_replies, health_llm
 
 app = FastAPI()
 SESSIONS = {}
@@ -187,119 +188,147 @@ def update_meta(kb):
     kb["meta"]["last_updated_iso"] = datetime.utcnow().isoformat() + "Z"
 
 
+def template_questions_and_quick_replies(missing_fields):
+    questions = []
+    quick_replies = []
+    if any("company.work_format" in f for f in missing_fields):
+        questions.append("Какой формат работы: офис, гибрид или удаленка?")
+        quick_replies.extend(["Офис", "Гибрид", "Удаленка"])
+    if any("company_location" in f for f in missing_fields):
+        questions.append("В каком городе или регионе ищешь?")
+        quick_replies.append("Москва")
+    if any("employment.employment_type" in f for f in missing_fields):
+        questions.append("Какая занятость: полный день, частичная или проект?")
+        quick_replies.append("Полный день")
+    if any("compensation" in f for f in missing_fields):
+        questions.append("Какой бюджет или вилка по оплате?")
+        quick_replies.append("Есть бюджет")
+
+    # Deduplicate quick replies
+    seen = set()
+    unique_qr = []
+    for qr in quick_replies:
+        if qr not in seen:
+            unique_qr.append(qr)
+            seen.add(qr)
+    return questions, unique_qr[:6]
+
+
+def build_clarification_prompt(session_id, kb, profession_query, last_user_message, request):
+    request_id = get_request_id_from_request(request)
+    missing_fields = kb.get("meta", {}).get("missing_fields", [])
+    context = {
+        "session_id": session_id,
+        "profession_query": profession_query,
+        "missing_fields": missing_fields,
+        "vacancy_kb": kb,
+        "last_user_message": last_user_message,
+        "request_id": request_id,
+    }
+    questions = []
+    quick_replies = []
+
+    try:
+        result = generate_questions_and_quick_replies(context)
+        if isinstance(result, dict):
+            questions = result.get("questions") or []
+            quick_replies = result.get("quick_replies") or []
+    except Exception as e:
+        log_event(
+            "llm_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
+
+    if not questions:
+        questions, _qr = template_questions_and_quick_replies(missing_fields)
+        quick_replies = quick_replies or _qr
+    if not quick_replies:
+        _q, quick_replies = template_questions_and_quick_replies(missing_fields)
+
+    questions = [q for q in questions if isinstance(q, str)][:3]
+    quick_replies = [qr for qr in quick_replies if isinstance(qr, str)][:6]
+
+    reply_lines = ["Давай уточним, чтобы собрать отчет:"]
+    for q in questions:
+        reply_lines.append(f"- {q}")
+    reply_text = "\n".join(reply_lines)
+
+    return reply_text, quick_replies, questions
+
+
 def parse_work_format(text):
     """Simple heuristic for work_format from text."""
     low = text.lower()
-    if "удал" in low or "remote" in low:
-        @app.get("/report/free")
-        def get_free_report(session_id: str, request: Request):
-            """Generate and return a free report from the vacancy KB."""
-            start_time = time.perf_counter()
-            request_id = get_request_id_from_request(request)
-            session = ensure_session(session_id)
-            kb = session.get("vacancy_kb", make_empty_vacancy_kb())
-            profession_query = session.get("profession_query", "")
-    
-            # Try to load from database first
-            try:
-                db_session = get_session(session_id)
-                if db_session:
-                    if db_session.get("free_report"):
-                        log_event(
-                            "free_report_cache_hit",
-                            request_id=request_id,
-                            session_id=session_id,
-                            route=str(request.url.path),
-                            method=request.method,
-                            duration_ms=compute_duration_ms(start_time),
-                        )
-                        return {
-                            "session_id": session_id,
-                            "free_report": db_session["free_report"],
-                            "cached": True,
-                            "kb_meta": {
-                                "missing_fields": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["missing_fields"],
-                                "filled_fields_count": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["filled_fields_count"],
-                            },
-                        }
-                    if db_session.get("vacancy_kb"):
-                        kb = db_session["vacancy_kb"]
-                    if db_session.get("profession_query"):
-                        profession_query = db_session.get("profession_query")
-            except Exception as e:
-                log_event(
-                    "db_error",
-                    level="error",
-                    request_id=request_id,
-                    session_id=session_id,
-                    route=str(request.url.path),
-                    method=request.method,
-                    error=str(e),
-                )
-    
-            # Generate free report
-            free_report = generate_free_report(kb, profession_query)
-    
-            # Cache in session
-            session["free_report"] = free_report
-            session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
-    
-            # Save to database
-            try:
-                update_session(session_id, free_report=free_report)
-            except Exception as e:
-                log_event(
-                    "db_error",
-                    level="error",
-                    request_id=request_id,
-                    session_id=session_id,
-                    route=str(request.url.path),
-                    method=request.method,
-                    error=str(e),
-                )
-    
-            log_event(
-                "free_report_generated",
-                request_id=request_id,
-                session_id=session_id,
-                route=str(request.url.path),
-                method=request.method,
-                duration_ms=compute_duration_ms(start_time),
-            )
-    
-            return {
-                "session_id": session_id,
-                "free_report": free_report,
-                "cached": False,
-                "generated_at_iso": session["free_report_generated_at"],
-                "kb_meta": {
-                    "missing_fields": kb["meta"]["missing_fields"],
-                    "filled_fields_count": kb["meta"]["filled_fields_count"],
-                },
-            }
+    if "удал" in low or "remote" in low or "дистанц" in low:
+        return "remote"
+    if "гибрид" in low:
+        return "hybrid"
+    if "офис" in low or "office" in low:
+        return "office"
+    return None
+
+
+def parse_employment_type(text):
+    low = text.lower()
+    if "проект" in low or "project" in low or "контракт" in low:
+        return "project"
+    if "част" in low or "part" in low:
+        return "part-time"
+    if "полный" in low or "full" in low:
+        return "full-time"
+    return None
+
+
+def parse_salary(text):
+    cleaned = text.replace("\xa0", " ")
+    numbers = []
+    for match in re.findall(r"\b\d{2,6}\b", cleaned):
+        try:
+            numbers.append(int(match.replace(" ", "")))
+        except ValueError:
+            continue
+    numbers = [n for n in numbers if n > 0]
+    if len(numbers) >= 2:
+        low, high = min(numbers), max(numbers)
+        return low, high, None
+    if len(numbers) == 1:
+        return numbers[0], None, None
+    low_text = cleaned.lower()
+    if any(word in low_text for word in ["бюджет", "вилка", "зарп"]):
+        return None, None, cleaned.strip()
+    return None, None, None
 
 
 def parse_location(text):
-    """Parse location from text, return (city, region)."""
     low = text.lower()
-    
-    # Simple dictionary of major Russian cities
-    cities = {
-        "москва": "москва",
-        "спб": "санкт-петербург",
-        "санкт-петербург": "санкт-петербург",
-        "питер": "санкт-петербург",
-        "екатеринбург": "екатеринбург",
-        "казань": "казань",
-        "новосибирск": "новосибирск",
+    city_map = {
+        "моск": "Москва",
+        "moscow": "Москва",
+        "спб": "Санкт-Петербург",
+        "питер": "Санкт-Петербург",
+        "санкт-петербург": "Санкт-Петербург",
+        "казан": "Казань",
+        "новосиб": "Новосибирск",
+        "екатеринбург": "Екатеринбург",
     }
-    
-    for city_key, city_name in cities.items():
-        if city_key in low:
-            return city_name, None
-    
-    # If no city found, try to extract as region
-    return None, text if len(text) < 100 else None
+    for key, city in city_map.items():
+        if key in low:
+            return city, None
+
+    match = re.search(r"в\s+([A-Za-zА-Яа-яЁё\-\s]{3,30})", text)
+    if match:
+        candidate = match.group(1).strip()
+        if candidate:
+            return candidate.title(), None
+
+    if any(word in low for word in ["регион", "любой город", "удал"]):
+        return None, text.strip() if len(text.strip()) < 100 else None
+    return None, None
 
 
 def ensure_session(sid: str, profession_query: str | None = None):
@@ -374,13 +403,14 @@ def chat_message(body: ChatMessage, request: Request):
     # default response
     reply = ""
     quick_replies = []
+    clarifying_questions = []
     should_show_free_result = False
 
     state = session.get("state")
 
     if msg_type == "start":
         session["state"] = "awaiting_flow"
-        reply = "Привет 🙂 Супер, что ты решил подойти к найму спокойно. Есть текст вакансии или только описание задач?"
+        reply = "Привет! Супер, что ты решил подойти к найму спокойно. Есть текст вакансии или только описание задач?"
         quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
         should_show_free_result = False
         
@@ -445,7 +475,12 @@ def chat_message(body: ChatMessage, request: Request):
             )
         
         log_reply(state=session["state"])
-        return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
+        return {
+            "reply": reply,
+            "quick_replies": quick_replies,
+            "clarifying_questions": clarifying_questions,
+            "should_show_free_result": False,
+        }
 
     if state == "awaiting_vacancy_text":
         # accept long text
@@ -486,7 +521,13 @@ def chat_message(body: ChatMessage, request: Request):
                 duration_ms=compute_duration_ms(start_time),
             )
             
-            reply = "Спасибо — пара уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
+            reply, quick_replies, clarifying_questions = build_clarification_prompt(
+                sid,
+                kb,
+                session.get("profession_query", ""),
+                text,
+                request,
+            )
         else:
             reply = "Пожалуйста, вставь текст вакансии целиком (подробнее, >200 символов)."
         
@@ -535,7 +576,13 @@ def chat_message(body: ChatMessage, request: Request):
             duration_ms=compute_duration_ms(start_time),
         )
         
-        reply = "Спасибо — пару уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
+        reply, quick_replies, clarifying_questions = build_clarification_prompt(
+            sid,
+            kb,
+            session.get("profession_query", ""),
+            text,
+            request,
+        )
         
         try:
             add_message(sid, "assistant", reply)
@@ -552,7 +599,12 @@ def chat_message(body: ChatMessage, request: Request):
             )
         
         log_reply(state=session["state"])
-        return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
+        return {
+            "reply": reply,
+            "quick_replies": quick_replies,
+            "clarifying_questions": clarifying_questions,
+            "should_show_free_result": False,
+        }
 
     if state == "awaiting_clarifications":
         session.setdefault("clarifications", []).append(text)
@@ -597,7 +649,7 @@ def chat_message(body: ChatMessage, request: Request):
             duration_ms=compute_duration_ms(start_time),
         )
         
-        reply = "Готово! Я собрал бесплатный результат ниже 🙂"
+        reply = "Готово! Я собрал бесплатный результат ниже."
         should_show_free_result = True
         
         try:
@@ -648,6 +700,11 @@ def health_db():
     return {"ok": db_ok}
 
 
+@app.get("/health/llm")
+def health_llm_endpoint():
+    return health_llm()
+
+
 @app.get("/vacancy")
 def get_vacancy(session_id: str, request: Request):
     """Get vacancy knowledge base for a session."""
@@ -690,18 +747,27 @@ def get_vacancy(session_id: str, request: Request):
 
 
 @app.get("/report/free")
-def get_free_report(session_id: str):
+def get_free_report(session_id: str, request: Request):
     """Generate and return a free report from the vacancy KB."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
     session = ensure_session(session_id)
     kb = session.get("vacancy_kb", make_empty_vacancy_kb())
     profession_query = session.get("profession_query", "")
-    
+
     # Try to load from database first
     try:
         db_session = get_session(session_id)
         if db_session:
             if db_session.get("free_report"):
-                # Return cached report
+                log_event(
+                    "free_report_cache_hit",
+                    request_id=request_id,
+                    session_id=session_id,
+                    route=str(request.url.path),
+                    method=request.method,
+                    duration_ms=compute_duration_ms(start_time),
+                )
                 return {
                     "session_id": session_id,
                     "free_report": db_session["free_report"],
@@ -714,23 +780,48 @@ def get_free_report(session_id: str):
             if db_session.get("vacancy_kb"):
                 kb = db_session["vacancy_kb"]
             if db_session.get("profession_query"):
-                profession_query = db_session["profession_query"]
+                profession_query = db_session.get("profession_query")
     except Exception as e:
-        print(f"Warning: Failed to load report from DB: {e}")
-    
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
+
     # Generate free report
     free_report = generate_free_report(kb, profession_query)
-    
+
     # Cache in session
     session["free_report"] = free_report
     session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
-    
+
     # Save to database
     try:
         update_session(session_id, free_report=free_report)
     except Exception as e:
-        print(f"Warning: Failed to save report to DB: {e}")
-    
+        log_event(
+            "db_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            error=str(e),
+        )
+
+    log_event(
+        "free_report_generated",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+    )
+
     return {
         "session_id": session_id,
         "free_report": free_report,
@@ -766,7 +857,7 @@ def generate_free_report(kb, profession_query=""):
         headline_parts.append(f"по {role_title.lower()}")
     elif role_domain:
         headline_parts.append(f"в сфере {role_domain}")
-    headline = " ".join(headline_parts) + " 🎯"
+    headline = " ".join(headline_parts)
     
     # 2. Where to search
     where_to_search = []

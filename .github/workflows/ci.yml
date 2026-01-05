@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  docker-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & start stack (API/DB/ML only)
+        run: docker compose -f infra/docker-compose.yml up -d --build db api ml
+
+      - name: Wait for API and ML health
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:8000/health >/dev/null 2>&1 && \
+               curl -fsS http://localhost:8000/health/db >/dev/null 2>&1 && \
+               curl -fsS http://localhost:8001/health >/dev/null 2>&1 && \
+               curl -fsS http://localhost:8000/health/llm >/dev/null 2>&1; then
+              echo "Services are ready"
+              break
+            fi
+            echo "waiting for services... ($i/90)"
+            sleep 1
+          done
+          curl -fsS http://localhost:8000/health
+          curl -fsS http://localhost:8000/health/db
+          curl -fsS http://localhost:8001/health
+          curl -fsS http://localhost:8000/health/llm
+
+      - name: Stage 5 tests
+        run: bash tests/test-stage5.sh
+
+      - name: Stage 6 tests
+        run: bash tests/test-stage6.sh
+
+      - name: Stage 7 tests
+        run: bash tests/test-stage7.sh
+
+      - name: Diagnostics (always)
+        if: always()
+        run: |
+          docker compose -f infra/docker-compose.yml ps
+          docker compose -f infra/docker-compose.yml logs --no-color --tail=300
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f infra/docker-compose.yml down -v

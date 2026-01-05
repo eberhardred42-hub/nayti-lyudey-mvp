@@ -24,6 +24,8 @@
 | **[STAGE5_IMPLEMENTATION.md](stages/stage5/STAGE5_IMPLEMENTATION.md)** | 12K | Database design and integration details | 15 min |
 | **[STAGE6_SUMMARY.md](stages/stage6/STAGE6_SUMMARY.md)** | 3K | Observability overview (request IDs, logs, debug endpoints) | 4 min |
 | **[STAGE6_IMPLEMENTATION.md](stages/stage6/STAGE6_IMPLEMENTATION.md)** | 4K | Observability implementation details | 8 min |
+| **[STAGE7_SUMMARY.md](stages/stage7/STAGE7_SUMMARY.md)** | 3K | LLM clarifications overview | 4 min |
+| **[STAGE7_IMPLEMENTATION.md](stages/stage7/STAGE7_IMPLEMENTATION.md)** | 4K | LLM integration and prompts | 8 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |
 
 ### Status & Navigation Files
@@ -45,6 +47,7 @@
 | **[test-parsing.py](../../tests/test-parsing.py)** | 4.9K | 13 compatibility tests | ✅ 13/13 PASS |
 | **[test-stage5.sh](../../tests/test-stage5.sh)** | 5.5K | Postgres persistence test | ✅ NEW |
 | **[test-stage6.sh](../../tests/test-stage6.sh)** | 3.5K | Observability (request IDs, debug endpoints) | ✅ NEW |
+| **[test-stage7.sh](../../tests/test-stage7.sh)** | 3.0K | LLM clarifications and quick replies | ✅ NEW |
 
 ---
 
