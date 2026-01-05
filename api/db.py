@@ -13,7 +13,28 @@ import json
 import psycopg2
 import psycopg2.extras
 from contextlib import contextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
+
+JsonType = Union[Dict[str, Any], List[Any]]
+
+
+def safe_json(value: Any, default: JsonType) -> JsonType:
+    """Decode JSON from DB safely, tolerating NULL/blank/invalid."""
+    if value is None:
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return default
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return default
+    return default
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
@@ -46,8 +67,8 @@ def init_db():
                 session_id TEXT PRIMARY KEY,
                 profession_query TEXT NOT NULL,
                 chat_state TEXT,
-                vacancy_kb JSONB,
-                free_report JSONB,
+                vacancy_kb JSONB NOT NULL DEFAULT '{}'::jsonb,
+                free_report JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ DEFAULT now(),
                 updated_at TIMESTAMPTZ DEFAULT now()
             )
@@ -101,7 +122,7 @@ def create_session(
             INSERT INTO sessions (session_id, profession_query, vacancy_kb)
             VALUES (%s, %s, %s)
             RETURNING session_id, profession_query, chat_state, vacancy_kb, free_report, created_at
-        """, (session_id, profession_query, json.dumps(vacancy_kb) if vacancy_kb else None))
+        """, (session_id, profession_query, psycopg2.extras.Json(vacancy_kb or {})))
         
         session = cur.fetchone()
         return dict(session) if session else {}
@@ -122,10 +143,8 @@ def get_session(session_id: str) -> Optional[Dict[str, Any]]:
         if session:
             # Parse JSONB fields
             session = dict(session)
-            if session.get("vacancy_kb"):
-                session["vacancy_kb"] = json.loads(session["vacancy_kb"])
-            if session.get("free_report"):
-                session["free_report"] = json.loads(session["free_report"])
+            session["vacancy_kb"] = safe_json(session.get("vacancy_kb"), {})
+            session["free_report"] = safe_json(session.get("free_report"), {})
             return session
         return None
 
@@ -149,11 +168,11 @@ def update_session(
         
         if vacancy_kb is not None:
             updates.append("vacancy_kb = %s")
-            params.append(json.dumps(vacancy_kb))
+            params.append(psycopg2.extras.Json(vacancy_kb or {}))
         
         if free_report is not None:
             updates.append("free_report = %s")
-            params.append(json.dumps(free_report))
+            params.append(psycopg2.extras.Json(free_report or {}))
         
         if updates:
             updates.append("updated_at = now()")
