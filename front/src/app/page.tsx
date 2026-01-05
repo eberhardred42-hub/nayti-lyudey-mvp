@@ -12,6 +12,17 @@ type Stage =
   | "clarifications"
   | "free_result";
 
+type FreeReport = {
+  headline: string;
+  where_to_search: Array<{ title: string; bullets: string[] }>;
+  what_to_screen: string[];
+  budget_reality_check: {
+    status: string;
+    bullets: string[];
+  };
+  next_steps: string[];
+};
+
 const CLARIFICATIONS = [
   "Город и формат (удалённо / очно)",
   "Бюджет (примерно)",
@@ -28,6 +39,9 @@ export default function Page() {
   const [clarIdx, setClarIdx] = useState(0);
   const [clarAnswers, setClarAnswers] = useState<string[]>([]);
   const [showPayModal, setShowPayModal] = useState(false);
+  const [freeReport, setFreeReport] = useState<FreeReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   const boxRef = useRef<HTMLDivElement | null>(null);
 
@@ -36,7 +50,7 @@ export default function Page() {
     const el = boxRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages.length, stage]);
+  }, [messages.length, stage, freeReport]);
 
   async function start() {
     if (!profession.trim()) return;
@@ -66,6 +80,25 @@ export default function Page() {
     setMessages((m) => [...m, { role: "assistant", text }]);
   }
 
+  async function fetchFreeReport(sid: string) {
+    if (!sid) return;
+    setReportLoading(true);
+    setReportError(null);
+    try {
+      const r = await fetch(`/api/report/free?session_id=${sid}`);
+      const data = await r.json();
+      if (r.ok && data.free_report) {
+        setFreeReport(data.free_report);
+      } else {
+        setReportError("Не удалось загрузить отчёт, попробуй обновить");
+      }
+    } catch (err) {
+      setReportError("Ошибка при загрузке отчёта");
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
   async function sendToChat(text: string) {
     if (!sessionId) return;
     const r = await fetch("/api/chat/message", {
@@ -76,7 +109,11 @@ export default function Page() {
     const data = await r.json();
     if (data.reply) setMessages((m) => [...m, { role: "assistant", text: data.reply }]);
     setQuickReplies(data.quick_replies || []);
-    if (data.should_show_free_result) setStage("free_result");
+    if (data.should_show_free_result) {
+      setStage("free_result");
+      // Fetch the free report
+      await fetchFreeReport(sessionId);
+    }
     // try to infer stage from reply text
     const low = (data.reply || "").toLowerCase();
     if (low.includes("вставь") && low.includes("ваканс")) setStage("vacancy_text");
@@ -206,34 +243,86 @@ export default function Page() {
               </div>
             )}
 
-            {/* при free_result показываем блок результата */}
+            {/* при free_result показываем реальный free report */}
             {stage === "free_result" && (
               <div style={{ marginTop: 8, padding: 12, borderRadius: 10, background: "#fcfdfd" }}>
-                <h3 style={{ marginTop: 0 }}>Бесплатный результат</h3>
-                <div style={{ marginBottom: 8 }}>
-                  <b>Где искать</b>
-                  <ul>
-                    <li>Платформы для фриланса (Upwork, Freelance.ru)</li>
-                    <li>Профессиональные сообщества в Telegram и Slack</li>
-                  </ul>
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <b>На что смотреть</b>
-                  <ul>
-                    <li>Портфолио и отзывы</li>
-                    <li>Сроки и ответственность</li>
-                    <li>Примеры похожих задач</li>
-                  </ul>
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <b>Сколько стоит</b>
-                  <div>Диапазон (заглушка): 15 000–80 000 ₽; стратегия: начать с тестового задания.</div>
-                </div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button onClick={() => setShowPayModal(true)} style={{ padding: 8, borderRadius: 8 }}>
-                    Получить полный пакет
-                  </button>
-                </div>
+                {reportLoading && <div style={{ opacity: 0.6 }}>⏳ Загружаю отчёт...</div>}
+                
+                {reportError && (
+                  <div style={{ color: "#d32f2f", marginBottom: 8 }}>
+                    ⚠️ {reportError}
+                  </div>
+                )}
+                
+                {freeReport && (
+                  <>
+                    <h3 style={{ marginTop: 0, marginBottom: 12 }}>{freeReport.headline}</h3>
+                    
+                    {/* Where to search */}
+                    <div style={{ marginBottom: 16 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 8 }}>Где искать</h4>
+                      {freeReport.where_to_search.map((section, idx) => (
+                        <div key={idx} style={{ marginBottom: 12 }}>
+                          <div style={{ fontWeight: "bold", marginBottom: 4 }}>
+                            {section.title}
+                          </div>
+                          <ul style={{ marginTop: 4, marginBottom: 8 }}>
+                            {section.bullets.map((bullet, bidx) => (
+                              <li key={bidx} style={{ marginBottom: 3 }}>
+                                {bullet}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+                    
+                    {/* What to screen */}
+                    <div style={{ marginBottom: 16 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 8 }}>На что смотреть</h4>
+                      <ul>
+                        {freeReport.what_to_screen.map((item, idx) => (
+                          <li key={idx} style={{ marginBottom: 6 }}>
+                            {item}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                    
+                    {/* Budget reality check */}
+                    <div style={{ marginBottom: 16 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 8 }}>Бюджет: реальность</h4>
+                      <ul>
+                        {freeReport.budget_reality_check.bullets.map((bullet, idx) => (
+                          <li key={idx} style={{ marginBottom: 6 }}>
+                            {bullet}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                    
+                    {/* Next steps */}
+                    <div style={{ marginBottom: 16 }}>
+                      <h4 style={{ marginTop: 0, marginBottom: 8 }}>Дальше</h4>
+                      <ol style={{ marginTop: 0 }}>
+                        {freeReport.next_steps.map((step, idx) => (
+                          <li key={idx} style={{ marginBottom: 6 }}>
+                            {step}
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                    
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button 
+                        onClick={() => setShowPayModal(true)} 
+                        style={{ padding: 8, borderRadius: 8 }}
+                      >
+                        Получить полный пакет
+                      </button>
+                    </div>
+                  </>
+                )}
               </div>
             )}
           </div>

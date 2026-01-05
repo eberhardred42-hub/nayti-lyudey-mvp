@@ -74,7 +74,7 @@
 3. **`test-parsing.py`**
    - Standalone unit tests for all parsing functions
    - No external dependencies
-   - Can be run independently: `python3 test-parsing.py`
+   - Can be run independently: `python3 tests/test-parsing.py`
 
 4. **`test-stage3.sh`**
    - Integration tests using curl
@@ -134,12 +134,12 @@ python3 -m py_compile api/main.py
 
 ### Run Parsing Tests:
 ```bash
-python3 test-parsing.py
+python3 tests/test-parsing.py
 ```
 
 ### Run Integration Tests (requires backend running):
 ```bash
-bash test-stage3.sh
+bash tests/test-stage3.sh
 ```
 
 ## 🎯 MVP Required Fields Met

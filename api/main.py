@@ -388,6 +388,197 @@ def get_vacancy(session_id: str):
         "filled_fields_count": kb["meta"]["filled_fields_count"],
     }
 
+
+@app.get("/report/free")
+def get_free_report(session_id: str):
+    """Generate and return a free report from the vacancy KB."""
+    session = ensure_session(session_id)
+    kb = session.get("vacancy_kb", make_empty_vacancy_kb())
+    profession_query = session.get("profession_query", "")
+    
+    # Generate free report
+    free_report = generate_free_report(kb, profession_query)
+    
+    # Optionally cache in session (but not required)
+    session["free_report"] = free_report
+    session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
+    
+    return {
+        "session_id": session_id,
+        "free_report": free_report,
+        "generated_at_iso": session["free_report_generated_at"],
+        "kb_meta": {
+            "missing_fields": kb["meta"]["missing_fields"],
+            "filled_fields_count": kb["meta"]["filled_fields_count"],
+        },
+    }
+
+def generate_free_report(kb, profession_query=""):
+    """Generate a free report from vacancy KB using simple heuristics."""
+    
+    # Extract useful data from KB
+    role_title = kb["role"]["role_title"]
+    role_domain = kb["role"]["role_domain"]
+    tasks = kb["responsibilities"]["tasks"]
+    work_format = kb["company"]["work_format"]
+    city = kb["company"]["company_location_city"]
+    employment_type = kb["employment"]["employment_type"]
+    salary_min = kb["compensation"]["salary_min_rub"]
+    salary_max = kb["compensation"]["salary_max_rub"]
+    salary_comment = kb["compensation"]["salary_comment"]
+    raw_text = kb["responsibilities"]["raw_vacancy_text"] or ""
+    
+    low_text = raw_text.lower()
+    low_query = profession_query.lower()
+    
+    # 1. Headline
+    headline_parts = ["Держи бесплатный результат поиска"]
+    if role_title:
+        headline_parts.append(f"по {role_title.lower()}")
+    elif role_domain:
+        headline_parts.append(f"в сфере {role_domain}")
+    headline = " ".join(headline_parts) + " 🎯"
+    
+    # 2. Where to search
+    where_to_search = []
+    
+    # Always include HH
+    where_to_search.append({
+        "title": "Основные площадки",
+        "bullets": [
+            "HeadHunter (HH) — основной источник резюме",
+            "LinkedIn — проверь профили и Recruiter функции",
+        ]
+    })
+    
+    # Add location-specific channels if office/hybrid and city known
+    if work_format in ["office", "hybrid"] and city:
+        where_to_search.append({
+            "title": f"Локальные каналы ({city.title()})",
+            "bullets": [
+                f"Telegram-чаты по IT/бизнесу в {city.title()}",
+                "VK сообщества профессионалов",
+                "Авито (для линейных/офисных позиций)",
+            ]
+        })
+    
+    # Add domain-specific channels
+    is_it = "it" in low_query or any(w in low_text for w in ["python", "java", "golang", "программ", "разработ", "backend", "frontend"])
+    is_creative = any(w in low_text for w in ["дизайн", "маркетинг", "реклам", "контент", "креатив"])
+    is_sales = any(w in low_text for w in ["продажа", "sales", "менеджер", "бизнес-развитие"])
+    
+    if is_it:
+        where_to_search.append({
+            "title": "IT-специфичные каналы",
+            "bullets": [
+                "Habr Career",
+                "Telegram IT-чаты по стеку (Python, Go, JS и т.д.)",
+                "GitHub (прямой поиск по профилям)",
+            ]
+        })
+    
+    if is_creative:
+        where_to_search.append({
+            "title": "Креативные каналы",
+            "bullets": [
+                "Behance, Dribbble (портфолио дизайнеров)",
+                "Telegram-каналы творческих сообществ",
+                "TikTok/YouTube (для контент-мейкеров)",
+            ]
+        })
+    
+    if is_sales:
+        where_to_search.append({
+            "title": "Продажи и управление",
+            "bullets": [
+                "LinkedIn (сетевой поиск)",
+                "Telegram-каналы бизнес-сообществ",
+                "Рекомендации и рефералы внутри сети",
+            ]
+        })
+    
+    # If no specific domain, add general recommendations
+    if not (is_it or is_creative or is_sales) and len(where_to_search) == 1:
+        where_to_search.append({
+            "title": "Альтернативные каналы",
+            "bullets": [
+                "Telegram-сообщества профессионалов",
+                "VK группы (зачастую живые обсуждения)",
+                "Рефералы и личные контакты",
+            ]
+        })
+    
+    # 3. What to screen
+    what_to_screen = [
+        "Резюме/портфолио: актуальность, ясность стека и опыта",
+        "Примеры работ/кейсы: релевантность к твоим задачам",
+        "Мягкие навыки: общительность, ответственность, проактивность",
+    ]
+    
+    if tasks:
+        what_to_screen.append("Понимание твоих задач: может ли кандидат их объяснить своими словами")
+    
+    if is_it:
+        what_to_screen.append("Знание инструментов: какие стеки/фреймворки точно нужны")
+        what_to_screen.append("Pet проекты: показывают интерес к профессии")
+    
+    if is_creative:
+        what_to_screen.append("Чувство стиля: соответствует ли эстетика твоему видению")
+        what_to_screen.append("Процесс работы: может объяснить решения и ограничения")
+    
+    if is_sales:
+        what_to_screen.append("Track record: цифры, результаты, достижения")
+        what_to_screen.append("Энергия и амбициозность: готовность к росту")
+    
+    what_to_screen.append("Honesty red flags: недовольство предыдущими работодателями, зарплатные скачки без причины")
+    what_to_screen.append("Этика найма: убедись, что нет конфликта интересов или действующего контракта")
+    
+    # 4. Budget reality check
+    budget_status = "unknown"
+    budget_bullets = []
+    
+    if salary_min or salary_max or salary_comment:
+        budget_bullets = [
+            "Если бюджет выше—сконцентрируйся на опыте и уровне сеньёра.",
+            "Если бюджет ниже—рассмотри джуна с хорошим потенциалом, part-time или проектную работу.",
+            "Опцион: наставничество (junior + ментор) может быть экономичнее середины.",
+        ]
+        if salary_comment:
+            budget_bullets.insert(0, f"Твой бюджет: {salary_comment}")
+        elif salary_min and salary_max:
+            budget_bullets.insert(0, f"Бюджет: {salary_min:,}–{salary_max:,} ₽")
+    else:
+        budget_bullets = [
+            "Не указан бюджет, но помни: рынок очень вариативен.",
+            "Перед размещением вакансии — проверь аналогичные позиции на HH.",
+            "Не боись предложить тестовое задание, чтобы оценить реального кандидата.",
+        ]
+    
+    # 5. Next steps
+    next_steps = [
+        "Формирование вакансии: ясные требования, стек, условия, процесс интервью.",
+        "Выбор каналов: начни с 2–3 основных (HH + специализированный).",
+        "Быстрый скрининг резюме: ответь на вопрос 'может ли он/она это делать?' за 2 мин.",
+    ]
+    
+    if work_format == "office" or work_format == "hybrid":
+        next_steps.append("Организаторский момент: убедись, что есть место для работника и оборудование.")
+    
+    next_steps.append("Первое интервью: рассказывай о задачах, спрашивай о опыте, проверяй культуру.")
+    next_steps.append("Тестовое задание (если уместно): small scope, 2–4 часа работы, реальная задача.")
+    
+    return {
+        "headline": headline,
+        "where_to_search": where_to_search,
+        "what_to_screen": what_to_screen,
+        "budget_reality_check": {
+            "status": budget_status,
+            "bullets": budget_bullets,
+        },
+        "next_steps": next_steps,
+    }
+
+
 @app.post("/sessions")
 def create_session(body: SessionCreate):
     session_id = str(uuid.uuid4())
