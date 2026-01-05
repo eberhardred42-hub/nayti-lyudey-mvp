@@ -1,0 +1,35 @@
+services:
+  api:
+    build: ../api
+    ports:
+      - "8000:8000"
+    depends_on:
+      - db
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/nlyudi
+
+  ml:
+    build: ../ml
+    ports:
+      - "8001:8001"
+
+  front:
+    build: ../front
+    ports:
+      - "3000:3000"
+    environment:
+      - BACKEND_URL=http://api:8000
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nlyudi
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
