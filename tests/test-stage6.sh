@@ -8,8 +8,9 @@ COMPOSE="docker compose -f infra/docker-compose.yml"
 BACKEND_URL="${BACKEND_URL:-http://localhost:8000}"
 FRONT_URL="${FRONT_URL:-http://localhost:3000}"
 ML_URL="${ML_URL:-http://localhost:8001}"
-HEADERS_FILE_1="/tmp/stage6_headers_1.txt"
-HEADERS_FILE_2="/tmp/stage6_headers_2.txt"
+TMPDIR="${RUNNER_TEMP:-/tmp}"
+HEADERS_FILE_1="$TMPDIR/stage6_headers_1.txt"
+HEADERS_FILE_2="$TMPDIR/stage6_headers_2.txt"
 
 # Stage 6 observability integration test
 # Requires running docker compose or already running services.
@@ -44,32 +45,33 @@ wait_url "$ML_URL/health" "ml"
 
 echo "[stage6] Create session"
 
-TMPDIR=${TMPDIR:-/tmp}
-HDR="$(mktemp "$TMPDIR/stage6-hdr.XXXXXX")"
-BODY="$(mktemp "$TMPDIR/stage6-body.XXXXXX")"
+TMPDIR="${RUNNER_TEMP:-/tmp}"
+HDR="$(mktemp -p "$TMPDIR" stage6-hdr.XXXXXX)"
+BODY="$(mktemp -p "$TMPDIR" stage6-body.XXXXXX)"
 chmod 644 "$HDR" "$BODY" || true
 CODE="$(curl -sS -D "$HDR" -o "$BODY" -w '%{http_code}' \
   -X POST "$BACKEND_URL/sessions" \
   -H "Content-Type: application/json" \
   -d '{"profession_query":"Маркетолог"}')"
 
-SESSION_ID="$(python3 - <<'PY'
+SESSION_ID="$(python3 - "$BODY" <<'PY'
 import json,sys
 try:
-    data=json.load(open(sys.argv[1],'r',encoding='utf-8'))
-    print(data.get("session_id","") or "")
+    data=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
+    print(data.get("session_id", "") or "")
 except Exception:
     print("")
 PY
-"$BODY")"
+)"
+
+echo "[stage6] /sessions HTTP_CODE=$CODE"
+echo "--- headers ---"
+cat "$HDR" || true
+echo "--- body ---"
+cat "$BODY" || true
 
 if [[ "$CODE" != "200" || -z "$SESSION_ID" ]]; then
   echo "[stage6][error] Session creation failed"
-  echo "HTTP_CODE=$CODE"
-  echo "--- headers ---"
-  cat "$HDR" || true
-  echo "--- body ---"
-  cat "$BODY" || true
   exit 1
 fi
 
