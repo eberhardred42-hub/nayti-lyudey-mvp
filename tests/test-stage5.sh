@@ -5,7 +5,7 @@
 
 set -e
 
-PROJECT_DIR="/workspaces/nayti-lyudey-mvp"
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
 
 BACKEND_URL="${BACKEND_URL:-http://localhost:8000}"

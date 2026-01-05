@@ -42,6 +42,13 @@ async def request_id_middleware(request: Request, call_next):
     request_id = request.headers.get("X-Request-Id") or str(uuid.uuid4())
     request.state.request_id = request_id
     start_time = time.perf_counter()
+    log_event(
+        "request_received",
+        request_id=request_id,
+        route=str(request.url.path),
+        method=request.method,
+        content_length=request.headers.get("content-length"),
+    )
     try:
         response = await call_next(request)
     except Exception as exc:
@@ -56,6 +63,14 @@ async def request_id_middleware(request: Request, call_next):
             error=str(exc),
         )
         raise
+    log_event(
+        "request_finished",
+        request_id=request_id,
+        route=str(request.url.path),
+        method=request.method,
+        status_code=response.status_code,
+        duration_ms=compute_duration_ms(start_time),
+    )
     response.headers["X-Request-Id"] = request_id
     return response
 
@@ -186,6 +201,15 @@ def update_meta(kb):
     kb["meta"]["filled_fields_count"] = count_filled_fields(kb)
     kb["meta"]["missing_fields"] = compute_missing_fields(kb)
     kb["meta"]["last_updated_iso"] = datetime.utcnow().isoformat() + "Z"
+
+
+def kb_meta_counts(kb):
+    meta = kb.get("meta", {})
+    missing_fields = meta.get("missing_fields") or []
+    return {
+        "filled_fields_count": meta.get("filled_fields_count", 0),
+        "missing_fields_count": len(missing_fields),
+    }
 
 
 def template_questions_and_quick_replies(missing_fields):
@@ -357,7 +381,7 @@ def chat_message(body: ChatMessage, request: Request):
     
     # Try to load from database
     try:
-        db_session = get_session(sid)
+        db_session = get_session(sid, request_id=request_id)
         if db_session:
             session = {
                 "profession_query": db_session.get("profession_query", ""),
@@ -379,6 +403,8 @@ def chat_message(body: ChatMessage, request: Request):
             error=str(e),
         )
 
+    kb_counts = kb_meta_counts(session.get("vacancy_kb", make_empty_vacancy_kb()))
+    state_before = session.get("state")
     log_event(
         "chat_message_received",
         request_id=request_id,
@@ -387,9 +413,13 @@ def chat_message(body: ChatMessage, request: Request):
         method=request.method,
         duration_ms=compute_duration_ms(start_time),
         message_type=msg_type,
+        chat_state_before=state_before,
+        filled_fields_count=kb_counts.get("filled_fields_count"),
+        missing_fields_count=kb_counts.get("missing_fields_count"),
     )
 
     def log_reply(event_name="chat_reply_sent", **extra_fields):
+        kb_counts_after = kb_meta_counts(session.get("vacancy_kb", make_empty_vacancy_kb()))
         log_event(
             event_name,
             request_id=request_id,
@@ -397,6 +427,9 @@ def chat_message(body: ChatMessage, request: Request):
             route=str(request.url.path),
             method=request.method,
             duration_ms=compute_duration_ms(start_time),
+            chat_state_after=session.get("state"),
+            filled_fields_count=kb_counts_after.get("filled_fields_count"),
+            missing_fields_count=kb_counts_after.get("missing_fields_count"),
             **extra_fields,
         )
 
@@ -416,8 +449,8 @@ def chat_message(body: ChatMessage, request: Request):
         
         # Save to DB
         try:
-            add_message(sid, "assistant", reply)
-            update_session(sid, chat_state=session["state"])
+            add_message(sid, "assistant", reply, request_id=request_id)
+            update_session(sid, chat_state=session["state"], request_id=request_id)
         except Exception as e:
             log_event(
                 "db_error",
@@ -435,7 +468,7 @@ def chat_message(body: ChatMessage, request: Request):
     # Save user message
     if text:
         try:
-            add_message(sid, "user", text)
+            add_message(sid, "user", text, request_id=request_id)
         except Exception as e:
             log_event(
                 "db_error",
@@ -461,8 +494,8 @@ def chat_message(body: ChatMessage, request: Request):
             quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
         
         try:
-            add_message(sid, "assistant", reply)
-            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+            add_message(sid, "assistant", reply, request_id=request_id)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"], request_id=request_id)
         except Exception as e:
             log_event(
                 "db_error",
@@ -532,8 +565,8 @@ def chat_message(body: ChatMessage, request: Request):
             reply = "Пожалуйста, вставь текст вакансии целиком (подробнее, >200 символов)."
         
         try:
-            add_message(sid, "assistant", reply)
-            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+            add_message(sid, "assistant", reply, request_id=request_id)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"], request_id=request_id)
         except Exception as e:
             log_event(
                 "db_error",
@@ -585,8 +618,8 @@ def chat_message(body: ChatMessage, request: Request):
         )
         
         try:
-            add_message(sid, "assistant", reply)
-            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+            add_message(sid, "assistant", reply, request_id=request_id)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"], request_id=request_id)
         except Exception as e:
             log_event(
                 "db_error",
@@ -672,8 +705,8 @@ def chat_message(body: ChatMessage, request: Request):
     # fallback
     reply = "Хорошо, записал."
     try:
-        add_message(sid, "assistant", reply)
-        update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        add_message(sid, "assistant", reply, request_id=request_id)
+        update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"], request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -694,9 +727,10 @@ def health():
 
 
 @app.get("/health/db")
-def health_db():
+def health_db(request: Request):
     """Check database connectivity."""
-    db_ok = health_check()
+    request_id = get_request_id_from_request(request)
+    db_ok = health_check(request_id=request_id)
     return {"ok": db_ok}
 
 
@@ -715,7 +749,7 @@ def get_vacancy(session_id: str, request: Request):
     
     # Also try to load from database
     try:
-        db_session = get_session(session_id)
+        db_session = get_session(session_id, request_id=request_id)
         if db_session and db_session.get("vacancy_kb"):
             kb = db_session["vacancy_kb"]
     except Exception as e:
@@ -757,7 +791,7 @@ def get_free_report(session_id: str, request: Request):
 
     # Try to load from database first
     try:
-        db_session = get_session(session_id)
+        db_session = get_session(session_id, request_id=request_id)
         if db_session:
             if db_session.get("free_report"):
                 log_event(
@@ -801,7 +835,7 @@ def get_free_report(session_id: str, request: Request):
 
     # Save to database
     try:
-        update_session(session_id, free_report=free_report)
+        update_session(session_id, free_report=free_report, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -1019,7 +1053,7 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     # Also save to database
     try:
         kb = make_empty_vacancy_kb()
-        db_create_session(session_id, body.profession_query, kb)
+        db_create_session(session_id, body.profession_query, kb, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -1047,7 +1081,7 @@ def debug_session(session_id: str, request: Request):
     """Read-only session debug endpoint."""
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
-    db_session = get_session(session_id)
+    db_session = get_session(session_id, request_id=request_id)
     if not db_session:
         raise HTTPException(status_code=404, detail="Session not found")
     kb = db_session.get("vacancy_kb") or make_empty_vacancy_kb()
@@ -1075,10 +1109,10 @@ def debug_messages(session_id: str, request: Request, limit: int = 50):
     """Read-only messages debug endpoint."""
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
-    db_session = get_session(session_id)
+    db_session = get_session(session_id, request_id=request_id)
     if not db_session:
         raise HTTPException(status_code=404, detail="Session not found")
-    msgs = get_session_messages(session_id, limit=limit)
+    msgs = get_session_messages(session_id, limit=limit, request_id=request_id)
     normalized = []
     for msg in msgs:
         normalized.append({

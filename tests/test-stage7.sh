@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+
 # Stage 7: LLM-driven clarifications (mock/openai_compat) integration test
 
 BASE_URL=${BASE_URL:-http://localhost:8000}
