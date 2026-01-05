@@ -44,8 +44,10 @@ wait_url "$ML_URL/health" "ml"
 
 echo "[stage6] Create session"
 
-HDR="$(mktemp)"
-BODY="$(mktemp)"
+TMPDIR=${TMPDIR:-/tmp}
+HDR="$(mktemp "$TMPDIR/stage6-hdr.XXXXXX")"
+BODY="$(mktemp "$TMPDIR/stage6-body.XXXXXX")"
+chmod 644 "$HDR" "$BODY" || true
 CODE="$(curl -sS -D "$HDR" -o "$BODY" -w '%{http_code}' \
   -X POST "$BACKEND_URL/sessions" \
   -H "Content-Type: application/json" \
