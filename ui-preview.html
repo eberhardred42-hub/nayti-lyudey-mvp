@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>НайтиЛюдей - UI Preview</title>
+    <style>
+        /* Минималистичный стиль: линии и воздух */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+            background: #fff;
+            color: #000;
+        }
+
+        .container {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* Стартовый экран */
+        .searchMode {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .searchBox {
+            width: 100%;
+            max-width: 600px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .searchInput {
+            flex: 1;
+            font-size: 18px;
+            padding: 12px 0;
+            border: none;
+            border-bottom: 2px solid #000;
+            outline: none;
+            background: transparent;
+        }
+
+        .searchInput::placeholder {
+            color: #999;
+        }
+
+        .searchBtn {
+            padding: 12px 24px;
+            font-size: 16px;
+            border: 1px solid #000;
+            background: #fff;
+            color: #000;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: none;
+        }
+
+        .searchBtn.visible {
+            display: block;
+        }
+
+        .searchBtn:hover {
+            background: #000;
+            color: #fff;
+        }
+
+        /* Чат-экран */
+        .chatMode {
+            display: none;
+            flex-direction: column;
+            height: 100vh;
+        }
+
+        .chatMode.active {
+            display: flex;
+        }
+
+        .topQuery {
+            position: sticky;
+            top: 0;
+            background: #fff;
+            border-bottom: 1px solid #ddd;
+            padding: 20px 24px;
+            z-index: 10;
+        }
+
+        .topQueryLabel {
+            font-size: 12px;
+            color: #666;
+            margin-bottom: 4px;
+        }
+
+        .topQueryText {
+            font-size: 18px;
+            font-weight: 400;
+        }
+
+        .messagesArea {
+            flex: 1;
+            overflow-y: auto;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .message {
+            max-width: 70%;
+            padding: 12px 0;
+            line-height: 1.5;
+            white-space: pre-wrap;
+        }
+
+        .messageUser {
+            align-self: flex-end;
+            text-align: right;
+            border-bottom: 1px solid #000;
+        }
+
+        .messageAssistant {
+            align-self: flex-start;
+            border-bottom: 1px solid #ccc;
+        }
+
+        .composerArea {
+            border-top: 1px solid #ddd;
+            padding: 16px 24px;
+            background: #fff;
+        }
+
+        .composerRow {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            margin-bottom: 12px;
+        }
+
+        .composerInput {
+            flex: 1;
+            font-size: 16px;
+            padding: 8px 0;
+            border: none;
+            border-bottom: 1px solid #000;
+            outline: none;
+            background: transparent;
+        }
+
+        .composerInput::placeholder {
+            color: #999;
+        }
+
+        .sendBtn {
+            padding: 8px 16px;
+            font-size: 14px;
+            border: 1px solid #000;
+            background: #fff;
+            color: #000;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .sendBtn:hover {
+            background: #000;
+            color: #fff;
+        }
+
+        .quickReplies {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+        }
+
+        .quickReplyBtn {
+            padding: 8px 16px;
+            font-size: 14px;
+            border: 1px solid #ccc;
+            background: #fff;
+            color: #000;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .quickReplyBtn:hover {
+            border-color: #000;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <!-- Стартовый экран -->
+        <div class="searchMode" id="searchMode">
+            <div class="searchBox">
+                <input 
+                    class="searchInput" 
+                    id="searchInput"
+                    placeholder="Кого ты ищешь?"
+                    autocomplete="off"
+                />
+                <button class="searchBtn" id="searchBtn">
+                    Найти людей
+                </button>
+            </div>
+        </div>
+
+        <!-- Чат-экран -->
+        <div class="chatMode" id="chatMode">
+            <!-- Запрос наверху (sticky) -->
+            <div class="topQuery">
+                <div class="topQueryLabel">Запрос</div>
+                <div class="topQueryText" id="topQueryText"></div>
+            </div>
+
+            <!-- Область сообщений -->
+            <div class="messagesArea" id="messagesArea">
+                <!-- Сообщения добавляются динамически -->
+            </div>
+
+            <!-- Composer внизу -->
+            <div class="composerArea">
+                <div class="composerRow">
+                    <input 
+                        class="composerInput" 
+                        id="composerInput"
+                        placeholder="Напиши сообщение..."
+                        autocomplete="off"
+                    />
+                    <button class="sendBtn" id="sendBtn">
+                        Отправить
+                    </button>
+                </div>
+
+                <!-- Quick replies -->
+                <div class="quickReplies" id="quickReplies">
+                    <!-- Кнопки добавляются динамически -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // State
+        let mode = 'search';
+        let messages = [];
+        let quickReplies = ['Есть текст вакансии', 'Нет вакансии, есть задачи'];
+
+        // Elements
+        const searchMode = document.getElementById('searchMode');
+        const chatMode = document.getElementById('chatMode');
+        const searchInput = document.getElementById('searchInput');
+        const searchBtn = document.getElementById('searchBtn');
+        const topQueryText = document.getElementById('topQueryText');
+        const messagesArea = document.getElementById('messagesArea');
+        const composerInput = document.getElementById('composerInput');
+        const sendBtn = document.getElementById('sendBtn');
+        const quickRepliesDiv = document.getElementById('quickReplies');
+
+        // Показать/скрыть кнопку "Найти людей"
+        searchInput.addEventListener('input', () => {
+            if (searchInput.value.trim()) {
+                searchBtn.classList.add('visible');
+            } else {
+                searchBtn.classList.remove('visible');
+            }
+        });
+
+        // Нажатие Enter в поиске
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && searchInput.value.trim()) {
+                startChat();
+            }
+        });
+
+        // Кнопка "Найти людей"
+        searchBtn.addEventListener('click', startChat);
+
+        // Начать чат
+        function startChat() {
+            const query = searchInput.value.trim();
+            if (!query) return;
+
+            // Переключаемся в режим чата
+            mode = 'chat';
+            searchMode.style.display = 'none';
+            chatMode.classList.add('active');
+            topQueryText.textContent = query;
+
+            // Добавляем первое сообщение от ассистента
+            addMessage('assistant', 'Привет! Давай найдём тебе нужных людей. У тебя есть текст вакансии?');
+            renderQuickReplies();
+        }
+
+        // Добавить сообщение
+        function addMessage(role, text) {
+            messages.push({ role, text });
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message message${role === 'user' ? 'User' : 'Assistant'}`;
+            messageDiv.textContent = text;
+            
+            messagesArea.appendChild(messageDiv);
+            messagesArea.scrollTop = messagesArea.scrollHeight;
+        }
+
+        // Отрисовать quick replies
+        function renderQuickReplies() {
+            quickRepliesDiv.innerHTML = '';
+            
+            quickReplies.forEach(reply => {
+                const btn = document.createElement('button');
+                btn.className = 'quickReplyBtn';
+                btn.textContent = reply;
+                btn.addEventListener('click', () => {
+                    handleUserMessage(reply);
+                });
+                quickRepliesDiv.appendChild(btn);
+            });
+        }
+
+        // Обработать сообщение пользователя
+        function handleUserMessage(text) {
+            addMessage('user', text);
+            composerInput.value = '';
+            
+            // Имитация ответа ассистента
+            setTimeout(() => {
+                if (text.includes('Есть текст вакансии')) {
+                    addMessage('assistant', 'Отлично! Вставь текст вакансии целиком.');
+                    quickReplies = [];
+                    renderQuickReplies();
+                } else if (text.includes('Нет вакансии')) {
+                    addMessage('assistant', 'Хорошо, опиши задачи, которые нужно сделать.');
+                    quickReplies = [];
+                    renderQuickReplies();
+                } else {
+                    addMessage('assistant', 'Понял. Уточни:\n• Город и формат (удалённо/очно)\n• Бюджет (примерно)\n• Занятость');
+                    quickReplies = ['Москва, гибрид, 200-300к', 'СПб, удалённо, 150к'];
+                    renderQuickReplies();
+                }
+            }, 500);
+        }
+
+        // Отправка сообщения
+        sendBtn.addEventListener('click', () => {
+            const text = composerInput.value.trim();
+            if (text) {
+                handleUserMessage(text);
+            }
+        });
+
+        // Enter в composer
+        composerInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter' && composerInput.value.trim()) {
+                handleUserMessage(composerInput.value.trim());
+            }
+        });
+    </script>
+</body>
+</html>

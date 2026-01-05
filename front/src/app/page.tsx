@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import styles from "./page.module.css";
 
 type Msg = { role: "user" | "assistant"; text: string };
 
@@ -11,6 +12,17 @@ type Stage =
   | "tasks"
   | "clarifications"
   | "free_result";
+
+type FreeReport = {
+  headline: string;
+  where_to_search: Array<{ title: string; bullets: string[] }>;
+  what_to_screen: string[];
+  budget_reality_check: {
+    status: string;
+    bullets: string[];
+  };
+  next_steps: string[];
+};
 
 const CLARIFICATIONS = [
   "Город и формат (удалённо / очно)",
@@ -28,15 +40,21 @@ export default function Page() {
   const [clarIdx, setClarIdx] = useState(0);
   const [clarAnswers, setClarAnswers] = useState<string[]>([]);
   const [showPayModal, setShowPayModal] = useState(false);
+  const [freeReport, setFreeReport] = useState<FreeReport | null>(null);
+  const [reportLoading, setReportLoading] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   const boxRef = useRef<HTMLDivElement | null>(null);
+  
+  // Mode: "search" or "chat"
+  const mode = stage === "start" ? "search" : "chat";
 
-  // автоскролл вниз при новых сообщениях
+  // Автоскролл вниз при новых сообщениях
   useEffect(() => {
     const el = boxRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [messages.length, stage]);
+  }, [messages.length, stage, freeReport]);
 
   async function start() {
     if (!profession.trim()) return;
@@ -66,6 +84,25 @@ export default function Page() {
     setMessages((m) => [...m, { role: "assistant", text }]);
   }
 
+  async function fetchFreeReport(sid: string) {
+    if (!sid) return;
+    setReportLoading(true);
+    setReportError(null);
+    try {
+      const r = await fetch(`/api/report/free?session_id=${sid}`);
+      const data = await r.json();
+      if (r.ok && data.free_report) {
+        setFreeReport(data.free_report);
+      } else {
+        setReportError("Не удалось загрузить отчёт, попробуй обновить");
+      }
+    } catch (err) {
+      setReportError("Ошибка при загрузке отчёта");
+    } finally {
+      setReportLoading(false);
+    }
+  }
+
   async function sendToChat(text: string) {
     if (!sessionId) return;
     const r = await fetch("/api/chat/message", {
@@ -76,7 +113,11 @@ export default function Page() {
     const data = await r.json();
     if (data.reply) setMessages((m) => [...m, { role: "assistant", text: data.reply }]);
     setQuickReplies(data.quick_replies || []);
-    if (data.should_show_free_result) setStage("free_result");
+    if (data.should_show_free_result) {
+      setStage("free_result");
+      // Fetch the free report
+      await fetchFreeReport(sessionId);
+    }
     // try to infer stage from reply text
     const low = (data.reply || "").toLowerCase();
     if (low.includes("вставь") && low.includes("ваканс")) setStage("vacancy_text");
@@ -105,202 +146,193 @@ export default function Page() {
     sendToChat(trimmed);
   }
 
-  // Enter отправляет сообщение
-  function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      handleUserSend(input);
-    }
-  }
-
   return (
-    <main style={{ maxWidth: 720, margin: "40px auto", padding: 16 }}>
-      {stage === "start" ? (
-        <div>
-          <h1 style={{ fontSize: 28, marginBottom: 12 }}>НайтиЛюдей</h1>
-          <p style={{ marginBottom: 16, opacity: 0.8 }}>
-            Введи профессию или примерно “что нужно сделать”.
-          </p>
-          <div style={{ display: "flex", gap: 8 }}>
+    <div className={styles.container}>
+      {mode === "search" ? (
+        // Стартовый экран: пустая страница, только строка ввода
+        <div className={styles.searchMode}>
+          <div className={styles.searchBox}>
             <input
+              className={styles.searchInput}
               value={profession}
               onChange={(e) => setProfession(e.target.value)}
               placeholder="Кого ты ищешь?"
-              style={{
-                flex: 1,
-                padding: 12,
-                border: "1px solid #ddd",
-                borderRadius: 10,
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && profession.trim()) {
+                  start();
+                }
               }}
             />
-            <button
-              onClick={start}
-              style={{
-                padding: "12px 16px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                cursor: "pointer",
-              }}
-            >
-              Найти
-            </button>
+            {profession.trim() && (
+              <button className={styles.searchBtn} onClick={start}>
+                Найти людей
+              </button>
+            )}
           </div>
         </div>
       ) : (
-        <div>
-          <div style={{ marginBottom: 12, opacity: 0.7 }}>
-            Запрос: <b>{profession}</b>
-            {sessionId ? (
-              <span>
-                {' '}3: Сессия: <b>{sessionId.slice(0, 8)}…</b>
-              </span>
-            ) : null}
+        // Чат-экран: топ запрос + сообщения + composer
+        <div className={styles.chatMode}>
+          {/* Запрос наверху (sticky) */}
+          <div className={styles.topQuery}>
+            <div className={styles.topQueryLabel}>Запрос</div>
+            <div className={styles.topQueryText}>{profession}</div>
           </div>
 
-          <div
-            style={{
-              border: "1px solid #eee",
-              borderRadius: 14,
-              padding: 12,
-              height: 420,
-              overflow: "auto",
-              display: "flex",
-              flexDirection: "column",
-              gap: 10,
-              background: "#fff",
-            }}
-            ref={boxRef}
-          >
+          {/* Область сообщений */}
+          <div className={styles.messagesArea} ref={boxRef}>
             {messages.map((m, i) => (
               <div
                 key={i}
-                style={{
-                  alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-                  maxWidth: "82%",
-                  padding: 10,
-                  borderRadius: 14,
-                  background: m.role === "user" ? "#f3f4f6" : "#fafafa",
-                  border: "1px solid #eee",
-                  whiteSpace: "pre-wrap",
-                }}
+                className={
+                  m.role === "user"
+                    ? `${styles.message} ${styles.messageUser}`
+                    : `${styles.message} ${styles.messageAssistant}`
+                }
               >
                 {m.text}
               </div>
             ))}
 
-            {/* быстрые кнопки (quick replies) */}
+            {/* Free report */}
+            {stage === "free_result" && (
+              <div className={styles.freeReportBox}>
+                {reportLoading && (
+                  <div className={styles.reportLoading}>Загружаю отчёт...</div>
+                )}
+
+                {reportError && (
+                  <div className={styles.reportError}>{reportError}</div>
+                )}
+
+                {freeReport && (
+                  <>
+                    <h3>{freeReport.headline}</h3>
+
+                    {/* Где искать */}
+                    <div>
+                      <h4>Где искать</h4>
+                      {freeReport.where_to_search.map((section, idx) => (
+                        <div key={idx}>
+                          <div style={{ fontWeight: "bold", marginBottom: 4 }}>
+                            {section.title}
+                          </div>
+                          <ul>
+                            {section.bullets.map((bullet, bidx) => (
+                              <li key={bidx}>{bullet}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* На что смотреть */}
+                    <div>
+                      <h4>На что смотреть</h4>
+                      <ul>
+                        {freeReport.what_to_screen.map((item, idx) => (
+                          <li key={idx}>{item}</li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {/* Бюджет: реальность */}
+                    <div>
+                      <h4>Бюджет: реальность</h4>
+                      <ul>
+                        {freeReport.budget_reality_check.bullets.map((bullet, idx) => (
+                          <li key={idx}>{bullet}</li>
+                        ))}
+                      </ul>
+                    </div>
+
+                    {/* Дальше */}
+                    <div>
+                      <h4>Дальше</h4>
+                      <ol>
+                        {freeReport.next_steps.map((step, idx) => (
+                          <li key={idx}>{step}</li>
+                        ))}
+                      </ol>
+                    </div>
+
+                    <button
+                      className={styles.fullPackageBtn}
+                      onClick={() => setShowPayModal(true)}
+                    >
+                      Получить полный пакет
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Composer внизу */}
+          <div className={styles.composerArea}>
+            <div className={styles.composerRow}>
+              <input
+                className={styles.composerInput}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                placeholder={
+                  stage === "vacancy_text"
+                    ? "Вставь текст вакансии..."
+                    : stage === "tasks"
+                    ? "Опиши задачи..."
+                    : stage === "clarifications"
+                    ? `Ответ: ${CLARIFICATIONS[clarIdx] ?? "..."}`
+                    : "Напиши сообщение..."
+                }
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && input.trim()) {
+                    handleUserSend(input);
+                  }
+                }}
+              />
+              <button className={styles.sendBtn} onClick={() => handleUserSend(input)}>
+                Отправить
+              </button>
+            </div>
+
+            {/* Quick replies */}
             {quickReplies.length > 0 && (
-              <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
+              <div className={styles.quickReplies}>
                 {quickReplies.map((q, idx) => (
                   <button
                     key={idx}
+                    className={styles.quickReplyBtn}
                     onClick={() => {
                       setMessages((m) => [...m, { role: "user", text: q }]);
                       sendToChat(q);
                     }}
-                    style={{ padding: 8, borderRadius: 8 }}
                   >
                     {q}
                   </button>
                 ))}
               </div>
             )}
-
-            {/* при free_result показываем блок результата */}
-            {stage === "free_result" && (
-              <div style={{ marginTop: 8, padding: 12, borderRadius: 10, background: "#fcfdfd" }}>
-                <h3 style={{ marginTop: 0 }}>Бесплатный результат</h3>
-                <div style={{ marginBottom: 8 }}>
-                  <b>Где искать</b>
-                  <ul>
-                    <li>Платформы для фриланса (Upwork, Freelance.ru)</li>
-                    <li>Профессиональные сообщества в Telegram и Slack</li>
-                  </ul>
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <b>На что смотреть</b>
-                  <ul>
-                    <li>Портфолио и отзывы</li>
-                    <li>Сроки и ответственность</li>
-                    <li>Примеры похожих задач</li>
-                  </ul>
-                </div>
-                <div style={{ marginBottom: 8 }}>
-                  <b>Сколько стоит</b>
-                  <div>Диапазон (заглушка): 15 000–80 000 ₽; стратегия: начать с тестового задания.</div>
-                </div>
-                <div style={{ display: "flex", gap: 8 }}>
-                  <button onClick={() => setShowPayModal(true)} style={{ padding: 8, borderRadius: 8 }}>
-                    Получить полный пакет
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
-
-          <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder={
-                stage === "vacancy_text"
-                  ? "Вставь текст вакансии…"
-                  : stage === "tasks"
-                  ? "Опиши задачи…"
-                  : stage === "clarifications"
-                  ? `Ответ: ${CLARIFICATIONS[clarIdx] ?? "..."}`
-                  : "Напиши сообщение…"
-              }
-              style={{
-                flex: 1,
-                padding: 12,
-                border: "1px solid #ddd",
-                borderRadius: 10,
-              }}
-              onKeyDown={onKeyDown}
-            />
-            <button
-              onClick={() => handleUserSend(input)}
-              style={{
-                padding: "12px 16px",
-                borderRadius: 10,
-                border: "1px solid #ddd",
-                cursor: "pointer",
-              }}
-            >
-              Отправить
-            </button>
-          </div>
-
-          {/* Paywall modal */}
-          {showPayModal && (
-            <div
-              style={{
-                position: "fixed",
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-                background: "rgba(0,0,0,0.4)",
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                zIndex: 60,
-              }}
-            >
-              <div style={{ width: 360, background: "white", padding: 20, borderRadius: 12 }}>
-                <h3>Скоро: платный пакет документов</h3>
-                <p>Тестируем цену 150–390 ₽.</p>
-                <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
-                  <button onClick={() => setShowPayModal(false)} style={{ padding: 8, borderRadius: 8 }}>
-                    Закрыть
-                  </button>
-                </div>
-              </div>
-            </div>
-          )}
         </div>
       )}
-    </main>
+
+      {/* Paywall modal */}
+      {showPayModal && (
+        <div className={styles.payModal}>
+          <div className={styles.payModalContent}>
+            <h3>Скоро: платный пакет документов</h3>
+            <p>Тестируем цену 150–390 ₽.</p>
+            <div className={styles.modalActions}>
+              <button
+                className={styles.closeBtn}
+                onClick={() => setShowPayModal(false)}
+              >
+                Закрыть
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }

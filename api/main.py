@@ -3,9 +3,17 @@ from pydantic import BaseModel
 import uuid
 import re
 from datetime import datetime
+from db import init_db, health_check, create_session as db_create_session
+from db import get_session, update_session, add_message, get_session_messages
 
 app = FastAPI()
 SESSIONS = {}
+
+# Initialize database on startup
+try:
+    init_db()
+except Exception as e:
+    print(f"Warning: Database initialization failed: {e}")
 
 class SessionCreate(BaseModel):
     profession_query: str
@@ -239,6 +247,22 @@ def chat_message(body: ChatMessage):
 
     # Ensure session exists
     session = ensure_session(sid)
+    
+    # Try to load from database
+    try:
+        db_session = get_session(sid)
+        if db_session:
+            session = {
+                "profession_query": db_session.get("profession_query", ""),
+                "state": db_session.get("chat_state", "awaiting_flow"),
+                "vacancy_text": None,
+                "tasks": None,
+                "clarifications": [],
+                "vacancy_kb": db_session.get("vacancy_kb", make_empty_vacancy_kb()),
+            }
+            SESSIONS[sid] = session
+    except Exception as e:
+        print(f"Warning: Failed to load session from DB: {e}")
 
     # default response
     reply = ""
@@ -252,7 +276,22 @@ def chat_message(body: ChatMessage):
         reply = "Привет 🙂 Супер, что ты решил подойти к найму спокойно. Есть текст вакансии или только описание задач?"
         quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
         should_show_free_result = False
+        
+        # Save to DB
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"])
+        except Exception as e:
+            print(f"Warning: Failed to save message to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
+
+    # Save user message
+    if text:
+        try:
+            add_message(sid, "user", text)
+        except Exception as e:
+            print(f"Warning: Failed to save user message to DB: {e}")
 
     # user messages
     if state == "awaiting_flow":
@@ -266,6 +305,13 @@ def chat_message(body: ChatMessage):
         else:
             reply = "Не совсем понял. Есть текст вакансии или только задачи?"
             quick_replies = ["Есть текст вакансии", "Нет вакансии, есть задачи"]
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_vacancy_text":
@@ -302,6 +348,13 @@ def chat_message(body: ChatMessage):
             reply = "Спасибо — пара уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
         else:
             reply = "Пожалуйста, вставь текст вакансии целиком (подробнее, >200 символов)."
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_tasks":
@@ -325,6 +378,13 @@ def chat_message(body: ChatMessage):
         update_meta(kb)
         
         reply = "Спасибо — пару уточнений: 1) город и формат, 2) бюджет, 3) занятость. Ответь одним сообщением."
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
     if state == "awaiting_clarifications":
@@ -364,15 +424,35 @@ def chat_message(body: ChatMessage):
         
         reply = "Готово! Я собрал бесплатный результат ниже 🙂"
         should_show_free_result = True
+        
+        try:
+            add_message(sid, "assistant", reply)
+            update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+        except Exception as e:
+            print(f"Warning: Failed to save final state to DB: {e}")
+        
         return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": should_show_free_result}
 
     # fallback
     reply = "Хорошо, записал."
+    try:
+        add_message(sid, "assistant", reply)
+        update_session(sid, chat_state=session["state"], vacancy_kb=session["vacancy_kb"])
+    except Exception as e:
+        print(f"Warning: Failed to save fallback to DB: {e}")
+    
     return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/health/db")
+def health_db():
+    """Check database connectivity."""
+    db_ok = health_check()
+    return {"ok": db_ok}
 
 
 @app.get("/vacancy")
@@ -381,6 +461,14 @@ def get_vacancy(session_id: str):
     session = ensure_session(session_id)
     kb = session.get("vacancy_kb", make_empty_vacancy_kb())
     
+    # Also try to load from database
+    try:
+        db_session = get_session(session_id)
+        if db_session and db_session.get("vacancy_kb"):
+            kb = db_session["vacancy_kb"]
+    except Exception as e:
+        print(f"Warning: Failed to load vacancy from DB: {e}")
+    
     return {
         "session_id": session_id,
         "vacancy_kb": kb,
@@ -388,9 +476,232 @@ def get_vacancy(session_id: str):
         "filled_fields_count": kb["meta"]["filled_fields_count"],
     }
 
+
+@app.get("/report/free")
+def get_free_report(session_id: str):
+    """Generate and return a free report from the vacancy KB."""
+    session = ensure_session(session_id)
+    kb = session.get("vacancy_kb", make_empty_vacancy_kb())
+    profession_query = session.get("profession_query", "")
+    
+    # Try to load from database first
+    try:
+        db_session = get_session(session_id)
+        if db_session:
+            if db_session.get("free_report"):
+                # Return cached report
+                return {
+                    "session_id": session_id,
+                    "free_report": db_session["free_report"],
+                    "cached": True,
+                    "kb_meta": {
+                        "missing_fields": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["missing_fields"],
+                        "filled_fields_count": (db_session.get("vacancy_kb") or make_empty_vacancy_kb())["meta"]["filled_fields_count"],
+                    },
+                }
+            if db_session.get("vacancy_kb"):
+                kb = db_session["vacancy_kb"]
+            if db_session.get("profession_query"):
+                profession_query = db_session["profession_query"]
+    except Exception as e:
+        print(f"Warning: Failed to load report from DB: {e}")
+    
+    # Generate free report
+    free_report = generate_free_report(kb, profession_query)
+    
+    # Cache in session
+    session["free_report"] = free_report
+    session["free_report_generated_at"] = datetime.utcnow().isoformat() + "Z"
+    
+    # Save to database
+    try:
+        update_session(session_id, free_report=free_report)
+    except Exception as e:
+        print(f"Warning: Failed to save report to DB: {e}")
+    
+    return {
+        "session_id": session_id,
+        "free_report": free_report,
+        "cached": False,
+        "generated_at_iso": session["free_report_generated_at"],
+        "kb_meta": {
+            "missing_fields": kb["meta"]["missing_fields"],
+            "filled_fields_count": kb["meta"]["filled_fields_count"],
+        },
+    }
+
+def generate_free_report(kb, profession_query=""):
+    """Generate a free report from vacancy KB using simple heuristics."""
+    
+    # Extract useful data from KB
+    role_title = kb["role"]["role_title"]
+    role_domain = kb["role"]["role_domain"]
+    tasks = kb["responsibilities"]["tasks"]
+    work_format = kb["company"]["work_format"]
+    city = kb["company"]["company_location_city"]
+    employment_type = kb["employment"]["employment_type"]
+    salary_min = kb["compensation"]["salary_min_rub"]
+    salary_max = kb["compensation"]["salary_max_rub"]
+    salary_comment = kb["compensation"]["salary_comment"]
+    raw_text = kb["responsibilities"]["raw_vacancy_text"] or ""
+    
+    low_text = raw_text.lower()
+    low_query = profession_query.lower()
+    
+    # 1. Headline
+    headline_parts = ["Держи бесплатный результат поиска"]
+    if role_title:
+        headline_parts.append(f"по {role_title.lower()}")
+    elif role_domain:
+        headline_parts.append(f"в сфере {role_domain}")
+    headline = " ".join(headline_parts) + " 🎯"
+    
+    # 2. Where to search
+    where_to_search = []
+    
+    # Always include HH
+    where_to_search.append({
+        "title": "Основные площадки",
+        "bullets": [
+            "HeadHunter (HH) — основной источник резюме",
+            "LinkedIn — проверь профили и Recruiter функции",
+        ]
+    })
+    
+    # Add location-specific channels if office/hybrid and city known
+    if work_format in ["office", "hybrid"] and city:
+        where_to_search.append({
+            "title": f"Локальные каналы ({city.title()})",
+            "bullets": [
+                f"Telegram-чаты по IT/бизнесу в {city.title()}",
+                "VK сообщества профессионалов",
+                "Авито (для линейных/офисных позиций)",
+            ]
+        })
+    
+    # Add domain-specific channels
+    is_it = "it" in low_query or any(w in low_text for w in ["python", "java", "golang", "программ", "разработ", "backend", "frontend"])
+    is_creative = any(w in low_text for w in ["дизайн", "маркетинг", "реклам", "контент", "креатив"])
+    is_sales = any(w in low_text for w in ["продажа", "sales", "менеджер", "бизнес-развитие"])
+    
+    if is_it:
+        where_to_search.append({
+            "title": "IT-специфичные каналы",
+            "bullets": [
+                "Habr Career",
+                "Telegram IT-чаты по стеку (Python, Go, JS и т.д.)",
+                "GitHub (прямой поиск по профилям)",
+            ]
+        })
+    
+    if is_creative:
+        where_to_search.append({
+            "title": "Креативные каналы",
+            "bullets": [
+                "Behance, Dribbble (портфолио дизайнеров)",
+                "Telegram-каналы творческих сообществ",
+                "TikTok/YouTube (для контент-мейкеров)",
+            ]
+        })
+    
+    if is_sales:
+        where_to_search.append({
+            "title": "Продажи и управление",
+            "bullets": [
+                "LinkedIn (сетевой поиск)",
+                "Telegram-каналы бизнес-сообществ",
+                "Рекомендации и рефералы внутри сети",
+            ]
+        })
+    
+    # If no specific domain, add general recommendations
+    if not (is_it or is_creative or is_sales) and len(where_to_search) == 1:
+        where_to_search.append({
+            "title": "Альтернативные каналы",
+            "bullets": [
+                "Telegram-сообщества профессионалов",
+                "VK группы (зачастую живые обсуждения)",
+                "Рефералы и личные контакты",
+            ]
+        })
+    
+    # 3. What to screen
+    what_to_screen = [
+        "Резюме/портфолио: актуальность, ясность стека и опыта",
+        "Примеры работ/кейсы: релевантность к твоим задачам",
+        "Мягкие навыки: общительность, ответственность, проактивность",
+    ]
+    
+    if tasks:
+        what_to_screen.append("Понимание твоих задач: может ли кандидат их объяснить своими словами")
+    
+    if is_it:
+        what_to_screen.append("Знание инструментов: какие стеки/фреймворки точно нужны")
+        what_to_screen.append("Pet проекты: показывают интерес к профессии")
+    
+    if is_creative:
+        what_to_screen.append("Чувство стиля: соответствует ли эстетика твоему видению")
+        what_to_screen.append("Процесс работы: может объяснить решения и ограничения")
+    
+    if is_sales:
+        what_to_screen.append("Track record: цифры, результаты, достижения")
+        what_to_screen.append("Энергия и амбициозность: готовность к росту")
+    
+    what_to_screen.append("Honesty red flags: недовольство предыдущими работодателями, зарплатные скачки без причины")
+    what_to_screen.append("Этика найма: убедись, что нет конфликта интересов или действующего контракта")
+    
+    # 4. Budget reality check
+    budget_status = "unknown"
+    budget_bullets = []
+    
+    if salary_min or salary_max or salary_comment:
+        budget_bullets = [
+            "Если бюджет выше—сконцентрируйся на опыте и уровне сеньёра.",
+            "Если бюджет ниже—рассмотри джуна с хорошим потенциалом, part-time или проектную работу.",
+            "Опцион: наставничество (junior + ментор) может быть экономичнее середины.",
+        ]
+        if salary_comment:
+            budget_bullets.insert(0, f"Твой бюджет: {salary_comment}")
+        elif salary_min and salary_max:
+            budget_bullets.insert(0, f"Бюджет: {salary_min:,}–{salary_max:,} ₽")
+    else:
+        budget_bullets = [
+            "Не указан бюджет, но помни: рынок очень вариативен.",
+            "Перед размещением вакансии — проверь аналогичные позиции на HH.",
+            "Не боись предложить тестовое задание, чтобы оценить реального кандидата.",
+        ]
+    
+    # 5. Next steps
+    next_steps = [
+        "Формирование вакансии: ясные требования, стек, условия, процесс интервью.",
+        "Выбор каналов: начни с 2–3 основных (HH + специализированный).",
+        "Быстрый скрининг резюме: ответь на вопрос 'может ли он/она это делать?' за 2 мин.",
+    ]
+    
+    if work_format == "office" or work_format == "hybrid":
+        next_steps.append("Организаторский момент: убедись, что есть место для работника и оборудование.")
+    
+    next_steps.append("Первое интервью: рассказывай о задачах, спрашивай о опыте, проверяй культуру.")
+    next_steps.append("Тестовое задание (если уместно): small scope, 2–4 часа работы, реальная задача.")
+    
+    return {
+        "headline": headline,
+        "where_to_search": where_to_search,
+        "what_to_screen": what_to_screen,
+        "budget_reality_check": {
+            "status": budget_status,
+            "bullets": budget_bullets,
+        },
+        "next_steps": next_steps,
+    }
+
+
 @app.post("/sessions")
-def create_session(body: SessionCreate):
+def create_session_endpoint(body: SessionCreate):
+    """Create a new session and persist to database."""
     session_id = str(uuid.uuid4())
+    
+    # Create in-memory session for backward compatibility
     SESSIONS[session_id] = {
         "profession_query": body.profession_query,
         "state": "awaiting_flow",
@@ -399,4 +710,12 @@ def create_session(body: SessionCreate):
         "clarifications": [],
         "vacancy_kb": make_empty_vacancy_kb(),
     }
+    
+    # Also save to database
+    try:
+        kb = make_empty_vacancy_kb()
+        db_create_session(session_id, body.profession_query, kb)
+    except Exception as e:
+        print(f"Warning: Failed to save session to DB: {e}")
+    
     return {"session_id": session_id}

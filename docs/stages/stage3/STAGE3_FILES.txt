@@ -1,0 +1,141 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    STAGE 3 - FILES CHANGE SUMMARY
+═══════════════════════════════════════════════════════════════════════════════
+
+MODIFIED FILES (1):
+─────────────────────────────────────────────────────────────────────────────
+
+1. api/main.py
+   Size: 402 lines (was ~220)
+   Changes:
+   • Added imports: re, datetime
+   • Added 7 new functions for KB management:
+     - make_empty_vacancy_kb()
+     - count_filled_fields()
+     - compute_missing_fields()
+     - update_meta()
+     - parse_work_format()
+     - parse_employment_type()
+     - parse_salary()
+     - parse_location()
+   • Extended POST /chat/message:
+     - Fills KB when vacancy text submitted
+     - Parses tasks from vacancy text
+     - Parses clarifications (location, salary, format, employment)
+   • Modified POST /sessions to initialize vacancy_kb
+   • Added new endpoint GET /vacancy
+   Backward Compatibility: ✓ (Stage 2 logic preserved)
+
+NEW FILES (6):
+─────────────────────────────────────────────────────────────────────────────
+
+1. front/src/app/api/vacancy/route.ts
+   Type: TypeScript/Next.js
+   Purpose: Frontend proxy for GET /vacancy endpoint
+   Features:
+   • Validates session_id parameter
+   • Forwards request to backend
+   • Handles errors gracefully
+   Dependencies: Next.js built-in
+
+2. STAGE3_IMPLEMENTATION.md
+   Type: Documentation
+   Purpose: Complete implementation guide
+   Contents:
+   • Overview and architecture
+   • Function descriptions
+   • API examples with curl
+   • Session structure
+   • Flow diagrams
+   • Testing instructions
+
+3. STAGE3_SUMMARY.md
+   Type: Documentation
+   Purpose: Quick reference and checklist
+   Contents:
+   • Completed tasks checklist
+   • Test results
+   • Files changed summary
+   • Progressive fill example
+   • Verification instructions
+
+4. test-parsing.py
+   Type: Python unit tests
+   Purpose: Validate all parsing functions
+   Tests:
+   • parse_work_format() - 4 tests
+   • parse_employment_type() - 4 tests
+   • parse_salary() - 2 tests
+   • parse_location() - 3 tests
+   Run: python3 tests/test-parsing.py
+
+5. test-stage3.sh
+   Type: Bash integration tests
+   Purpose: End-to-end testing with curl
+   Tests:
+   • Session creation
+   • Initial KB state
+   • Chat flow with vacancy text
+   • Clarifications parsing
+   • KB retrieval
+   Run: bash tests/test-stage3.sh (requires running backend)
+
+6. quick-test.sh
+   Type: Bash validation script
+   Purpose: Quick health check before commit
+   Checks:
+   • Python syntax validation
+   • Parsing functions validation
+   • File existence checks
+   • Git changes verification
+   Run: bash tests/quick-test.sh
+
+UNTOUCHED FILES (Compliance):
+─────────────────────────────────────────────────────────────────────────────
+
+✓ infra/docker-compose.yml - No changes
+✓ api/Dockerfile - No changes
+✓ api/requirements.txt - No changes (no new dependencies)
+✓ All other Stage 2 files remain unchanged
+
+═══════════════════════════════════════════════════════════════════════════════
+
+GIT STATUS:
+─────────────────────────────────────────────────────────────────────────────
+
+Modified:
+  M api/main.py
+
+Untracked:
+  ?? STAGE3_IMPLEMENTATION.md
+  ?? STAGE3_SUMMARY.md
+  ?? STAGE3_FILES.txt
+  ?? test-parsing.py
+  ?? test-stage3.sh
+  ?? quick-test.sh
+  ?? front/src/app/api/vacancy/
+
+═══════════════════════════════════════════════════════════════════════════════
+
+STATISTICS:
+─────────────────────────────────────────────────────────────────────────────
+
+Code Changes:
+  • Total lines added: ~400 (parsing functions + KB management)
+  • Files modified: 1
+  • New source files: 1 (TypeScript)
+  • New test files: 2
+  • New documentation: 3
+  • Total new lines: ~600 (including tests & docs)
+
+Dependencies:
+  • New Python dependencies: 0
+  • New Node.js dependencies: 0
+  • New system dependencies: 0
+
+Backward Compatibility:
+  • Stage 2 API responses: ✓ Unchanged
+  • Session structure: ✓ Extended (added vacancy_kb)
+  • Database schema: N/A (in-memory only)
+
+═══════════════════════════════════════════════════════════════════════════════

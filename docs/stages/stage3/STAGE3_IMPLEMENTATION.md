@@ -96,12 +96,12 @@ Two test files provided:
 
 1. **`test-parsing.py`** - Tests parsing functions directly:
    ```bash
-   python3 test-parsing.py
+   python3 tests/test-parsing.py
    ```
 
 2. **`test-stage3.sh`** - End-to-end curl tests (requires running backend):
    ```bash
-   bash test-stage3.sh
+   bash tests/test-stage3.sh
    ```
 
 ## Backward Compatibility
