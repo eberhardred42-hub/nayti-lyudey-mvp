@@ -1,5 +1,6 @@
 import json
 import time
+import os
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
@@ -737,6 +738,17 @@ def health_db(request: Request):
 @app.get("/health/llm")
 def health_llm_endpoint():
     return health_llm()
+
+
+@app.get("/health/sms")
+def health_sms():
+    """Check SMS provider configuration (env-only; no network)."""
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
+    # We deliberately don't validate credentials here (Stage 9.3.0 baseline).
+    return {
+        "ok": True,
+        "provider": provider,
+    }
 
 
 @app.get("/vacancy")
