@@ -1,0 +1,26 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "role_snapshot_json",
+    "legacy_kind": "tasks_summary"
+  },
+  "role": {
+    "title": "Senior Python Developer",
+    "domain": "it",
+    "seniority": "senior"
+  },
+  "one_liner": "Senior Python Developer для разработки backend-сервисов (Django/FastAPI), Москва/гибрид.",
+  "must_have": [
+    "Python (production)",
+    "Django/FastAPI",
+    "PostgreSQL"
+  ],
+  "nice_to_have": [
+    "Docker",
+    "Kubernetes"
+  ],
+  "deal_breakers": [
+    "Нет коммерческого опыта с Python",
+    "Нулевая коммуникация / конфликтность"
+  ]
+}

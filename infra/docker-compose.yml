@@ -8,11 +8,15 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/nlyudi
+      - ML_BASE_URL=http://ml:8001
+      - MOCK_MODE=${MOCK_MODE:-}
 
   ml:
     build: ../ml
     ports:
       - "8001:8001"
+    environment:
+      - MOCK_MODE=${MOCK_MODE:-good}
 
   front:
     build: ../front

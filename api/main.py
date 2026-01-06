@@ -4,13 +4,19 @@ from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
 import re
+import os
+import urllib.request
+import urllib.error
 from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
+from db import add_artifact as db_add_artifact, list_artifacts as db_list_artifacts
 from llm_client import generate_questions_and_quick_replies, health_llm
 
 app = FastAPI()
 SESSIONS = {}
+
+ML_BASE_URL = os.environ.get("ML_BASE_URL", "http://localhost:8001").strip() or "http://localhost:8001"
 
 
 def log_event(event: str, level: str = "info", **fields):
@@ -94,6 +100,11 @@ class ChatMessage(BaseModel):
     session_id: str
     type: str
     text: str | None = None
+
+
+class MlJobRequest(BaseModel):
+    session_id: str
+    vacancy_profile: dict | None = None
 
 
 def make_empty_vacancy_kb():
@@ -579,7 +590,12 @@ def chat_message(body: ChatMessage, request: Request):
             )
         
         log_reply(state=session["state"])
-        return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
+        return {
+            "reply": reply,
+            "quick_replies": quick_replies,
+            "clarifying_questions": clarifying_questions,
+            "should_show_free_result": False,
+        }
 
     if state == "awaiting_tasks":
         session["tasks"] = text
@@ -1031,6 +1047,193 @@ def generate_free_report(kb, profession_query=""):
         },
         "next_steps": next_steps,
     }
+
+
+def normalize_kind_and_meta(kind: str, meta: dict | None) -> tuple[str, dict]:
+    meta = dict(meta or {})
+    legacy_map = {
+        "tasks_summary": "role_snapshot_json",
+        "screening_questions": "screening_script_json",
+        "sourcing_pack": "sourcing_pack_json",
+    }
+    if kind in legacy_map:
+        meta.setdefault("legacy_kind", kind)
+        return legacy_map[kind], meta
+    return kind, meta
+
+
+def infer_format(kind: str, payload_json: dict | None, payload_text: str | None) -> str:
+    if payload_json is not None:
+        return "json"
+    if payload_text is not None:
+        if kind.endswith("_md"):
+            return "md"
+        return "text"
+    # defensive default (should not happen)
+    return "json"
+
+
+def call_ml_run(vacancy_profile: dict, request_id: str, session_id: str) -> dict:
+    url = ML_BASE_URL.rstrip("/") + "/run"
+    payload_bytes = json.dumps(vacancy_profile, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload_bytes,
+        method="POST",
+        headers={"Content-Type": "application/json", "X-Request-Id": request_id},
+    )
+    log_event(
+        "ml_request",
+        request_id=request_id,
+        session_id=session_id,
+        url=url,
+        payload_chars=len(payload_bytes),
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        try:
+            parsed = json.loads(body) if body else {}
+        except Exception:
+            parsed = {"error": "ml_http_error", "body": body[:1000]}
+        # If ML returns structured 400, pass it through
+        if e.code == 400:
+            raise HTTPException(status_code=400, detail=parsed)
+        raise HTTPException(status_code=502, detail={"error": "ml_failed", "status": e.code, "detail": parsed})
+    except Exception as e:
+        raise HTTPException(status_code=502, detail={"error": "ml_unavailable", "detail": str(e)})
+
+
+def default_vacancy_profile_from_session(session_id: str, profession_query: str, kb: dict) -> dict:
+    role_title = (kb.get("role") or {}).get("role_title") or profession_query or "Role"
+    work_format = (kb.get("company") or {}).get("work_format") or "unknown"
+    city = (kb.get("company") or {}).get("company_location_city")
+    region = (kb.get("company") or {}).get("company_location_region")
+    salary_min = (kb.get("compensation") or {}).get("salary_min_rub")
+    salary_max = (kb.get("compensation") or {}).get("salary_max_rub")
+    # tolerate missing/invalid: default to 0..0 but keep structure valid for ML
+    try:
+        salary_min = int(salary_min) if salary_min is not None else 0
+    except Exception:
+        salary_min = 0
+    try:
+        salary_max = int(salary_max) if salary_max is not None else salary_min
+    except Exception:
+        salary_max = salary_min
+
+    return {
+        "meta": {"contract_version": "v1", "kind": "vacancy_profile"},
+        "role": {"title": role_title, "domain": None, "seniority": None},
+        "company": {
+            "name": None,
+            "location": {"city": city, "region": region, "country": "RU"},
+            "work_format": work_format,
+        },
+        "compensation": {"range": {"currency": "RUB", "min": salary_min, "max": salary_max}, "comment": None},
+    }
+
+
+@app.post("/ml/job")
+def ml_job(body: MlJobRequest, request: Request):
+    """Run ML job and persist artifacts with stable {kind, format, payload_json/payload_text} contract."""
+    start_time = time.perf_counter()
+    request_id = get_request_id_from_request(request)
+    session_id = body.session_id
+
+    db_session = get_session(session_id, request_id=request_id)
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    kb = db_session.get("vacancy_kb") or {}
+    vacancy_profile = body.vacancy_profile or default_vacancy_profile_from_session(
+        session_id=session_id,
+        profession_query=db_session.get("profession_query") or "",
+        kb=kb,
+    )
+
+    pack = call_ml_run(vacancy_profile, request_id=request_id, session_id=session_id)
+
+    # Persist artifacts (normalized)
+    items_for_manifest: list[dict] = []
+
+    def persist_envelope(envelope: dict):
+        artifact_id = envelope.get("artifact_id") or str(uuid.uuid4())
+        kind = envelope.get("kind") or "unknown"
+        meta = (envelope.get("meta") or {})
+        content = envelope.get("content")
+
+        kind_norm, meta_norm = normalize_kind_and_meta(kind, meta)
+
+        payload_json = content if isinstance(content, dict) else None
+        payload_text = content if isinstance(content, str) else None
+        if payload_text is None and isinstance(content, dict) and "markdown" in content and isinstance(content.get("markdown"), str):
+            # allow content={markdown: "..."} to be treated as md
+            payload_text = content.get("markdown")
+            payload_json = None
+            kind_norm = "free_report_md" if kind_norm == "free_report_md" else kind_norm
+
+        fmt = infer_format(kind_norm, payload_json=payload_json, payload_text=payload_text)
+
+        # never store format as None
+        db_add_artifact(
+            session_id=session_id,
+            artifact_id=artifact_id,
+            kind=kind_norm,
+            format=fmt,
+            payload_json=payload_json,
+            payload_text=payload_text,
+            meta=meta_norm,
+            request_id=request_id,
+        )
+        items_for_manifest.append({"artifact_id": artifact_id, "kind": kind_norm, "format": fmt})
+
+    for layer_name in ["user_result", "trace"]:
+        layer = (pack.get(layer_name) or {})
+        for env in (layer.get("artifacts") or []):
+            if isinstance(env, dict):
+                persist_envelope(env)
+
+    # Always persist manifest artifact (with items)
+    manifest_artifact_id = f"manifest_{uuid.uuid4().hex[:8]}"
+    db_add_artifact(
+        session_id=session_id,
+        artifact_id=manifest_artifact_id,
+        kind="manifest",
+        format="json",
+        payload_json={"items": items_for_manifest},
+        payload_text=None,
+        meta={},
+        request_id=request_id,
+    )
+
+    log_event(
+        "ml_job_saved",
+        request_id=request_id,
+        session_id=session_id,
+        route=str(request.url.path),
+        method=request.method,
+        duration_ms=compute_duration_ms(start_time),
+        artifacts_saved=len(items_for_manifest) + 1,
+    )
+
+    return {"session_id": session_id, "manifest_artifact_id": manifest_artifact_id}
+
+
+@app.get("/artifacts")
+def list_artifacts_endpoint(session_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    db_session = get_session(session_id, request_id=request_id)
+    if not db_session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    artifacts = db_list_artifacts(session_id, request_id=request_id)
+    # Ensure format is never None in response
+    for a in artifacts:
+        if not a.get("format"):
+            a["format"] = infer_format(a.get("kind") or "unknown", a.get("payload_json"), a.get("payload_text"))
+    return {"session_id": session_id, "artifacts": artifacts}
 
 
 @app.post("/sessions")

@@ -1,0 +1,236 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "hiring_pack",
+    "legacy_kind": null
+  },
+  "pack_id": "pack_2026-01-06_demo",
+  "user_result": {
+    "artifacts": [
+      {
+        "artifact_id": "art_free_report_json_001",
+        "kind": "free_report_json",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "headline": "Держи бесплатный результат поиска",
+          "where_to_search": [
+            {
+              "title": "Основные площадки",
+              "bullets": [
+                "HeadHunter (HH) — основной источник резюме",
+                "LinkedIn — проверь профили и Recruiter функции"
+              ]
+            }
+          ],
+          "what_to_screen": [
+            {
+              "title": "Быстрые критерии скрининга",
+              "bullets": [
+                "Коммерческий опыт по стеку",
+                "Понимание продакшн-практик"
+              ]
+            }
+          ],
+          "budget_reality_check": {
+            "status": "unknown",
+            "bullets": [
+              "Уточни вилку (min/max)"
+            ]
+          },
+          "next_steps": [
+            "Сформулировать требования и процесс интервью"
+          ]
+        }
+      },
+      {
+        "artifact_id": "art_free_report_md_001",
+        "kind": "free_report_md",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "markdown": "# Бесплатный результат\n\nКаналы: HH, LinkedIn...\n"
+        }
+      },
+      {
+        "artifact_id": "art_role_snapshot_json_001",
+        "kind": "role_snapshot_json",
+        "meta": {
+          "legacy_kind": "tasks_summary"
+        },
+        "content": {
+          "role": {
+            "title": "Senior Python Developer",
+            "domain": "it",
+            "seniority": "senior"
+          },
+          "one_liner": "Senior Python Developer для backend-разработки.",
+          "must_have": [
+            "Python",
+            "PostgreSQL"
+          ],
+          "nice_to_have": [
+            "Docker"
+          ],
+          "deal_breakers": [
+            "Нет коммерческого опыта"
+          ]
+        }
+      },
+      {
+        "artifact_id": "art_sourcing_pack_json_001",
+        "kind": "sourcing_pack_json",
+        "meta": {
+          "legacy_kind": "sourcing_pack"
+        },
+        "content": {
+          "target_profile": {
+            "title": "Senior Python Developer",
+            "location": "Москва/гибрид"
+          },
+          "channels": [],
+          "boolean_search_queries": [],
+          "outreach_templates": []
+        }
+      },
+      {
+        "artifact_id": "art_screening_script_json_001",
+        "kind": "screening_script_json",
+        "meta": {
+          "legacy_kind": "screening_questions"
+        },
+        "content": {
+          "opening": "Скрининг на 10–15 минут.",
+          "questions": [],
+          "closing": "Спасибо!"
+        }
+      },
+      {
+        "artifact_id": "art_budget_reality_check_json_001",
+        "kind": "budget_reality_check_json",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "currency": "RUB",
+          "salary_min": 250000,
+          "salary_max": 350000,
+          "status": "ok",
+          "explanation": "Вилка конкурентная для рынка.",
+          "recommendations": []
+        }
+      },
+      {
+        "artifact_id": "art_scorecard_json_001",
+        "kind": "scorecard_json",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "anchors": [
+            {
+              "score": 1,
+              "label": "Не соответствует"
+            },
+            {
+              "score": 2,
+              "label": "Скорее не подходит"
+            },
+            {
+              "score": 3,
+              "label": "Условно подходит"
+            },
+            {
+              "score": 4,
+              "label": "Хорошо подходит"
+            },
+            {
+              "score": 5,
+              "label": "Сильный кандидат"
+            }
+          ],
+          "competencies": []
+        }
+      }
+    ]
+  },
+  "trace": {
+    "artifacts": [
+      {
+        "artifact_id": "art_ml_job_input_001",
+        "kind": "ml_job_input",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "session_id": "<session_id>",
+          "vacancy_profile_ref": "contracts/vacancy_profile.v1.json",
+          "requested_kinds": [
+            "free_report_json",
+            "scorecard_json"
+          ]
+        }
+      },
+      {
+        "artifact_id": "art_llm_request_001",
+        "kind": "llm_request",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "model": "<model>",
+          "prompt": "<prompt>",
+          "temperature": 0.2
+        }
+      },
+      {
+        "artifact_id": "art_llm_response_001",
+        "kind": "llm_response",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "raw_text": "<raw response>",
+          "parsed_json": null
+        }
+      },
+      {
+        "artifact_id": "art_quality_report_001",
+        "kind": "quality_report",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "summary": {
+            "status": "pass",
+            "issues_count": 0,
+            "warnings_count": 0
+          },
+          "checks": [],
+          "artifacts_validated": []
+        }
+      },
+      {
+        "artifact_id": "art_manifest_001",
+        "kind": "manifest",
+        "meta": {
+          "legacy_kind": null
+        },
+        "content": {
+          "pack_id": "pack_2026-01-06_demo",
+          "generated_at_iso": "2026-01-06T13:00:00Z",
+          "artifacts": [
+            {
+              "artifact_id": "art_free_report_json_001",
+              "layer": "user_result",
+              "kind": "free_report_json",
+              "content_ref": "inline"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

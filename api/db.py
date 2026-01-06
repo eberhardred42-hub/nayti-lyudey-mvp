@@ -102,6 +102,31 @@ def init_db():
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         """)
+
+        # Create artifacts table (Stage 8)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id BIGSERIAL PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                artifact_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                format TEXT NOT NULL,
+                payload_json JSONB,
+                payload_text TEXT,
+                meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_artifacts_session_artifact_id
+            ON artifacts(session_id, artifact_id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session_id
+            ON artifacts(session_id)
+        """)
         
         # Create index on session_id for faster queries
         cur.execute("""
@@ -110,6 +135,124 @@ def init_db():
         """)
         
         conn.commit()
+
+
+# ==========================================================================
+# Artifacts operations (Stage 8)
+# ==========================================================================
+
+
+def add_artifact(
+    session_id: str,
+    artifact_id: str,
+    kind: str,
+    format: str,
+    payload_json: Optional[Dict[str, Any]] = None,
+    payload_text: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    request_id: str = "unknown",
+) -> None:
+    """Upsert an artifact for a session."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="add_artifact",
+        request_id=request_id,
+        session_id=session_id,
+        artifact_id=artifact_id,
+        kind=kind,
+        format=format,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO artifacts (session_id, artifact_id, kind, format, payload_json, payload_text, meta)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (session_id, artifact_id)
+                DO UPDATE SET kind = EXCLUDED.kind,
+                              format = EXCLUDED.format,
+                              payload_json = EXCLUDED.payload_json,
+                              payload_text = EXCLUDED.payload_text,
+                              meta = EXCLUDED.meta
+                """,
+                (
+                    session_id,
+                    artifact_id,
+                    kind,
+                    format,
+                    psycopg2.extras.Json(payload_json) if payload_json is not None else None,
+                    payload_text,
+                    psycopg2.extras.Json(meta or {}),
+                ),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="add_artifact",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="add_artifact",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_artifacts(session_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """List artifacts for a session (newest first)."""
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="list_artifacts", request_id=request_id, session_id=session_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT artifact_id, kind, format, payload_json, payload_text, meta, created_at
+                FROM artifacts
+                WHERE session_id = %s
+                ORDER BY created_at DESC
+                """,
+                (session_id,),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="list_artifacts",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            normalized: List[Dict[str, Any]] = []
+            for row in rows:
+                row = dict(row)
+                row["payload_json"] = safe_json(row.get("payload_json"), {})
+                row["meta"] = safe_json(row.get("meta"), {})
+                if isinstance(row.get("created_at"), datetime):
+                    row["created_at"] = row["created_at"].isoformat()
+                normalized.append(row)
+            return normalized
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_artifacts",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
 
 
 def health_check(request_id: str = "unknown") -> bool:

@@ -1,0 +1,21 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "budget_reality_check_json",
+    "legacy_kind": null
+  },
+  "currency": "RUB",
+  "salary_min": 250000,
+  "salary_max": 350000,
+  "market_band": {
+    "p25": 220000,
+    "p50": 300000,
+    "p75": 400000
+  },
+  "status": "ok",
+  "explanation": "Вилка близка к медиане рынка для Senior Python в Москве/гибрид.",
+  "recommendations": [
+    "Если хотим сильного senior — держать верхнюю границу конкурентной.",
+    "Если бюджет ограничен — рассмотреть middle+ с сильными кейсами."
+  ]
+}

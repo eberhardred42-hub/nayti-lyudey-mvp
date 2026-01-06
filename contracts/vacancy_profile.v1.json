@@ -1,0 +1,56 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "vacancy_profile",
+    "legacy_kind": null,
+    "schema_note": "Normalized vacancy profile used as input for downstream artifacts"
+  },
+  "role": {
+    "title": "Senior Python Developer",
+    "domain": "it",
+    "seniority": "senior"
+  },
+  "company": {
+    "name": null,
+    "location": {
+      "city": "Москва",
+      "region": null,
+      "country": "RU"
+    },
+    "work_format": "hybrid"
+  },
+  "compensation": {
+    "salary_currency": "RUB",
+    "salary_min": 250000,
+    "salary_max": 350000,
+    "comment": "250–350k ₽ gross (обсуждаемо)"
+  },
+  "employment": {
+    "employment_type": "full-time",
+    "schedule_comment": null
+  },
+  "requirements": {
+    "experience_years_min": 5,
+    "education_level": "unknown",
+    "hard_skills": [
+      "Python",
+      "Django",
+      "PostgreSQL"
+    ],
+    "soft_skills": [
+      "коммуникация",
+      "ответственность"
+    ]
+  },
+  "responsibilities": {
+    "tasks": [
+      "Разработка и поддержка backend-сервисов",
+      "Code review",
+      "Участие в проектировании"
+    ],
+    "raw_vacancy_text": "(raw vacancy text may be attached here)"
+  },
+  "sourcing": {
+    "suggested_channels": []
+  }
+}

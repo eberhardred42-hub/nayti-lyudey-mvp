@@ -1,0 +1,48 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "manifest",
+    "legacy_kind": null
+  },
+  "pack_id": "pack_2026-01-06T13:00:00Z_demo",
+  "generated_at_iso": "2026-01-06T13:00:00Z",
+  "artifacts": [
+    {
+      "artifact_id": "art_free_report_json_001",
+      "layer": "user_result",
+      "kind": "free_report_json",
+      "content_ref": "inline"
+    },
+    {
+      "artifact_id": "art_free_report_md_001",
+      "layer": "user_result",
+      "kind": "free_report_md",
+      "content_ref": "inline"
+    },
+    {
+      "artifact_id": "art_quality_report_001",
+      "layer": "trace",
+      "kind": "quality_report",
+      "content_ref": "inline"
+    }
+  ],
+  "kinds_dictionary": {
+    "free_report_json": "User-facing structured report (JSON)",
+    "free_report_md": "User-facing markdown report (string)",
+    "role_snapshot_json": "Role summary snapshot (JSON)",
+    "sourcing_pack_json": "Sourcing channels + outreach pack (JSON)",
+    "screening_script_json": "Phone screen script/questions (JSON)",
+    "budget_reality_check_json": "Budget validation and guidance (JSON)",
+    "scorecard_json": "Interview scorecard rubric (JSON)",
+    "ml_job_input": "Input payload used to run ML job",
+    "llm_request": "Prompt + parameters sent to LLM",
+    "llm_response": "Raw LLM response (text/json)",
+    "quality_report": "Quality checks output",
+    "manifest": "Index of artifacts inside a pack"
+  },
+  "legacy_kinds": {
+    "tasks_summary": "Prefer role_snapshot_json (or role_snapshot_json.meta.legacy_kind=tasks_summary)",
+    "screening_questions": "Prefer screening_script_json (or screening_script_json.meta.legacy_kind=screening_questions)",
+    "sourcing_pack": "Prefer sourcing_pack_json (or sourcing_pack_json.meta.legacy_kind=sourcing_pack)"
+  }
+}

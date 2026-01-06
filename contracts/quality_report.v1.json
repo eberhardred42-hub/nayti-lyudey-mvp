@@ -1,0 +1,34 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "quality_report",
+    "legacy_kind": null
+  },
+  "summary": {
+    "status": "pass",
+    "issues_count": 0,
+    "warnings_count": 1
+  },
+  "checks": [
+    {
+      "id": "schema.free_report_json",
+      "status": "pass",
+      "details": "Required fields present: headline, where_to_search, what_to_screen, budget_reality_check, next_steps"
+    },
+    {
+      "id": "compensation.min_max_present",
+      "status": "warn",
+      "details": "salary_min/salary_max present, but salary_currency inferred"
+    }
+  ],
+  "artifacts_validated": [
+    {
+      "artifact_id": "art_free_report_json_001",
+      "kind": "free_report_json"
+    },
+    {
+      "artifact_id": "art_scorecard_json_001",
+      "kind": "scorecard_json"
+    }
+  ]
+}

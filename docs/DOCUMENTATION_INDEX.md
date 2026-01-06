@@ -1,4 +1,4 @@
-# 📑 Stage 4.1 & Stage 5 — Complete Documentation Index
+# 📑 Documentation Index (Stages 4–8)
 
 ## 🎯 Start Here
 
@@ -9,6 +9,8 @@
 **Need technical details?** → Read [STAGE4_IMPLEMENTATION.md](stages/stage4/STAGE4_IMPLEMENTATION.md) (15 min)
 
 **Want to test it?** → Follow [RUNBOOK.md](RUNBOOK.md) (setup + testing)
+
+**Need Stage 8 overview?** → Read [STAGE8_SUMMARY.md](stages/stage8/STAGE8_SUMMARY.md)
 
 ---
 
@@ -28,6 +30,8 @@
 | **[STAGE6.2_IMPLEMENTATION.md](stages/stage6.2/STAGE6.2_IMPLEMENTATION.md)** | 4K | Detailed verbose logging instrumentation | 8 min |
 | **[STAGE7_SUMMARY.md](stages/stage7/STAGE7_SUMMARY.md)** | 3K | LLM clarifications overview | 4 min |
 | **[STAGE7_IMPLEMENTATION.md](stages/stage7/STAGE7_IMPLEMENTATION.md)** | 4K | LLM integration and prompts | 8 min |
+| **[STAGE8_SUMMARY.md](stages/stage8/STAGE8_SUMMARY.md)** | NEW | Schemas v1 + repair/fallback + quality gates overview | 6 min |
+| **[STAGE8_IMPLEMENTATION.md](stages/stage8/STAGE8_IMPLEMENTATION.md)** | NEW | Technical details: validation, artifacts, mock modes | 12 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |
 
 ### Status & Navigation Files
@@ -50,6 +54,10 @@
 | **[test-stage5.sh](../../tests/test-stage5.sh)** | 5.5K | Postgres persistence test | ✅ NEW |
 | **[test-stage6.sh](../../tests/test-stage6.sh)** | 3.5K | Observability (request IDs, debug endpoints) | ✅ NEW |
 | **[test-stage7.sh](../../tests/test-stage7.sh)** | 3.0K | LLM clarifications and quick replies | ✅ NEW |
+| **[test-stage8-schemas.py](../../tests/test-stage8-schemas.py)** | NEW | ML schemas v1 validation | ✅ NEW |
+| **[test-stage8-repair.py](../../tests/test-stage8-repair.py)** | NEW | LLM repair/fallback pipeline (MOCK_MODE) | ✅ NEW |
+| **[test-stage8-quality.py](../../tests/test-stage8-quality.py)** | NEW | Quality gates + scorecard anchors | ✅ NEW |
+| **[test-stage8-artifacts.py](../../tests/test-stage8-artifacts.py)** | NEW | Docker integration: /ml/job → Postgres artifacts | ✅ NEW |
 
 ---
 

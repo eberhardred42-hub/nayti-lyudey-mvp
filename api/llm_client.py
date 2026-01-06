@@ -122,7 +122,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     request_id = context.get("request_id", "unknown")
     session_id = context.get("session_id", "unknown")
     missing_fields = context.get("missing_fields") or []
-    provider = LLM_PROVIDER
+    provider = "mock" if (os.environ.get("MOCK_MODE") or "").strip() else LLM_PROVIDER
 
     prompt_parts = [
         "Ты помогаешь рекрутеру уточнить вводные. Верни JSON с ключами questions и quick_replies.",
@@ -198,7 +198,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
 
 
 def health_llm() -> dict:
-    provider = LLM_PROVIDER
+    provider = "mock" if (os.environ.get("MOCK_MODE") or "").strip() else LLM_PROVIDER
     if provider == "mock":
         return {"ok": True, "provider": "mock"}
     if provider == "openai_compat":

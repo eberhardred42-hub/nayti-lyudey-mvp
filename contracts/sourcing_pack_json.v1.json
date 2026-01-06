@@ -1,0 +1,39 @@
+{
+  "meta": {
+    "contract_version": "v1",
+    "kind": "sourcing_pack_json",
+    "legacy_kind": "sourcing_pack"
+  },
+  "target_profile": {
+    "title": "Senior Python Developer",
+    "location": "Москва или гибрид"
+  },
+  "channels": [
+    {
+      "name": "HeadHunter",
+      "priority": "high",
+      "notes": "Основной поток резюме"
+    },
+    {
+      "name": "Habr Career",
+      "priority": "high",
+      "notes": "Сильные инженеры, выше конкуренция"
+    },
+    {
+      "name": "Telegram",
+      "priority": "medium",
+      "notes": "Чаты по Python/Django/FastAPI"
+    }
+  ],
+  "boolean_search_queries": [
+    "(Python AND (Django OR FastAPI) AND PostgreSQL) AND (senior OR lead)"
+  ],
+  "outreach_templates": [
+    {
+      "channel": "LinkedIn",
+      "language": "ru",
+      "subject": "Senior Python Developer — гибрид Москва",
+      "message": "Привет! У нас роль Senior Python Developer (Django/FastAPI), гибрид в Москве. Интересно обсудить?"
+    }
+  ]
+}

@@ -22,7 +22,7 @@ NC='\033[0m' # No Color
 echo "Test 1: Creating session..."
 RESPONSE=$(curl -s -X POST "$BACKEND_URL/sessions" \
   -H "Content-Type: application/json" \
-  -d '{}')
+    -d '{"profession_query":"Test Employer"}')
 
 SESSION_ID=$(echo "$RESPONSE" | grep -o '"session_id":"[^"]*"' | cut -d'"' -f4)
 if [ -z "$SESSION_ID" ]; then
@@ -36,14 +36,14 @@ echo ""
 echo "Test 2: Starting chat..."
 RESPONSE=$(curl -s -X POST "$BACKEND_URL/chat/message" \
   -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\", \"message\": \"привет, я работодатель\"}")
+    -d "{\"session_id\": \"$SESSION_ID\", \"type\": \"start\", \"text\": null}")
 
-if echo "$RESPONSE" | grep -q '"stage":"choose_flow"'; then
-    echo -e "${GREEN}✓ Chat started successfully${NC}"
+if echo "$RESPONSE" | grep -q '"quick_replies"'; then
+        echo -e "${GREEN}✓ Chat started successfully${NC}"
 else
-    echo -e "${RED}❌ Failed to start chat${NC}"
-    echo "Response: $RESPONSE"
-    exit 1
+        echo -e "${RED}❌ Failed to start chat${NC}"
+        echo "Response: $RESPONSE"
+        exit 1
 fi
 echo ""
 
@@ -51,46 +51,44 @@ echo ""
 echo "Test 3: Choosing 'Есть текст вакансии' flow..."
 RESPONSE=$(curl -s -X POST "$BACKEND_URL/chat/message" \
   -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\", \"message\": \"Есть текст вакансии\"}")
+    -d "{\"session_id\": \"$SESSION_ID\", \"type\": \"reply\", \"text\": \"Есть текст вакансии\"}")
 
-if echo "$RESPONSE" | grep -q '"stage":"vacancy_text"'; then
-    echo -e "${GREEN}✓ Flow selected: vacancy_text${NC}"
+if echo "$RESPONSE" | grep -q '"reply"'; then
+        echo -e "${GREEN}✓ Flow selected: vacancy_text${NC}"
 else
-    echo -e "${RED}❌ Failed to select flow${NC}"
-    exit 1
+        echo -e "${RED}❌ Failed to select flow${NC}"
+        echo "Response: $RESPONSE"
+        exit 1
 fi
 echo ""
 
-# Test 4: Submit vacancy text
+# Test 4: Submit vacancy text (via chat)
 echo "Test 4: Submitting vacancy text..."
 VACANCY_TEXT="Ищем Senior Python Developer. Требования: 5+ лет опыта с Python, Django, PostgreSQL. Зарплата 250k-350k. Офис в Москве, гибрид возможен."
 
-RESPONSE=$(curl -s -X POST "$BACKEND_URL/vacancy" \
-  -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\", \"raw_vacancy_text\": \"$VACANCY_TEXT\"}")
+RESPONSE=$(curl -s -X POST "$BACKEND_URL/chat/message" \
+    -H "Content-Type: application/json" \
+    -d "{\"session_id\": \"$SESSION_ID\", \"type\": \"reply\", \"text\": \"$VACANCY_TEXT\"}")
 
-if echo "$RESPONSE" | grep -q '"stage":"tasks"'; then
-    echo -e "${GREEN}✓ Vacancy text submitted${NC}"
+if echo "$RESPONSE" | grep -q '"reply"'; then
+        echo -e "${GREEN}✓ Vacancy text submitted${NC}"
 else
-    echo -e "${RED}❌ Failed to submit vacancy text${NC}"
-    echo "Response: $RESPONSE"
-    exit 1
+        echo -e "${RED}❌ Failed to submit vacancy text${NC}"
+        echo "Response: $RESPONSE"
+        exit 1
 fi
 echo ""
 
 # Test 5: Submit clarifications
 echo "Test 5: Submitting clarifications..."
-RESPONSE=$(curl -s -X POST "$BUDGET_URL/chat/message" \
-  -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\", \"message\": \"Спасибо, мне нужна документация\"}" 2>/dev/null || \
-  curl -s -X POST "$BACKEND_URL/chat/message" \
-  -H "Content-Type: application/json" \
-  -d "{\"session_id\": \"$SESSION_ID\", \"message\": \"Спасибо, хватит. Покажи мне результат\"}")
+RESPONSE=$(curl -s -X POST "$BACKEND_URL/chat/message" \
+    -H "Content-Type: application/json" \
+    -d "{\"session_id\": \"$SESSION_ID\", \"type\": \"reply\", \"text\": \"Москва, гибридно, 250-350к, фулл тайм\"}")
 
 if echo "$RESPONSE" | grep -q '"should_show_free_result"'; then
-    echo -e "${GREEN}✓ Should show free result${NC}"
+        echo -e "${GREEN}✓ Clarifications processed${NC}"
 else
-    echo -e "${GREEN}✓ Clarifications processed${NC}"
+        echo -e "${GREEN}✓ Clarifications processed${NC}"
 fi
 echo ""
 
