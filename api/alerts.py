@@ -53,7 +53,7 @@ def send_alert(
         with urllib.request.urlopen(req, timeout=2.0) as resp:
             status = getattr(resp, "status", None)
             log_event(
-                "alert_send_ok",
+                "alert_sent",
                 request_id=request_id,
                 alert_event=event,
                 severity=severity,

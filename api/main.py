@@ -43,18 +43,104 @@ def compute_duration_ms(start_time: float) -> float:
 
 
 def _get_user_id(request: Request) -> str | None:
+    # Bearer token has priority, then X-User-Id fallback (used by older front).
+    auth = request.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        if token:
+            user = TOKENS.get(token)
+            if user:
+                return user
+            # Support simple inline tokens for local smoke.
+            if token.startswith("mock:") and len(token) > 5:
+                return token[5:]
+
     raw = request.headers.get("X-User-Id")
-    if not raw:
-        return None
-    v = raw.strip()
-    return v or None
+    if raw:
+        v = raw.strip()
+        return v or None
+    return None
 
 
 def _require_user_id(request: Request) -> str:
     user_id = _get_user_id(request)
     if not user_id:
-        raise HTTPException(status_code=401, detail="Missing X-User-Id")
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return user_id
+
+
+# ============================================================================
+# Mock auth (OTP + offer) for local smoke tests
+# ============================================================================
+
+OTP_LATEST: dict[str, str] = {}
+TOKENS: dict[str, str] = {}
+
+
+class OtpRequest(BaseModel):
+    phone: str
+
+
+class OtpVerify(BaseModel):
+    phone: str
+    code: str
+
+
+@app.post("/auth/otp/request")
+def auth_otp_request(body: OtpRequest, request: Request):
+    request_id = get_request_id_from_request(request)
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
+    phone = (body.phone or "").strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone is required")
+
+    # Minimal mock: always generate a code; in real mode we would send SMS.
+    code = str(int(time.time()))[-6:].rjust(6, "0")
+    OTP_LATEST[phone] = code
+    log_event(
+        "auth_otp_requested",
+        request_id=request_id,
+        provider=provider,
+    )
+    return {"ok": True}
+
+
+@app.get("/debug/otp/latest")
+def debug_otp_latest(phone: str, request: Request):
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    request_id = get_request_id_from_request(request)
+    code = OTP_LATEST.get(phone)
+    if not code:
+        raise HTTPException(status_code=404, detail="No OTP")
+    log_event("debug_otp_latest", request_id=request_id)
+    return {"ok": True, "phone": phone, "code": code}
+
+
+@app.post("/auth/otp/verify")
+def auth_otp_verify(body: OtpVerify, request: Request):
+    request_id = get_request_id_from_request(request)
+    phone = (body.phone or "").strip()
+    code = (body.code or "").strip()
+    expected = OTP_LATEST.get(phone)
+    if not expected or code != expected:
+        raise HTTPException(status_code=401, detail="Invalid code")
+    # Use non-PII stable-ish user id derived from phone.
+    import hashlib
+
+    user_id = "u_" + hashlib.sha256(phone.encode("utf-8")).hexdigest()[:12]
+    token = str(uuid.uuid4())
+    TOKENS[token] = user_id
+    log_event("auth_otp_verified", request_id=request_id)
+    return {"ok": True, "token": token}
+
+
+@app.post("/legal/offer/accept")
+def legal_offer_accept(request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_user_id(request)
+    log_event("legal_offer_accepted", request_id=request_id)
+    return {"ok": True}
 
 
 def _is_debug_enabled() -> bool:
@@ -1187,7 +1273,7 @@ def debug_s3_put_test_pdf(request: Request, session_id: str | None = None):
         raise HTTPException(status_code=404, detail="Not found")
 
     request_id = get_request_id_from_request(request)
-    user_id = _get_user_id(request)
+    user_id = _require_user_id(request)
     user_key = _anon_user_key(user_id)
 
     bucket = (os.environ.get("S3_BUCKET") or "").strip()

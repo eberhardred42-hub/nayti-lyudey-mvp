@@ -32,6 +32,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _s3_settings() -> Dict[str, Any]:
     endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
+    presign_endpoint = (os.environ.get("S3_PRESIGN_ENDPOINT") or "").strip() or None
     region = (os.environ.get("S3_REGION") or "us-east-1").strip()
     access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip() or None
     secret_key = (os.environ.get("S3_SECRET_KEY") or "").strip() or None
@@ -49,6 +50,7 @@ def _s3_settings() -> Dict[str, Any]:
 
     return {
         "endpoint": endpoint,
+        "presign_endpoint": presign_endpoint,
         "region": region,
         "access_key": access_key,
         "secret_key": secret_key,
@@ -56,25 +58,38 @@ def _s3_settings() -> Dict[str, Any]:
     }
 
 
-_client_cached = None
+_client_cache: Dict[str, Any] = {}
 
 
-def _client():
-    global _client_cached
-    if _client_cached is not None:
-        return _client_cached
-
+def _client(endpoint_override: Optional[str] = None):
     s = _s3_settings()
-    _client_cached = boto3.client(
+
+    endpoint = endpoint_override if endpoint_override is not None else s["endpoint"]
+    cache_key = endpoint or "<none>"
+    cached = _client_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # When overriding endpoint (e.g. for presign URLs), compute use_ssl from
+    # that endpoint if possible; otherwise fall back to S3_USE_SSL logic.
+    if endpoint and endpoint.lower().startswith("https://"):
+        use_ssl = True
+    elif endpoint and endpoint.lower().startswith("http://"):
+        use_ssl = False
+    else:
+        use_ssl = bool(s["use_ssl"])
+
+    client = boto3.client(
         "s3",
-        endpoint_url=s["endpoint"],
+        endpoint_url=endpoint,
         region_name=s["region"],
         aws_access_key_id=s["access_key"],
         aws_secret_access_key=s["secret_key"],
-        use_ssl=bool(s["use_ssl"]),
-        config=Config(s3={"addressing_style": "path"}),
+        use_ssl=use_ssl,
+        config=Config(signature_version="s3v4", s3={"addressing_style": "path"}),
     )
-    return _client_cached
+    _client_cache[cache_key] = client
+    return client
 
 
 def upload_bytes(
@@ -152,7 +167,9 @@ def presign_get(
     """
     start = time.perf_counter()
     try:
-        url = _client().generate_presigned_url(
+        s = _s3_settings()
+        endpoint_for_url = s.get("presign_endpoint") or s.get("endpoint")
+        url = _client(endpoint_override=endpoint_for_url).generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
             ExpiresIn=expires_sec,
