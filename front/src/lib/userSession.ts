@@ -21,3 +21,14 @@ export function getUserToken(): string | null {
   const v = window.localStorage.getItem("user_token") || window.localStorage.getItem("token");
   return v ? v : null;
 }
+
+export function setUserToken(token: string) {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem("user_token", token);
+}
+
+export function clearUserToken() {
+  if (typeof window === "undefined") return;
+  window.localStorage.removeItem("user_token");
+}
+
