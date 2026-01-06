@@ -1,0 +1,8 @@
+export default function AdminDocumentsPage() {
+  return (
+    <div>
+      <h1>Documents</h1>
+      <div>Заглушка</div>
+    </div>
+  );
+}

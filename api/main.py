@@ -7,6 +7,7 @@ import uuid
 import redis
 import re
 from datetime import datetime
+from typing import Optional
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
@@ -26,6 +27,91 @@ from storage.s3_client import upload_bytes, presign_get
 
 app = FastAPI()
 SESSIONS = {}
+
+
+# ==========================================================================
+# Admin auth (MVP): password + expiring token
+# ==========================================================================
+
+ADMIN_TOKENS: dict[str, dict] = {}
+
+
+def _admin_password() -> str | None:
+    v = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+    return v or None
+
+
+def _admin_token_ttl_seconds() -> int:
+    raw = (os.environ.get("ADMIN_TOKEN_TTL_SECONDS") or "").strip()
+    try:
+        v = int(raw)
+        return v if v > 0 else 3600
+    except Exception:
+        return 3600
+
+
+def _require_admin_token(request: Request) -> dict:
+    token = (request.headers.get("X-Admin-Token") or "").strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="missing_admin_token")
+    rec = ADMIN_TOKENS.get(token)
+    if not rec:
+        raise HTTPException(status_code=401, detail="invalid_admin_token")
+    expires_at = rec.get("expires_at")
+    if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
+        try:
+            del ADMIN_TOKENS[token]
+        except Exception:
+            pass
+        raise HTTPException(status_code=401, detail="expired_admin_token")
+    return rec
+
+
+class AdminLoginBody(BaseModel):
+    password: str
+
+
+@app.post("/admin/login")
+def admin_login(body: AdminLoginBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    expected = _admin_password()
+    if not expected:
+        log_event("admin_login_disabled", request_id=request_id, user=_anon_user_key(user_id))
+        raise HTTPException(status_code=503, detail="admin_login_disabled")
+
+    pwd = (body.password or "").strip()
+    if not pwd:
+        raise HTTPException(status_code=400, detail="password_required")
+    if pwd != expected:
+        log_event("admin_login_failed", level="warning", request_id=request_id, user=_anon_user_key(user_id))
+        raise HTTPException(status_code=401, detail="invalid_password")
+
+    ttl = _admin_token_ttl_seconds()
+    token = str(uuid.uuid4())
+    expires_at = time.time() + ttl
+    ADMIN_TOKENS[token] = {
+        "user_id": user_id,
+        "created_at": time.time(),
+        "expires_at": expires_at,
+    }
+    log_event("admin_login_ok", request_id=request_id, user=_anon_user_key(user_id), ttl_seconds=ttl)
+    return {
+        "ok": True,
+        "admin_token": token,
+        "ttl_seconds": ttl,
+        "expires_at": datetime.utcfromtimestamp(expires_at).isoformat() + "Z",
+    }
+
+
+@app.get("/admin/me")
+def admin_me(request: Request):
+    rec = _require_admin_token(request)
+    return {
+        "ok": True,
+        "user_id": rec.get("user_id"),
+        "expires_at": datetime.utcfromtimestamp(float(rec.get("expires_at"))).isoformat() + "Z",
+    }
 
 
 def log_event(event: str, level: str = "info", **fields):

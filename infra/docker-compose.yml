@@ -13,6 +13,8 @@ services:
     environment:
       - DEBUG=${DEBUG:-0}
       - SMS_PROVIDER=${SMS_PROVIDER:-mock}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      - ADMIN_TOKEN_TTL_SECONDS=${ADMIN_TOKEN_TTL_SECONDS:-}
       - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@db:5432/nlyudi}
       - S3_PROVIDER=${S3_PROVIDER:-s3}
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
