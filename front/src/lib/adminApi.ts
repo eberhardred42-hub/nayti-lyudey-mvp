@@ -1,4 +1,5 @@
 import { getAdminToken } from "./adminSession";
+import { getUserToken } from "./userSession";
 
 type ApiErrorBody = { detail?: string };
 
@@ -10,6 +11,8 @@ function friendlyAdminError(detail?: string): string {
       return "Введите пароль";
     case "invalid_password":
       return "Неверный пароль";
+    case "not_allowed":
+      return "Этот номер телефона не в allowlist";
     case "missing_admin_token":
       return "Нужна админ-сессия";
     case "invalid_admin_token":
@@ -47,11 +50,20 @@ export async function adminMe() {
   return adminFetch("/api/admin/me", { method: "GET" });
 }
 
-export async function adminLogin(password: string, userId: string) {
+export async function adminLogin(password: string) {
+  const userToken = getUserToken();
+  if (!userToken) {
+    const err: any = new Error("Сначала войдите как пользователь");
+    err.detail = "Unauthorized";
+    throw err;
+  }
   const r = await fetch("/api/admin/login", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-User-Id": userId },
-    body: JSON.stringify({ password }),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: userToken.toLowerCase().startsWith("bearer ") ? userToken : `Bearer ${userToken}`,
+    },
+    body: JSON.stringify({ admin_password: password }),
   });
   const data = await r.json();
   if (!r.ok) {
@@ -61,5 +73,5 @@ export async function adminLogin(password: string, userId: string) {
     err.detail = data?.detail;
     throw err;
   }
-  return data as { ok: boolean; admin_token: string; expires_at: string; ttl_seconds: number };
+  return data as { ok: boolean; admin_token: string; expires_in_sec: number };
 }

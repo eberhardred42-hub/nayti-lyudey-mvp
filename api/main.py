@@ -1,12 +1,16 @@
 import json
 import time
 import os
+import secrets
+import random
+import hashlib
+import hmac
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
 import redis
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
@@ -21,6 +25,7 @@ from db import (
     list_latest_render_jobs_for_pack,
     list_packs_for_user,
 )
+from db import ensure_user, get_user_by_id, create_admin_session, get_admin_session_by_token_hash, revoke_admin_session
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
@@ -30,88 +35,256 @@ SESSIONS = {}
 
 
 # ==========================================================================
-# Admin auth (MVP): password + expiring token
+# Admin auth: phone allowlist + password hash + 12h DB-backed admin sessions
 # ==========================================================================
 
-ADMIN_TOKENS: dict[str, dict] = {}
+
+def _admin_phone_allowlist() -> set[str]:
+    raw = (os.environ.get("ADMIN_PHONE_ALLOWLIST") or "").strip()
+    if not raw:
+        return set()
+    out: set[str] = set()
+    for part in raw.split(","):
+        v = part.strip()
+        if v:
+            out.add(v)
+    return out
 
 
-def _admin_password() -> str | None:
-    v = (os.environ.get("ADMIN_PASSWORD") or "").strip()
+def _admin_password_hash_hex() -> str | None:
+    v = (os.environ.get("ADMIN_PASSWORD_HASH") or "").strip().lower()
     return v or None
 
 
-def _admin_token_ttl_seconds() -> int:
-    raw = (os.environ.get("ADMIN_TOKEN_TTL_SECONDS") or "").strip()
+def _admin_password_salt() -> str | None:
+    v = (os.environ.get("ADMIN_PASSWORD_SALT") or "").strip()
+    return v or None
+
+
+def _admin_session_ttl_hours() -> int:
+    raw = (os.environ.get("ADMIN_SESSION_TTL_HOURS") or "").strip()
     try:
         v = int(raw)
-        return v if v > 0 else 3600
+        return v if v > 0 else 12
     except Exception:
-        return 3600
+        return 12
 
 
-def _require_admin_token(request: Request) -> dict:
-    token = (request.headers.get("X-Admin-Token") or "").strip()
+def _pbkdf2_hex(value: str, salt: str, iterations: int = 100_000) -> str:
+    dk = hashlib.pbkdf2_hmac(
+        "sha256",
+        value.encode("utf-8"),
+        salt.encode("utf-8"),
+        iterations,
+    )
+    return dk.hex()
+
+
+def _mask_phone(phone_e164: str | None) -> str:
+    if not phone_e164:
+        return "unknown"
+    s = phone_e164.strip()
+    if len(s) <= 4:
+        return "****"
+    return f"{s[:2]}****{s[-2:]}"
+
+
+def _verify_admin_password(admin_password: str) -> bool:
+    stored = _admin_password_hash_hex()
+    salt = _admin_password_salt()
+    if not stored or not salt:
+        return False
+    computed = _pbkdf2_hex(admin_password, salt)
+    return hmac.compare_digest(computed, stored)
+
+
+def _record_admin_event(
+    event_type: str,
+    request: Request,
+    admin_user_id: str | None,
+    request_id: str,
+) -> None:
+    try:
+        ip = getattr(getattr(request, "client", None), "host", None)
+        ua = request.headers.get("User-Agent")
+        payload = {
+            "event_type": event_type,
+            "admin_user_id": admin_user_id,
+            "request_id": request_id,
+            "meta": {"ip": ip, "ua": ua},
+        }
+        create_artifact(
+            session_id=None,
+            kind="admin_event",
+            format="json",
+            payload_json=payload,
+            meta=None,
+            request_id=request_id,
+        )
+    except Exception:
+        # best-effort
+        pass
+
+
+def _require_bearer_user(request: Request) -> dict:
+    auth = (request.headers.get("Authorization") or "").strip()
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    token = auth.split(" ", 1)[1].strip()
     if not token:
-        raise HTTPException(status_code=401, detail="missing_admin_token")
-    rec = ADMIN_TOKENS.get(token)
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Support mock token for local manual tests.
+    # Format: Bearer mockphone:+79991234567
+    if token.startswith("mockphone:") and len(token) > 10:
+        phone = token.split(":", 1)[1].strip()
+        if not phone:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone))
+        return {"user_id": user_id, "phone_e164": phone}
+
+    rec = TOKENS.get(token)
     if not rec:
-        raise HTTPException(status_code=401, detail="invalid_admin_token")
-    expires_at = rec.get("expires_at")
-    if isinstance(expires_at, (int, float)) and time.time() >= float(expires_at):
-        try:
-            del ADMIN_TOKENS[token]
-        except Exception:
-            pass
-        raise HTTPException(status_code=401, detail="expired_admin_token")
+        raise HTTPException(status_code=401, detail="Unauthorized")
     return rec
 
 
+def _require_admin(request: Request) -> dict:
+    request_id = get_request_id_from_request(request)
+    token_plain = (request.headers.get("X-Admin-Token") or "").strip()
+    if not token_plain:
+        raise HTTPException(status_code=401, detail="missing_admin_token")
+    salt = _admin_password_salt() or ""
+    if not salt:
+        raise HTTPException(status_code=503, detail="admin_login_disabled")
+    token_hash = _pbkdf2_hex(token_plain, salt)
+    sess = get_admin_session_by_token_hash(token_hash, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=401, detail="invalid_admin_token")
+    if sess.get("revoked_at") is not None:
+        raise HTTPException(status_code=401, detail="invalid_admin_token")
+
+    expires_at = sess.get("expires_at")
+    try:
+        if isinstance(expires_at, datetime):
+            exp = expires_at
+        else:
+            exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) >= exp:
+            raise HTTPException(status_code=401, detail="expired_admin_token")
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid_admin_token")
+
+    user_id = str(sess.get("user_id"))
+    u = get_user_by_id(user_id, request_id=request_id)
+    return {
+        "admin_session": sess,
+        "admin_user": {"id": user_id, "phone": (u or {}).get("phone_e164")},
+    }
+
+
 class AdminLoginBody(BaseModel):
-    password: str
+    admin_password: str
 
 
 @app.post("/admin/login")
 def admin_login(body: AdminLoginBody, request: Request):
     request_id = get_request_id_from_request(request)
-    user_id = _require_user_id(request)
-    expected = _admin_password()
-    if not expected:
-        log_event("admin_login_disabled", request_id=request_id, user=_anon_user_key(user_id))
-        raise HTTPException(status_code=503, detail="admin_login_disabled")
 
-    pwd = (body.password or "").strip()
+    # Brute-force barrier: add a small delay on any failure.
+    def fail(detail: str, phone_e164: str | None = None):
+        time.sleep(0.5 + random.random() * 0.3)
+        log_event(
+            "admin_login_fail",
+            level="warning",
+            request_id=request_id,
+            phone=_mask_phone(phone_e164),
+            reason=detail,
+        )
+        _record_admin_event("login_fail", request=request, admin_user_id=None, request_id=request_id)
+        raise HTTPException(status_code=401, detail=detail)
+
+    allow = _admin_phone_allowlist()
+    if not allow:
+        fail("admin_login_disabled")
+
+    user = _require_bearer_user(request)
+    user_id = str(user.get("user_id") or "")
+    phone = str(user.get("phone_e164") or "").strip()
+    if not user_id or not phone:
+        fail("Unauthorized")
+    if phone not in allow:
+        fail("not_allowed", phone_e164=phone)
+
+    pwd = (body.admin_password or "").strip()
     if not pwd:
         raise HTTPException(status_code=400, detail="password_required")
-    if pwd != expected:
-        log_event("admin_login_failed", level="warning", request_id=request_id, user=_anon_user_key(user_id))
-        raise HTTPException(status_code=401, detail="invalid_password")
+    if not _verify_admin_password(pwd):
+        fail("invalid_password", phone_e164=phone)
 
-    ttl = _admin_token_ttl_seconds()
-    token = str(uuid.uuid4())
-    expires_at = time.time() + ttl
-    ADMIN_TOKENS[token] = {
-        "user_id": user_id,
-        "created_at": time.time(),
-        "expires_at": expires_at,
-    }
-    log_event("admin_login_ok", request_id=request_id, user=_anon_user_key(user_id), ttl_seconds=ttl)
-    return {
-        "ok": True,
-        "admin_token": token,
-        "ttl_seconds": ttl,
-        "expires_at": datetime.utcfromtimestamp(expires_at).isoformat() + "Z",
-    }
+    ttl_hours = _admin_session_ttl_hours()
+    expires_in_sec = ttl_hours * 3600
+    expires_dt = datetime.now(timezone.utc) + timedelta(seconds=expires_in_sec)
+
+    token_plain = secrets.token_urlsafe(36)
+    salt = _admin_password_salt() or ""
+    token_hash = _pbkdf2_hex(token_plain, salt)
+
+    ensure_user(user_id=user_id, phone_e164=phone, request_id=request_id)
+    create_admin_session(
+        user_id=user_id,
+        token_hash=token_hash,
+        salt=salt,
+        expires_at=expires_dt,
+        request_id=request_id,
+    )
+
+    log_event(
+        "admin_login_ok",
+        request_id=request_id,
+        phone=_mask_phone(phone),
+        ttl_hours=ttl_hours,
+    )
+    _record_admin_event("login_ok", request=request, admin_user_id=user_id, request_id=request_id)
+
+    return {"ok": True, "admin_token": token_plain, "expires_in_sec": expires_in_sec}
 
 
 @app.get("/admin/me")
 def admin_me(request: Request):
-    rec = _require_admin_token(request)
-    return {
-        "ok": True,
-        "user_id": rec.get("user_id"),
-        "expires_at": datetime.utcfromtimestamp(float(rec.get("expires_at"))).isoformat() + "Z",
-    }
+    auth = _require_admin(request)
+    sess = auth.get("admin_session") or {}
+    user = auth.get("admin_user") or {}
+    exp = sess.get("expires_at")
+    if isinstance(exp, datetime):
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+        expires_at = exp.astimezone(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+    else:
+        expires_at = str(exp)
+    return {"ok": True, "admin_user": user, "expires_at": expires_at}
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    sess = auth.get("admin_session") or {}
+    user = auth.get("admin_user") or {}
+    admin_session_id = str(sess.get("id"))
+    if admin_session_id:
+        revoke_admin_session(admin_session_id, request_id=request_id)
+    log_event(
+        "admin_logout",
+        request_id=request_id,
+        phone=_mask_phone(user.get("phone")),
+    )
+    _record_admin_event("logout", request=request, admin_user_id=str(user.get("id") or ""), request_id=request_id)
+    return {"ok": True}
 
 
 def log_event(event: str, level: str = "info", **fields):
@@ -144,9 +317,11 @@ def _get_user_id(request: Request) -> str | None:
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
         if token:
-            user = TOKENS.get(token)
-            if user:
-                return user
+            rec = TOKENS.get(token)
+            if isinstance(rec, dict):
+                user_id = (rec.get("user_id") or "").strip()
+                if user_id:
+                    return user_id
             # Support simple inline tokens for local smoke.
             if token.startswith("mock:") and len(token) > 5:
                 return token[5:]
@@ -170,7 +345,7 @@ def _require_user_id(request: Request) -> str:
 # ============================================================================
 
 OTP_LATEST: dict[str, str] = {}
-TOKENS: dict[str, str] = {}
+TOKENS: dict[str, dict] = {}
 
 
 class OtpRequest(BaseModel):
@@ -221,14 +396,17 @@ def auth_otp_verify(body: OtpVerify, request: Request):
     expected = OTP_LATEST.get(phone)
     if not expected or code != expected:
         raise HTTPException(status_code=401, detail="Invalid code")
-    # Use non-PII stable-ish user id derived from phone.
-    import hashlib
-
-    user_id = "u_" + hashlib.sha256(phone.encode("utf-8")).hexdigest()[:12]
+    # Stable UUID for this phone (server-side; no PII in user_id).
+    user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone))
     token = str(uuid.uuid4())
-    TOKENS[token] = user_id
+    TOKENS[token] = {"user_id": user_id, "phone_e164": phone}
+    try:
+        ensure_user(user_id=user_id, phone_e164=phone, request_id=request_id)
+    except Exception:
+        # best-effort
+        pass
     log_event("auth_otp_verified", request_id=request_id)
-    return {"ok": True, "token": token}
+    return {"ok": True, "token": token, "user_id": user_id}
 
 
 @app.post("/legal/offer/accept")

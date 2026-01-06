@@ -14,3 +14,10 @@ export function getOrCreateUserId(): string {
   window.localStorage.setItem(USER_ID_KEY, id);
   return id;
 }
+
+export function getUserToken(): string | null {
+  if (typeof window === "undefined") return null;
+  // tolerate different keys (future-proof)
+  const v = window.localStorage.getItem("user_token") || window.localStorage.getItem("token");
+  return v ? v : null;
+}

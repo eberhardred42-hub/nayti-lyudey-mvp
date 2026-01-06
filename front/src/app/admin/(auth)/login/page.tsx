@@ -4,12 +4,12 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { adminLogin } from "@/lib/adminApi";
 import { clearAdminToken, isAdminTokenExpired, setAdminToken } from "@/lib/adminSession";
-import { getOrCreateUserId, getUserId } from "@/lib/userSession";
+import { getUserToken } from "@/lib/userSession";
 import { sendClientEvent } from "@/lib/clientEvents";
 
 export default function AdminLoginPage() {
   const router = useRouter();
-  const userId = useMemo(() => (typeof window !== "undefined" ? getUserId() : null), []);
+  const userToken = useMemo(() => (typeof window !== "undefined" ? getUserToken() : null), []);
 
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -27,19 +27,18 @@ export default function AdminLoginPage() {
 
   async function ensureUser() {
     setError(null);
-    getOrCreateUserId();
-    router.refresh();
+    // Use existing login flow (outside of this page).
+    router.push("/");
   }
 
   async function submit() {
-    const uid = getUserId();
-    if (!uid) return;
     setLoading(true);
     setError(null);
     sendClientEvent("ui_admin_login_submitted");
     try {
-      const data = await adminLogin(password, uid);
-      setAdminToken(data.admin_token, data.expires_at);
+      const data = await adminLogin(password);
+      const expiresAtIso = new Date(Date.now() + (data.expires_in_sec || 0) * 1000).toISOString();
+      setAdminToken(data.admin_token, expiresAtIso);
       sendClientEvent("ui_admin_login_ok");
       router.push("/admin");
     } catch (e: any) {
@@ -54,9 +53,9 @@ export default function AdminLoginPage() {
     <main style={{ padding: 24, maxWidth: 520, margin: "0 auto" }}>
       <h1>Админка</h1>
 
-      {!userId ? (
+      {!userToken ? (
         <section style={{ marginTop: 16 }}>
-          <div style={{ marginBottom: 12 }}>Нужна пользовательская сессия.</div>
+          <div style={{ marginBottom: 12 }}>Нужна пользовательская авторизация.</div>
           <button onClick={ensureUser}>Войти</button>
         </section>
       ) : (

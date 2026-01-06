@@ -213,6 +213,37 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_packs_user_created
             ON packs(user_id, created_at)
         """)
+
+        # Admin users (phone allowlist + sessions).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                phone_e164 TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                revoked_at TIMESTAMPTZ NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_user_id
+            ON admin_sessions(user_id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at
+            ON admin_sessions(expires_at)
+        """)
         
         conn.commit()
 
@@ -740,7 +771,7 @@ def set_session_user(session_id: str, user_id: str, request_id: str = "unknown")
 
 
 def create_artifact(
-    session_id: str,
+    session_id: Optional[str],
     kind: str,
     format: str,
     payload_json: Optional[Dict[str, Any]] = None,
@@ -794,6 +825,227 @@ def create_artifact(
                 query_name="create_artifact",
                 request_id=request_id,
                 artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Admin users + sessions
+# ==========================================================================
+
+
+def ensure_user(
+    user_id: str,
+    phone_e164: str,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="ensure_user",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO users (id, phone_e164)
+                VALUES (%s, %s)
+                ON CONFLICT (phone_e164) DO UPDATE SET id = EXCLUDED.id
+                RETURNING id, phone_e164, created_at
+                """,
+                (user_id, phone_e164),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="ensure_user",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="ensure_user",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_user_by_id(user_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_user_by_id",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, phone_e164, created_at
+                FROM users
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_user_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_user_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_admin_session(
+    user_id: str,
+    token_hash: str,
+    salt: str,
+    expires_at: datetime,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_admin_session",
+        request_id=request_id,
+        admin_session_id=session_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO admin_sessions (id, user_id, token_hash, salt, expires_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, user_id, expires_at, created_at, revoked_at
+                """,
+                (session_id, user_id, token_hash, salt, expires_at),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_admin_session_by_token_hash(
+    token_hash: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_admin_session_by_token_hash",
+        request_id=request_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, user_id, token_hash, salt, expires_at, created_at, revoked_at
+                FROM admin_sessions
+                WHERE token_hash = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_admin_session_by_token_hash",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_admin_session_by_token_hash",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def revoke_admin_session(admin_session_id: str, request_id: str = "unknown") -> int:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="revoke_admin_session",
+        request_id=request_id,
+        admin_session_id=admin_session_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE admin_sessions
+                SET revoked_at = now()
+                WHERE id = %s AND revoked_at IS NULL
+                """,
+                (admin_session_id,),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="revoke_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(cur.rowcount or 0)
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="revoke_admin_session",
+                request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )
