@@ -9,6 +9,7 @@ from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from llm_client import generate_questions_and_quick_replies, health_llm
+from storage.s3_client import health_s3_env, head_bucket_if_debug
 
 app = FastAPI()
 SESSIONS = {}
@@ -749,6 +750,30 @@ def health_sms():
         "ok": True,
         "provider": provider,
     }
+
+
+@app.get("/health/s3")
+def health_s3(request: Request):
+    """Check S3 configuration (env-only; no network).
+
+    In DEBUG mode, may run a lightweight head_bucket.
+    """
+    request_id = get_request_id_from_request(request)
+    payload = health_s3_env()
+    bucket = payload.get("bucket")
+    if bucket:
+        debug_head = head_bucket_if_debug(bucket)
+        if debug_head is not None:
+            payload["debug_head_bucket_ok"] = debug_head
+    log_event(
+        "health_s3",
+        request_id=request_id,
+        ok=payload.get("ok"),
+        bucket=payload.get("bucket"),
+        endpoint=payload.get("endpoint"),
+        has_credentials=payload.get("has_credentials"),
+    )
+    return payload
 
 
 @app.get("/vacancy")

@@ -1,0 +1,222 @@
+import json
+import os
+import time
+from datetime import datetime
+from typing import Any, Dict, Optional
+
+import boto3
+from botocore.config import Config
+
+from alerts import send_alert
+
+
+def log_event(event: str, level: str = "info", **fields):
+    payload: Dict[str, Any] = {
+        "event": event,
+        "level": level,
+        "ts": datetime.utcnow().isoformat() + "Z",
+    }
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[key] = value
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _s3_settings() -> Dict[str, Any]:
+    endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
+    region = (os.environ.get("S3_REGION") or "us-east-1").strip()
+    access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip() or None
+    secret_key = (os.environ.get("S3_SECRET_KEY") or "").strip() or None
+
+    use_ssl_env = os.environ.get("S3_USE_SSL")
+    if use_ssl_env is None:
+        use_ssl = None
+    else:
+        use_ssl = use_ssl_env.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    if use_ssl is None and endpoint:
+        use_ssl = endpoint.lower().startswith("https://")
+    if use_ssl is None:
+        use_ssl = True
+
+    return {
+        "endpoint": endpoint,
+        "region": region,
+        "access_key": access_key,
+        "secret_key": secret_key,
+        "use_ssl": use_ssl,
+    }
+
+
+_client_cached = None
+
+
+def _client():
+    global _client_cached
+    if _client_cached is not None:
+        return _client_cached
+
+    s = _s3_settings()
+    _client_cached = boto3.client(
+        "s3",
+        endpoint_url=s["endpoint"],
+        region_name=s["region"],
+        aws_access_key_id=s["access_key"],
+        aws_secret_access_key=s["secret_key"],
+        use_ssl=bool(s["use_ssl"]),
+        config=Config(s3={"addressing_style": "path"}),
+    )
+    return _client_cached
+
+
+def upload_bytes(
+    bucket: str,
+    key: str,
+    data: bytes,
+    content_type: str,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """Upload bytes to S3-compatible storage."""
+    start = time.perf_counter()
+    size_bytes = len(data)
+
+    log_event(
+        "s3_upload_start",
+        request_id=request_id,
+        bucket=bucket,
+        object_key=key,
+        size_bytes=size_bytes,
+        content_type=content_type,
+    )
+
+    try:
+        resp = _client().put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=data,
+            ContentType=content_type,
+        )
+        etag = resp.get("ETag")
+        log_event(
+            "s3_upload_ok",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            size_bytes=size_bytes,
+            etag=etag,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+        return {"etag": etag, "size_bytes": size_bytes}
+    except Exception as e:
+        log_event(
+            "s3_upload_error",
+            level="error",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            size_bytes=size_bytes,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+            error=str(e),
+        )
+        send_alert(
+            severity="error",
+            event="s3_upload_error",
+            request_id=request_id,
+            context={
+                "bucket": bucket,
+                "object_key": key,
+                "size_bytes": size_bytes,
+                "error": str(e),
+            },
+        )
+        raise
+
+
+def presign_get(
+    bucket: str,
+    key: str,
+    expires_sec: int = 600,
+    request_id: str = "unknown",
+) -> str:
+    """Generate presigned GET url.
+
+    IMPORTANT: Do not log the presigned URL.
+    """
+    start = time.perf_counter()
+    try:
+        url = _client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=expires_sec,
+        )
+        log_event(
+            "s3_presign_ok",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            expires_sec=expires_sec,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+        return url
+    except Exception as e:
+        log_event(
+            "s3_presign_error",
+            level="error",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            expires_sec=expires_sec,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+            error=str(e),
+        )
+        send_alert(
+            severity="error",
+            event="s3_presign_error",
+            request_id=request_id,
+            context={
+                "bucket": bucket,
+                "object_key": key,
+                "expires_sec": expires_sec,
+                "error": str(e),
+            },
+        )
+        raise
+
+
+def health_s3_env() -> Dict[str, Any]:
+    """Env-only health payload for S3 (no network requests)."""
+    provider = (os.environ.get("S3_PROVIDER") or "s3").strip().lower()
+    bucket = (os.environ.get("S3_BUCKET") or "").strip() or None
+    endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
+
+    s = _s3_settings()
+    has_credentials = bool(s.get("access_key")) and bool(s.get("secret_key"))
+
+    ok = bool(bucket) and bool(endpoint) and provider == "s3"
+
+    return {
+        "ok": ok,
+        "provider": "s3",
+        "endpoint": endpoint,
+        "bucket": bucket,
+        "has_credentials": has_credentials,
+    }
+
+
+def head_bucket_if_debug(bucket: str) -> Optional[bool]:
+    """Optional lightweight check used only in DEBUG mode."""
+    if not _env_bool("DEBUG", False):
+        return None
+    try:
+        _client().head_bucket(Bucket=bucket)
+        return True
+    except Exception:
+        return False
