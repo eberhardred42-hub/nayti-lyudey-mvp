@@ -11,6 +11,7 @@ Uses psycopg2 for PostgreSQL connection (no ORM).
 import os
 import json
 import time
+import uuid
 from datetime import datetime
 import psycopg2
 import psycopg2.extras
@@ -91,6 +92,12 @@ def init_db():
                 updated_at TIMESTAMPTZ DEFAULT now()
             )
         """)
+
+        # Stage 9.3.x: optional user ownership for sessions.
+        cur.execute("""
+            ALTER TABLE sessions
+            ADD COLUMN IF NOT EXISTS user_id TEXT
+        """)
         
         # Create messages table
         cur.execute("""
@@ -107,6 +114,67 @@ def init_db():
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_messages_session_id
             ON messages(session_id)
+        """)
+
+        # Stage 9.3.x: artifacts table (links files to sessions).
+        # Columns are nullable to keep it forward-compatible with older DBs.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id UUID PRIMARY KEY,
+                session_id TEXT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+                kind TEXT NULL,
+                format TEXT NULL,
+                payload_json JSONB NULL,
+                meta JSONB NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS session_id TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS kind TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS format TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS payload_json JSONB
+        """)
+
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS meta JSONB
+        """)
+
+        # Files stored in S3-compatible storage (MinIO locally), metadata in Postgres.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS artifact_files (
+                id UUID PRIMARY KEY,
+                artifact_id UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+                storage TEXT NOT NULL DEFAULT 's3',
+                bucket TEXT NOT NULL,
+                object_key TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                size_bytes BIGINT NULL,
+                etag TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_artifact_files_artifact_id
+            ON artifact_files(artifact_id)
+        """)
+
+        cur.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_artifact_files_bucket_object_key
+            ON artifact_files(bucket, object_key)
         """)
         
         conn.commit()
@@ -388,6 +456,365 @@ def delete_session(session_id: str, request_id: str = "unknown") -> None:
                 query_name="delete_session",
                 request_id=request_id,
                 session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ============================================================================
+# Artifact file operations
+# ============================================================================
+
+def create_artifact_file(
+    artifact_id: str,
+    bucket: str,
+    object_key: str,
+    content_type: str,
+    size_bytes: Optional[int] = None,
+    etag: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """Create a new artifact file record.
+
+    Notes:
+    - `meta` is accepted for forward-compatibility, but not persisted yet.
+    """
+    _ = meta
+    file_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_artifact_file",
+        request_id=request_id,
+        artifact_id=artifact_id,
+        file_id=file_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO artifact_files (
+                    id, artifact_id, bucket, object_key, content_type, size_bytes, etag
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, artifact_id, storage, bucket, object_key, content_type, size_bytes, etag, created_at
+                """,
+                (file_id, artifact_id, bucket, object_key, content_type, size_bytes, etag),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_artifact_file",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_artifact_file",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_artifact_file(file_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Get an artifact file record by its ID."""
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="get_artifact_file", request_id=request_id, file_id=file_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, artifact_id, storage, bucket, object_key, content_type, size_bytes, etag, created_at
+                FROM artifact_files
+                WHERE id = %s
+                """,
+                (file_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_artifact_file",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_artifact_file",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_artifact_file_by_artifact(artifact_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Get latest artifact file record for the given artifact."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_artifact_file_by_artifact",
+        request_id=request_id,
+        artifact_id=artifact_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, artifact_id, storage, bucket, object_key, content_type, size_bytes, etag, created_at
+                FROM artifact_files
+                WHERE artifact_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (artifact_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_artifact_file_by_artifact",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_artifact_file_by_artifact",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_user_files(user_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """List artifact-backed files that belong to the given user."""
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="list_user_files", request_id=request_id, user_id=user_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    af.id AS file_id,
+                    af.artifact_id,
+                    a.kind,
+                    af.created_at,
+                    af.content_type,
+                    af.size_bytes,
+                    (a.meta->>'doc_id') AS doc_id
+                FROM artifact_files af
+                JOIN artifacts a ON a.id = af.artifact_id
+                JOIN sessions s ON s.session_id = a.session_id
+                WHERE s.user_id = %s
+                ORDER BY af.created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_user_files",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_user_files",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def set_session_user(session_id: str, user_id: str, request_id: str = "unknown") -> None:
+    """Attach a user_id to a session (best-effort; column is optional)."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="set_session_user",
+        request_id=request_id,
+        session_id=session_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE sessions
+                SET user_id = %s, updated_at = now()
+                WHERE session_id = %s
+                """,
+                (user_id, session_id),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="set_session_user",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="set_session_user",
+                request_id=request_id,
+                session_id=session_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_artifact(
+    session_id: str,
+    kind: str,
+    format: str,
+    payload_json: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """Create an artifact record."""
+    artifact_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_artifact",
+        request_id=request_id,
+        artifact_id=artifact_id,
+        session_id=session_id,
+        kind=kind,
+        format=format,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO artifacts (id, session_id, kind, format, payload_json, meta)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, session_id, kind, format, payload_json, meta, created_at
+                """,
+                (
+                    artifact_id,
+                    session_id,
+                    kind,
+                    format,
+                    psycopg2.extras.Json(payload_json) if payload_json is not None else None,
+                    psycopg2.extras.Json(meta) if meta is not None else None,
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_artifact",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_artifact",
+                request_id=request_id,
+                artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_file_download_info_for_user(
+    file_id: str,
+    user_id: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    """Resolve (bucket, key) for a file_id if it belongs to the given user."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_file_download_info_for_user",
+        request_id=request_id,
+        file_id=file_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    af.id AS file_id,
+                    af.artifact_id,
+                    af.bucket,
+                    af.object_key,
+                    af.content_type,
+                    af.size_bytes,
+                    af.etag,
+                    af.created_at
+                FROM artifact_files af
+                JOIN artifacts a ON a.id = af.artifact_id
+                JOIN sessions s ON s.session_id = a.session_id
+                WHERE af.id = %s AND s.user_id = %s
+                """,
+                (file_id, user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_file_download_info_for_user",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_file_download_info_for_user",
+                request_id=request_id,
+                file_id=file_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )

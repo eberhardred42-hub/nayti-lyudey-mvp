@@ -1,5 +1,6 @@
 import json
 import time
+import os
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
@@ -7,7 +8,11 @@ import re
 from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
+from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
+from db import list_user_files
 from llm_client import generate_questions_and_quick_replies, health_llm
+from storage.s3_client import health_s3_env, head_bucket_if_debug
+from storage.s3_client import upload_bytes, presign_get
 
 app = FastAPI()
 SESSIONS = {}
@@ -35,6 +40,153 @@ def get_request_id_from_request(request: Request) -> str:
 
 def compute_duration_ms(start_time: float) -> float:
     return round((time.perf_counter() - start_time) * 1000, 2)
+
+
+def _get_user_id(request: Request) -> str | None:
+    # Bearer token has priority, then X-User-Id fallback (used by older front).
+    auth = request.headers.get("Authorization") or ""
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        if token:
+            user = TOKENS.get(token)
+            if user:
+                return user
+            # Support simple inline tokens for local smoke.
+            if token.startswith("mock:") and len(token) > 5:
+                return token[5:]
+
+    raw = request.headers.get("X-User-Id")
+    if raw:
+        v = raw.strip()
+        return v or None
+    return None
+
+
+def _require_user_id(request: Request) -> str:
+    user_id = _get_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return user_id
+
+
+# ============================================================================
+# Mock auth (OTP + offer) for local smoke tests
+# ============================================================================
+
+OTP_LATEST: dict[str, str] = {}
+TOKENS: dict[str, str] = {}
+
+
+class OtpRequest(BaseModel):
+    phone: str
+
+
+class OtpVerify(BaseModel):
+    phone: str
+    code: str
+
+
+@app.post("/auth/otp/request")
+def auth_otp_request(body: OtpRequest, request: Request):
+    request_id = get_request_id_from_request(request)
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
+    phone = (body.phone or "").strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone is required")
+
+    # Minimal mock: always generate a code; in real mode we would send SMS.
+    code = str(int(time.time()))[-6:].rjust(6, "0")
+    OTP_LATEST[phone] = code
+    log_event(
+        "auth_otp_requested",
+        request_id=request_id,
+        provider=provider,
+    )
+    return {"ok": True}
+
+
+@app.get("/debug/otp/latest")
+def debug_otp_latest(phone: str, request: Request):
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+    request_id = get_request_id_from_request(request)
+    code = OTP_LATEST.get(phone)
+    if not code:
+        raise HTTPException(status_code=404, detail="No OTP")
+    log_event("debug_otp_latest", request_id=request_id)
+    return {"ok": True, "phone": phone, "code": code}
+
+
+@app.post("/auth/otp/verify")
+def auth_otp_verify(body: OtpVerify, request: Request):
+    request_id = get_request_id_from_request(request)
+    phone = (body.phone or "").strip()
+    code = (body.code or "").strip()
+    expected = OTP_LATEST.get(phone)
+    if not expected or code != expected:
+        raise HTTPException(status_code=401, detail="Invalid code")
+    # Use non-PII stable-ish user id derived from phone.
+    import hashlib
+
+    user_id = "u_" + hashlib.sha256(phone.encode("utf-8")).hexdigest()[:12]
+    token = str(uuid.uuid4())
+    TOKENS[token] = user_id
+    log_event("auth_otp_verified", request_id=request_id)
+    return {"ok": True, "token": token}
+
+
+@app.post("/legal/offer/accept")
+def legal_offer_accept(request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_user_id(request)
+    log_event("legal_offer_accepted", request_id=request_id)
+    return {"ok": True}
+
+
+def _is_debug_enabled() -> bool:
+    return (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _anon_user_key(user_id: str | None) -> str:
+    if not user_id:
+        return "anon"
+    import hashlib
+    return "u_" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _make_minimal_pdf_bytes() -> bytes:
+    """Generate a tiny valid PDF (with xref/startxref)."""
+    parts: list[bytes] = []
+    parts.append(b"%PDF-1.4\n")
+
+    offsets: list[int] = []
+
+    def add_obj(num: int, body: bytes):
+        offsets.append(sum(len(p) for p in parts))
+        parts.append(f"{num} 0 obj\n".encode("ascii"))
+        parts.append(body)
+        if not body.endswith(b"\n"):
+            parts.append(b"\n")
+        parts.append(b"endobj\n")
+
+    add_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>\n")
+    add_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n")
+    add_obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\n")
+    add_obj(4, b"<< /Length 0 >>\nstream\n\nendstream\n")
+
+    xref_offset = sum(len(p) for p in parts)
+    obj_count = 4
+    parts.append(b"xref\n")
+    parts.append(f"0 {obj_count + 1}\n".encode("ascii"))
+    parts.append(b"0000000000 65535 f \n")
+    for off in offsets:
+        parts.append(f"{off:010d} 00000 n \n".encode("ascii"))
+    parts.append(b"trailer\n")
+    parts.append(f"<< /Size {obj_count + 1} /Root 1 0 R >>\n".encode("ascii"))
+    parts.append(b"startxref\n")
+    parts.append(f"{xref_offset}\n".encode("ascii"))
+    parts.append(b"%%EOF\n")
+    return b"".join(parts)
 
 
 @app.middleware("http")
@@ -739,6 +891,41 @@ def health_llm_endpoint():
     return health_llm()
 
 
+@app.get("/health/sms")
+def health_sms():
+    """Check SMS provider configuration (env-only; no network)."""
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
+    # We deliberately don't validate credentials here (Stage 9.3.0 baseline).
+    return {
+        "ok": True,
+        "provider": provider,
+    }
+
+
+@app.get("/health/s3")
+def health_s3(request: Request):
+    """Check S3 configuration (env-only; no network).
+
+    In DEBUG mode, may run a lightweight head_bucket.
+    """
+    request_id = get_request_id_from_request(request)
+    payload = health_s3_env()
+    bucket = payload.get("bucket")
+    if bucket:
+        debug_head = head_bucket_if_debug(bucket)
+        if debug_head is not None:
+            payload["debug_head_bucket_ok"] = debug_head
+    log_event(
+        "health_s3",
+        request_id=request_id,
+        ok=payload.get("ok"),
+        bucket=payload.get("bucket"),
+        endpoint=payload.get("endpoint"),
+        has_credentials=payload.get("has_credentials"),
+    )
+    return payload
+
+
 @app.get("/vacancy")
 def get_vacancy(session_id: str, request: Request):
     """Get vacancy knowledge base for a session."""
@@ -1054,6 +1241,9 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     try:
         kb = make_empty_vacancy_kb()
         db_create_session(session_id, body.profession_query, kb, request_id=request_id)
+        user_id = _get_user_id(request)
+        if user_id:
+            set_session_user(session_id, user_id, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -1074,6 +1264,179 @@ def create_session_endpoint(body: SessionCreate, request: Request):
         duration_ms=compute_duration_ms(start_time),
     )
     return {"session_id": session_id}
+
+
+@app.post("/debug/s3/put-test-pdf")
+def debug_s3_put_test_pdf(request: Request, session_id: str | None = None):
+    """DEBUG-only: upload a tiny test PDF to S3 and register artifact + artifact_file."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    user_key = _anon_user_key(user_id)
+
+    bucket = (os.environ.get("S3_BUCKET") or "").strip()
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3_BUCKET is not configured")
+
+    # Ensure a session exists to attach ownership chain.
+    sid = session_id
+    if sid:
+        existing = get_session(sid, request_id=request_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        sid = str(uuid.uuid4())
+        kb = make_empty_vacancy_kb()
+        db_create_session(sid, "debug_pdf_test", kb, request_id=request_id)
+
+    if user_id:
+        try:
+            set_session_user(sid, user_id, request_id=request_id)
+        except Exception:
+            pass
+
+    artifact = create_artifact(
+        session_id=sid,
+        kind="pdf_test",
+        format="pdf",
+        payload_json=None,
+        request_id=request_id,
+    )
+    artifact_id = artifact.get("id")
+    if not artifact_id:
+        raise HTTPException(status_code=500, detail="Failed to create artifact")
+
+    pdf_bytes = _make_minimal_pdf_bytes()
+    key = f"users/{user_key}/test/{artifact_id}.pdf"
+
+    up = upload_bytes(bucket=bucket, key=key, data=pdf_bytes, content_type="application/pdf", request_id=request_id)
+
+    file_row = create_artifact_file(
+        artifact_id=str(artifact_id),
+        bucket=bucket,
+        object_key=key,
+        content_type="application/pdf",
+        size_bytes=up.get("size_bytes"),
+        etag=up.get("etag"),
+        meta={},
+        request_id=request_id,
+    )
+    file_id = file_row.get("id")
+    if not file_id:
+        raise HTTPException(status_code=500, detail="Failed to create artifact file")
+
+    download_url = presign_get(bucket=bucket, key=key, expires_sec=600, request_id=request_id)
+
+    log_event(
+        "file_created",
+        request_id=request_id,
+        artifact_id=str(artifact_id),
+        file_id=str(file_id),
+        bucket=bucket,
+        key=key,
+        size_bytes=up.get("size_bytes"),
+    )
+    log_event(
+        "file_presigned",
+        request_id=request_id,
+        file_id=str(file_id),
+        bucket=bucket,
+        key=key,
+        expires_in_sec=600,
+    )
+    return {
+        "ok": True,
+        "artifact_id": str(artifact_id),
+        "file_id": str(file_id),
+        "bucket": bucket,
+        "key": key,
+        "download_url": download_url,
+    }
+
+
+@app.get("/files/{file_id}/download")
+def files_download(file_id: str, request: Request):
+    """Auth-required: return presigned download URL if file belongs to current user."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    row = get_file_download_info_for_user(file_id=file_id, user_id=user_id, request_id=request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    bucket = row.get("bucket")
+    key = row.get("object_key")
+    if not bucket or not key:
+        raise HTTPException(status_code=500, detail="File record is incomplete")
+
+    expires = 600
+    url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+
+    log_event(
+        "file_presigned",
+        request_id=request_id,
+        file_id=file_id,
+        bucket=bucket,
+        key=key,
+        expires_in_sec=expires,
+    )
+    return {"ok": True, "url": url, "expires_in_sec": expires}
+
+
+@app.get("/me/files")
+def me_files(request: Request):
+    """Auth-required: list files that belong to current user."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    rows = list_user_files(user_id=user_id, request_id=request_id)
+    normalized = []
+    for r in rows:
+        normalized.append(
+            {
+                "file_id": str(r.get("file_id")),
+                "artifact_id": str(r.get("artifact_id")),
+                "kind": r.get("kind"),
+                "created_at": to_iso(r.get("created_at")),
+                "content_type": r.get("content_type"),
+                "size_bytes": r.get("size_bytes"),
+                "doc_id": r.get("doc_id"),
+                "status": "ready",
+            }
+        )
+    log_event(
+        "me_files_listed",
+        request_id=request_id,
+        user_id=user_id,
+        files_count=len(normalized),
+    )
+    return {"ok": True, "files": normalized}
+
+
+@app.post("/events/client")
+async def events_client(request: Request):
+    """Receive client-side analytics events (minimal).
+
+    Stores nothing; only logs.
+    """
+    request_id = get_request_id_from_request(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    event = None
+    props = None
+    if isinstance(body, dict):
+        event = body.get("event")
+        props = body.get("props")
+    log_event(
+        "client_event",
+        request_id=request_id,
+        client_event=event,
+        props=props,
+    )
+    return {"ok": True}
 
 
 @app.get("/debug/session")

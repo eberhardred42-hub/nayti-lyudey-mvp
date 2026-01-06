@@ -10,6 +10,10 @@
 
 **Want to test it?** → Follow [RUNBOOK.md](RUNBOOK.md) (setup + testing)
 
+**Stage 9.3 (Storage / MinIO / S3)?** → Read:
+- [STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)
+- [STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)
+
 ---
 
 ## 📚 All Documentation Files
@@ -28,6 +32,8 @@
 | **[STAGE6.2_IMPLEMENTATION.md](stages/stage6.2/STAGE6.2_IMPLEMENTATION.md)** | 4K | Detailed verbose logging instrumentation | 8 min |
 | **[STAGE7_SUMMARY.md](stages/stage7/STAGE7_SUMMARY.md)** | 3K | LLM clarifications overview | 4 min |
 | **[STAGE7_IMPLEMENTATION.md](stages/stage7/STAGE7_IMPLEMENTATION.md)** | 4K | LLM integration and prompts | 8 min |
+| **[STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)** | NEW | Storage (MinIO/S3) overview + what shipped | 5 min |
+| **[STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)** | NEW | Storage implementation + runbook | 15 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |
 
 ### Status & Navigation Files
