@@ -50,6 +50,14 @@ export async function adminMe() {
   return adminFetch("/api/admin/me", { method: "GET" });
 }
 
+export async function adminAudit(params?: { limit?: number; action?: string; target_type?: string }) {
+  const url = new URL("/api/admin/audit", window.location.origin);
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  if (params?.action) url.searchParams.set("action", params.action);
+  if (params?.target_type) url.searchParams.set("target_type", params.target_type);
+  return adminFetch(url.pathname + url.search, { method: "GET" });
+}
+
 export async function adminLogin(password: string) {
   const userToken = getUserToken();
   if (!userToken) {

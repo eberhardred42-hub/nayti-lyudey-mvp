@@ -244,6 +244,35 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at
             ON admin_sessions(expires_at)
         """)
+
+        # Admin audit log (investigable admin actions).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id UUID PRIMARY KEY,
+                admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                admin_session_id UUID NOT NULL REFERENCES admin_sessions(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NULL,
+                before_hash TEXT NULL,
+                after_hash TEXT NULL,
+                summary TEXT NULL,
+                request_id TEXT NULL,
+                ip TEXT NULL,
+                user_agent TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_user_id
+            ON admin_audit_log(admin_user_id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at
+            ON admin_audit_log(created_at)
+        """)
         
         conn.commit()
 
@@ -1045,6 +1074,171 @@ def revoke_admin_session(admin_session_id: str, request_id: str = "unknown") -> 
                 "db_query_error",
                 level="error",
                 query_name="revoke_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_admin_audit_log(
+    admin_user_id: str,
+    admin_session_id: str,
+    action: str,
+    target_type: str,
+    target_id: Optional[str],
+    before_hash: Optional[str],
+    after_hash: Optional[str],
+    summary: Optional[str],
+    request_id: Optional[str],
+    ip: Optional[str],
+    user_agent: Optional[str],
+    request_id_log: str = "unknown",
+) -> Dict[str, Any]:
+    audit_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_admin_audit_log",
+        request_id=request_id_log,
+        admin_audit_id=audit_id,
+        action=action,
+        target_type=target_type,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO admin_audit_log (
+                    id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, admin_user_id, admin_session_id, action, target_type, target_id,
+                          before_hash, after_hash, summary, request_id, ip, user_agent, created_at
+                """,
+                (
+                    audit_id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent,
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_admin_audit_log",
+                request_id=request_id_log,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_admin_audit_log",
+                request_id=request_id_log,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_admin_audit_log(
+    limit: int = 50,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_admin_audit_log",
+        request_id=request_id,
+        limit=limit,
+        action=action,
+        target_type=target_type,
+    )
+
+    safe_limit = int(limit or 50)
+    if safe_limit <= 0:
+        safe_limit = 50
+    if safe_limit > 200:
+        safe_limit = 200
+
+    where = []
+    args: list[Any] = []
+    if action:
+        where.append("action = %s")
+        args.append(action)
+    if target_type:
+        where.append("target_type = %s")
+        args.append(target_type)
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT
+                    id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent,
+                    created_at
+                FROM admin_audit_log
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*args, safe_limit),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="list_admin_audit_log",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_admin_audit_log",
                 request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),

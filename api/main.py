@@ -25,7 +25,15 @@ from db import (
     list_latest_render_jobs_for_pack,
     list_packs_for_user,
 )
-from db import ensure_user, get_user_by_id, create_admin_session, get_admin_session_by_token_hash, revoke_admin_session
+from db import (
+    ensure_user,
+    get_user_by_id,
+    create_admin_session,
+    get_admin_session_by_token_hash,
+    revoke_admin_session,
+    create_admin_audit_log,
+    list_admin_audit_log,
+)
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
@@ -123,6 +131,71 @@ def _record_admin_event(
         )
     except Exception:
         # best-effort
+        pass
+
+
+def _stable_obj_hash(obj: object | None) -> str | None:
+    if obj is None:
+        return None
+    try:
+        raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    except Exception:
+        return None
+
+
+def record_admin_audit(
+    request: Request,
+    admin_user_id: str,
+    admin_session_id: str,
+    action: str,
+    target_type: str,
+    target_id: str | None,
+    before_obj: object | None = None,
+    after_obj: object | None = None,
+    summary: str | None = None,
+):
+    request_id = get_request_id_from_request(request)
+    ip = getattr(getattr(request, "client", None), "host", None)
+    ua = request.headers.get("User-Agent")
+
+    before_hash = _stable_obj_hash(before_obj)
+    after_hash = _stable_obj_hash(after_obj)
+
+    # DB row (contains ip/ua by requirement)
+    create_admin_audit_log(
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action=action,
+        target_type=target_type,
+        target_id=target_id,
+        before_hash=before_hash,
+        after_hash=after_hash,
+        summary=summary,
+        request_id=request_id,
+        ip=ip,
+        user_agent=ua,
+        request_id_log=request_id,
+    )
+
+    # Artifact (no PII/tokens)
+    try:
+        create_artifact(
+            session_id=None,
+            kind="admin_event",
+            format="json",
+            payload_json={
+                "action": action,
+                "target_type": target_type,
+                "target_id": target_id,
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+                "request_id": request_id,
+            },
+            meta=None,
+            request_id=request_id,
+        )
+    except Exception:
         pass
 
 
@@ -235,7 +308,7 @@ def admin_login(body: AdminLoginBody, request: Request):
     token_hash = _pbkdf2_hex(token_plain, salt)
 
     ensure_user(user_id=user_id, phone_e164=phone, request_id=request_id)
-    create_admin_session(
+    created = create_admin_session(
         user_id=user_id,
         token_hash=token_hash,
         salt=salt,
@@ -249,7 +322,21 @@ def admin_login(body: AdminLoginBody, request: Request):
         phone=_mask_phone(phone),
         ttl_hours=ttl_hours,
     )
-    _record_admin_event("login_ok", request=request, admin_user_id=user_id, request_id=request_id)
+    try:
+        record_admin_audit(
+            request=request,
+            admin_user_id=user_id,
+            admin_session_id=str(created.get("id") or ""),
+            action="admin_login",
+            target_type="admin_session",
+            target_id=str(created.get("id") or ""),
+            before_obj=None,
+            after_obj={"expires_at": str(created.get("expires_at")), "ttl_hours": ttl_hours},
+            summary=None,
+        )
+    except Exception:
+        # best-effort; should not block login
+        pass
 
     return {"ok": True, "admin_token": token_plain, "expires_in_sec": expires_in_sec}
 
@@ -283,8 +370,35 @@ def admin_logout(request: Request):
         request_id=request_id,
         phone=_mask_phone(user.get("phone")),
     )
-    _record_admin_event("logout", request=request, admin_user_id=str(user.get("id") or ""), request_id=request_id)
+    try:
+        record_admin_audit(
+            request=request,
+            admin_user_id=str(user.get("id") or ""),
+            admin_session_id=admin_session_id,
+            action="admin_logout",
+            target_type="admin_session",
+            target_id=admin_session_id,
+            before_obj={"revoked": False},
+            after_obj={"revoked": True},
+            summary=None,
+        )
+    except Exception:
+        pass
     return {"ok": True}
+
+
+@app.get("/admin/audit")
+def admin_audit(limit: int = 50, action: str = "", target_type: str = "", request: Request = None):
+    # FastAPI will still pass Request by injection even with default None.
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    _ = _require_admin(request)
+    rows = list_admin_audit_log(
+        limit=limit,
+        action=(action or "").strip() or None,
+        target_type=(target_type or "").strip() or None,
+        request_id=request_id,
+    )
+    return {"ok": True, "items": rows}
 
 
 def log_event(event: str, level: str = "info", **fields):
