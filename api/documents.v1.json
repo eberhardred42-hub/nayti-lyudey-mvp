@@ -1,0 +1,17 @@
+{
+  "version": "1.0",
+  "documents": [
+    {"doc_id": "free_report", "title": "Бесплатный отчёт", "is_enabled": true, "tier": "free"},
+    {"doc_id": "vacancy_profile", "title": "Профиль вакансии", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "scorecard", "title": "Scorecard", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "screening_script", "title": "Скрипт скрининга", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "sourcing_pack", "title": "Sourcing pack", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "hiring_pack", "title": "Hiring pack", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "role_snapshot", "title": "Role snapshot", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "budget_reality_check", "title": "Budget reality check", "is_enabled": true, "tier": "free"},
+    {"doc_id": "quality_report", "title": "Quality report", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "manifest", "title": "Manifest", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "interview_guide", "title": "Interview guide", "is_enabled": true, "tier": "paid"},
+    {"doc_id": "offer_template", "title": "Offer template", "is_enabled": true, "tier": "paid"}
+  ]
+}
