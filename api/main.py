@@ -8,8 +8,10 @@ import re
 from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
+from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
+from storage.s3_client import upload_bytes, presign_get
 
 app = FastAPI()
 SESSIONS = {}
@@ -37,6 +39,67 @@ def get_request_id_from_request(request: Request) -> str:
 
 def compute_duration_ms(start_time: float) -> float:
     return round((time.perf_counter() - start_time) * 1000, 2)
+
+
+def _get_user_id(request: Request) -> str | None:
+    raw = request.headers.get("X-User-Id")
+    if not raw:
+        return None
+    v = raw.strip()
+    return v or None
+
+
+def _require_user_id(request: Request) -> str:
+    user_id = _get_user_id(request)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Missing X-User-Id")
+    return user_id
+
+
+def _is_debug_enabled() -> bool:
+    return (os.environ.get("DEBUG") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _anon_user_key(user_id: str | None) -> str:
+    if not user_id:
+        return "anon"
+    import hashlib
+    return "u_" + hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:12]
+
+
+def _make_minimal_pdf_bytes() -> bytes:
+    """Generate a tiny valid PDF (with xref/startxref)."""
+    parts: list[bytes] = []
+    parts.append(b"%PDF-1.4\n")
+
+    offsets: list[int] = []
+
+    def add_obj(num: int, body: bytes):
+        offsets.append(sum(len(p) for p in parts))
+        parts.append(f"{num} 0 obj\n".encode("ascii"))
+        parts.append(body)
+        if not body.endswith(b"\n"):
+            parts.append(b"\n")
+        parts.append(b"endobj\n")
+
+    add_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>\n")
+    add_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>\n")
+    add_obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R >>\n")
+    add_obj(4, b"<< /Length 0 >>\nstream\n\nendstream\n")
+
+    xref_offset = sum(len(p) for p in parts)
+    obj_count = 4
+    parts.append(b"xref\n")
+    parts.append(f"0 {obj_count + 1}\n".encode("ascii"))
+    parts.append(b"0000000000 65535 f \n")
+    for off in offsets:
+        parts.append(f"{off:010d} 00000 n \n".encode("ascii"))
+    parts.append(b"trailer\n")
+    parts.append(f"<< /Size {obj_count + 1} /Root 1 0 R >>\n".encode("ascii"))
+    parts.append(b"startxref\n")
+    parts.append(f"{xref_offset}\n".encode("ascii"))
+    parts.append(b"%%EOF\n")
+    return b"".join(parts)
 
 
 @app.middleware("http")
@@ -1091,6 +1154,9 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     try:
         kb = make_empty_vacancy_kb()
         db_create_session(session_id, body.profession_query, kb, request_id=request_id)
+        user_id = _get_user_id(request)
+        if user_id:
+            set_session_user(session_id, user_id, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -1111,6 +1177,125 @@ def create_session_endpoint(body: SessionCreate, request: Request):
         duration_ms=compute_duration_ms(start_time),
     )
     return {"session_id": session_id}
+
+
+@app.post("/debug/s3/put-test-pdf")
+def debug_s3_put_test_pdf(request: Request, session_id: str | None = None):
+    """DEBUG-only: upload a tiny test PDF to S3 and register artifact + artifact_file."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
+
+    request_id = get_request_id_from_request(request)
+    user_id = _get_user_id(request)
+    user_key = _anon_user_key(user_id)
+
+    bucket = (os.environ.get("S3_BUCKET") or "").strip()
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3_BUCKET is not configured")
+
+    # Ensure a session exists to attach ownership chain.
+    sid = session_id
+    if sid:
+        existing = get_session(sid, request_id=request_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        sid = str(uuid.uuid4())
+        kb = make_empty_vacancy_kb()
+        db_create_session(sid, "debug_pdf_test", kb, request_id=request_id)
+
+    if user_id:
+        try:
+            set_session_user(sid, user_id, request_id=request_id)
+        except Exception:
+            pass
+
+    artifact = create_artifact(
+        session_id=sid,
+        kind="pdf_test",
+        format="pdf",
+        payload_json=None,
+        request_id=request_id,
+    )
+    artifact_id = artifact.get("id")
+    if not artifact_id:
+        raise HTTPException(status_code=500, detail="Failed to create artifact")
+
+    pdf_bytes = _make_minimal_pdf_bytes()
+    key = f"users/{user_key}/test/{artifact_id}.pdf"
+
+    up = upload_bytes(bucket=bucket, key=key, data=pdf_bytes, content_type="application/pdf", request_id=request_id)
+
+    file_row = create_artifact_file(
+        artifact_id=str(artifact_id),
+        bucket=bucket,
+        object_key=key,
+        content_type="application/pdf",
+        size_bytes=up.get("size_bytes"),
+        etag=up.get("etag"),
+        meta={},
+        request_id=request_id,
+    )
+    file_id = file_row.get("id")
+    if not file_id:
+        raise HTTPException(status_code=500, detail="Failed to create artifact file")
+
+    download_url = presign_get(bucket=bucket, key=key, expires_sec=600, request_id=request_id)
+
+    log_event(
+        "file_created",
+        request_id=request_id,
+        artifact_id=str(artifact_id),
+        file_id=str(file_id),
+        bucket=bucket,
+        key=key,
+        size_bytes=up.get("size_bytes"),
+    )
+    log_event(
+        "file_presigned",
+        request_id=request_id,
+        file_id=str(file_id),
+        bucket=bucket,
+        key=key,
+        expires_in_sec=600,
+    )
+    return {
+        "ok": True,
+        "artifact_id": str(artifact_id),
+        "file_id": str(file_id),
+        "bucket": bucket,
+        "key": key,
+        "download_url": download_url,
+    }
+
+
+@app.get("/files/{file_id}/download")
+def files_download(file_id: str, request: Request):
+    """Auth-required: return presigned download URL if file belongs to current user."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    row = get_file_download_info_for_user(file_id=file_id, user_id=user_id, request_id=request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    bucket = row.get("bucket")
+    key = row.get("object_key")
+    if not bucket or not key:
+        raise HTTPException(status_code=500, detail="File record is incomplete")
+
+    expires = 600
+    url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+
+    log_event(
+        "file_presigned",
+        request_id=request_id,
+        file_id=file_id,
+        bucket=bucket,
+        key=key,
+        expires_in_sec=expires,
+    )
+    return {"ok": True, "url": url, "expires_in_sec": expires}
 
 
 @app.get("/debug/session")
