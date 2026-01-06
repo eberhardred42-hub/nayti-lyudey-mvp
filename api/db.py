@@ -176,6 +176,43 @@ def init_db():
             CREATE UNIQUE INDEX IF NOT EXISTS uq_artifact_files_bucket_object_key
             ON artifact_files(bucket, object_key)
         """)
+
+        # Stage 9.4.2: async render jobs.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS render_jobs (
+                id UUID PRIMARY KEY,
+                pack_id UUID NOT NULL,
+                session_id UUID NOT NULL,
+                user_id UUID NULL,
+                doc_id TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INT NOT NULL DEFAULT 0,
+                max_attempts INT NOT NULL DEFAULT 5,
+                last_error TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_render_jobs_status_updated
+            ON render_jobs(status, updated_at)
+        """)
+
+        # Stage 9.4.3+: packs (group of documents to render).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS packs (
+                pack_id UUID PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_packs_user_created
+            ON packs(user_id, created_at)
+        """)
         
         conn.commit()
 
@@ -815,6 +852,535 @@ def get_file_download_info_for_user(
                 query_name="get_file_download_info_for_user",
                 request_id=request_id,
                 file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Pack operations (Stage 9.4.3+)
+# ==========================================================================
+
+
+def create_pack(
+    session_id: str,
+    user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    pack_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_pack",
+        request_id=request_id,
+        pack_id=pack_id,
+        session_id=session_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO packs (pack_id, session_id, user_id)
+                VALUES (%s, %s, %s)
+                RETURNING pack_id, session_id, user_id, created_at
+                """,
+                (pack_id, session_id, user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_pack(pack_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_pack",
+        request_id=request_id,
+        pack_id=pack_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT pack_id, session_id, user_id, created_at
+                FROM packs
+                WHERE pack_id = %s
+                """,
+                (pack_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_packs_for_user(user_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_packs_for_user",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT pack_id, session_id, user_id, created_at
+                FROM packs
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_packs_for_user",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_packs_for_user",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_latest_render_jobs_for_pack(pack_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """Return latest job per doc_id for the pack."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_latest_render_jobs_for_pack",
+        request_id=request_id,
+        pack_id=pack_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT DISTINCT ON (doc_id)
+                    id,
+                    pack_id,
+                    session_id,
+                    user_id,
+                    doc_id,
+                    status,
+                    attempts,
+                    max_attempts,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM render_jobs
+                WHERE pack_id = %s
+                ORDER BY doc_id, created_at DESC
+                """,
+                (pack_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_latest_render_jobs_for_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_latest_render_jobs_for_pack",
+                request_id=request_id,
+                pack_id=pack_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_latest_file_id_for_render_job(job_id: str, request_id: str = "unknown") -> Optional[str]:
+    """Resolve file_id for a ready job using artifacts.meta.render_job_id."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_latest_file_id_for_render_job",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT af.id
+                FROM artifacts a
+                JOIN artifact_files af ON af.artifact_id = a.id
+                WHERE (a.meta->>'render_job_id') = %s
+                ORDER BY af.created_at DESC
+                LIMIT 1
+                """,
+                (job_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_latest_file_id_for_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return str(row[0]) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_latest_file_id_for_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Render job operations (Stage 9.4.2)
+# ==========================================================================
+
+
+def create_render_job(
+    pack_id: str,
+    session_id: str,
+    doc_id: str,
+    status: str = "queued",
+    user_id: Optional[str] = None,
+    max_attempts: int = 5,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    job_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_render_job",
+        request_id=request_id,
+        render_job_id=job_id,
+        pack_id=pack_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        status=status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO render_jobs (
+                    id, pack_id, session_id, user_id, doc_id, status, attempts, max_attempts, last_error
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, 0, %s, NULL)
+                RETURNING id, pack_id, session_id, user_id, doc_id, status, attempts, max_attempts, last_error, created_at, updated_at
+                """,
+                (job_id, pack_id, session_id, user_id, doc_id, status, max_attempts),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_render_job(job_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_render_job",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, pack_id, session_id, user_id, doc_id, status, attempts, max_attempts, last_error, created_at, updated_at
+                FROM render_jobs
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_render_job",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def try_mark_render_job_rendering(
+    job_id: str,
+    request_id: str = "unknown",
+) -> bool:
+    """Atomically transition queued->rendering."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="try_mark_render_job_rendering",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE render_jobs
+                SET status = 'rendering', updated_at = now()
+                WHERE id = %s AND status = 'queued'
+                """,
+                (job_id,),
+            )
+            ok = cur.rowcount == 1
+            _log_event(
+                "db_query_ok",
+                query_name="try_mark_render_job_rendering",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+                transitioned=ok,
+            )
+            return ok
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="try_mark_render_job_rendering",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def mark_render_job_ready(
+    job_id: str,
+    request_id: str = "unknown",
+) -> None:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="mark_render_job_ready",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE render_jobs
+                SET status = 'ready', last_error = NULL, updated_at = now()
+                WHERE id = %s
+                """,
+                (job_id,),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="mark_render_job_ready",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="mark_render_job_ready",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def mark_render_job_failed(
+    job_id: str,
+    last_error: str,
+    request_id: str = "unknown",
+) -> None:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="mark_render_job_failed",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE render_jobs
+                SET status = 'failed', last_error = %s, updated_at = now()
+                WHERE id = %s
+                """,
+                (last_error, job_id),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="mark_render_job_failed",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="mark_render_job_failed",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def increment_render_job_attempt(
+    job_id: str,
+    last_error: str,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """attempts++ and set last_error; returns updated row."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="increment_render_job_attempt",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            sql = (
+                "UPDATE render_jobs\n"
+                "SET attempts = attempts + 1,\n"
+                "    last_error = %s,\n"
+                "    status = 'queued',\n"
+                "    updated_at = now()\n"
+                "WHERE id = %s\n"
+                "RETURNING id, pack_id, session_id, user_id, doc_id, status, attempts, max_attempts, last_error, created_at, updated_at"
+            )
+            cur.execute(
+                sql,
+                (last_error, job_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="increment_render_job_attempt",
+                request_id=request_id,
+                render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="increment_render_job_attempt",
+                request_id=request_id,
+                render_job_id=job_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )

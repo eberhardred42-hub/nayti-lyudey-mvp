@@ -4,12 +4,22 @@ import os
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
+import redis
 import re
 from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
 from db import list_user_files
+from db import (
+    create_pack,
+    create_render_job,
+    get_latest_file_id_for_render_job,
+    get_pack,
+    get_render_job,
+    list_latest_render_jobs_for_pack,
+    list_packs_for_user,
+)
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
@@ -187,6 +197,86 @@ def _make_minimal_pdf_bytes() -> bytes:
     parts.append(f"{xref_offset}\n".encode("ascii"))
     parts.append(b"%%EOF\n")
     return b"".join(parts)
+
+
+def _redis_client() -> redis.Redis:
+    url = (os.environ.get("REDIS_URL") or "").strip() or "redis://localhost:6379/0"
+    return redis.Redis.from_url(url, decode_responses=True)
+
+
+RENDER_QUEUE_NAME = (os.environ.get("RENDER_QUEUE") or "render_jobs").strip() or "render_jobs"
+
+
+def _load_documents_registry() -> list[dict]:
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "documents.v1.json")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        docs = data.get("documents")
+        if isinstance(docs, list):
+            out = []
+            for d in docs:
+                if not isinstance(d, dict):
+                    continue
+                doc_id = (d.get("doc_id") or "").strip()
+                if not doc_id:
+                    continue
+                out.append(d)
+            return out
+    except Exception:
+        pass
+    return []
+
+
+def _doc_title(doc: dict) -> str:
+    t = doc.get("title")
+    return str(t) if t else str(doc.get("doc_id") or "document")
+
+
+def _build_render_request(doc_id: str, title: str, pack_id: str, session_id: str) -> dict:
+    return {
+        "doc_id": doc_id,
+        "title": title,
+        "sections": [
+            {"kind": "text", "title": "Содержимое", "text": "Базовый layout. Данные будут добавлены позже."}
+        ],
+        "meta": {"pack_id": pack_id, "session_id": session_id},
+    }
+
+
+class RenderJobCreateBody(BaseModel):
+    pack_id: uuid.UUID
+    session_id: uuid.UUID
+    doc_id: str
+    title: str
+    sections: list[dict] = []
+    meta: dict = {}
+
+
+class RenderJobCreateResponse(BaseModel):
+    ok: bool
+    job_id: str
+    status: str
+
+
+class RenderJobStatusResponse(BaseModel):
+    ok: bool
+    job_id: str
+    status: str
+    attempts: int
+    max_attempts: int
+    last_error: str | None = None
+
+
+class MlJobCreateBody(BaseModel):
+    session_id: str
+
+
+class MlJobCreateResponse(BaseModel):
+    ok: bool
+    pack_id: str
+    session_id: str
 
 
 @app.middleware("http")
@@ -1385,6 +1475,97 @@ def files_download(file_id: str, request: Request):
     return {"ok": True, "url": url, "expires_in_sec": expires}
 
 
+@app.post("/render/jobs", response_model=RenderJobCreateResponse)
+def render_jobs_create(body: RenderJobCreateBody, request: Request):
+    """Auth-required: create an async render job and enqueue it to Redis."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    doc_id = (body.doc_id or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="doc_id is required")
+
+    session_id_str = str(body.session_id)
+    pack_id_str = str(body.pack_id)
+
+    sess = get_session(session_id_str, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    owner = sess.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    job = create_render_job(
+        pack_id=pack_id_str,
+        session_id=session_id_str,
+        user_id=None,
+        doc_id=doc_id,
+        status="queued",
+        max_attempts=5,
+        request_id=request_id,
+    )
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise HTTPException(status_code=500, detail="Failed to create render job")
+
+    render_request = {
+        "doc_id": doc_id,
+        "title": body.title,
+        "sections": body.sections or [],
+        "meta": {**(body.meta or {}), "pack_id": pack_id_str, "session_id": session_id_str},
+    }
+    msg = json.dumps(
+        {
+            "job_id": job_id,
+            "pack_id": pack_id_str,
+            "session_id": session_id_str,
+            "doc_id": doc_id,
+            "render_request": render_request,
+        },
+        ensure_ascii=False,
+    )
+    try:
+        _redis_client().rpush(RENDER_QUEUE_NAME, msg)
+    except Exception as e:
+        log_event(
+            "render_error",
+            level="error",
+            request_id=request_id,
+            render_job_id=job_id,
+            doc_id=doc_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="Failed to enqueue render job")
+
+    log_event(
+        "render_job_created",
+        request_id=request_id,
+        render_job_id=job_id,
+        doc_id=doc_id,
+        session_id=session_id_str,
+        pack_id=pack_id_str,
+    )
+    return {"ok": True, "job_id": job_id, "status": "queued"}
+
+
+@app.get("/render/jobs/{job_id}", response_model=RenderJobStatusResponse)
+def render_jobs_status(job_id: str, request: Request):
+    """Auth-required: read render job status."""
+    request_id = get_request_id_from_request(request)
+    _ = _require_user_id(request)
+    row = get_render_job(job_id, request_id=request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {
+        "ok": True,
+        "job_id": str(row.get("id")),
+        "status": row.get("status"),
+        "attempts": int(row.get("attempts") or 0),
+        "max_attempts": int(row.get("max_attempts") or 0),
+        "last_error": row.get("last_error"),
+    }
+
+
 @app.get("/me/files")
 def me_files(request: Request):
     """Auth-required: list files that belong to current user."""
@@ -1412,6 +1593,269 @@ def me_files(request: Request):
         files_count=len(normalized),
     )
     return {"ok": True, "files": normalized}
+
+
+@app.post("/ml/job", response_model=MlJobCreateResponse)
+def ml_job_mock(body: MlJobCreateBody, request: Request):
+    """Mock ML job: creates a pack for a session.
+
+    Stage 9.4 smoke expects /ml/job to return pack_id.
+    """
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    sess = get_session(session_id, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    owner = sess.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = create_pack(session_id=session_id, user_id=user_id, request_id=request_id)
+    pack_id = str(row.get("pack_id") or "")
+    if not pack_id:
+        raise HTTPException(status_code=500, detail="Failed to create pack")
+
+    log_event(
+        "ml_job_created",
+        request_id=request_id,
+        pack_id=pack_id,
+        session_id=session_id,
+    )
+    return {"ok": True, "pack_id": pack_id, "session_id": session_id}
+
+
+@app.get("/me/packs")
+def me_packs(request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    rows = list_packs_for_user(user_id=user_id, request_id=request_id)
+    normalized = []
+    for r in rows:
+        normalized.append(
+            {
+                "pack_id": str(r.get("pack_id")),
+                "session_id": str(r.get("session_id")),
+                "created_at": to_iso(r.get("created_at")),
+            }
+        )
+    log_event(
+        "me_packs_listed",
+        request_id=request_id,
+        user_id=user_id,
+        packs_count=len(normalized),
+    )
+    return {"ok": True, "packs": normalized}
+
+
+@app.post("/packs/{pack_id}/render")
+def packs_render(pack_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+    owner = pack.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    session_id = str(pack.get("session_id") or "")
+    docs = [d for d in _load_documents_registry() if bool(d.get("is_enabled"))]
+    if not docs:
+        raise HTTPException(status_code=500, detail="Documents registry is empty")
+
+    log_event(
+        "render_pack_requested",
+        request_id=request_id,
+        pack_id=pack_id,
+        docs_total=len(docs),
+    )
+
+    existing = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
+    existing_by_doc = {str(r.get("doc_id")): r for r in existing}
+
+    created = 0
+    skipped = 0
+    enqueued = 0
+    rcli = _redis_client()
+
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        prev = existing_by_doc.get(doc_id)
+        if prev and str(prev.get("status")) in {"queued", "rendering", "ready"}:
+            skipped += 1
+            continue
+
+        job = create_render_job(
+            pack_id=pack_id,
+            session_id=session_id,
+            user_id=None,
+            doc_id=doc_id,
+            status="queued",
+            max_attempts=5,
+            request_id=request_id,
+        )
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            continue
+        created += 1
+
+        render_request = _build_render_request(
+            doc_id=doc_id,
+            title=_doc_title(d),
+            pack_id=pack_id,
+            session_id=session_id,
+        )
+        msg = json.dumps(
+            {
+                "job_id": job_id,
+                "pack_id": pack_id,
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "render_request": render_request,
+            },
+            ensure_ascii=False,
+        )
+        rcli.rpush(RENDER_QUEUE_NAME, msg)
+        enqueued += 1
+
+    log_event(
+        "render_jobs_enqueued",
+        request_id=request_id,
+        pack_id=pack_id,
+        jobs_created=created,
+        jobs_skipped=skipped,
+        jobs_enqueued=enqueued,
+    )
+    return {"ok": True, "pack_id": pack_id, "jobs_created": created, "jobs_skipped": skipped}
+
+
+@app.post("/packs/{pack_id}/render/{doc_id}")
+def packs_render_doc(pack_id: str, doc_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+    owner = pack.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="doc_id is required")
+
+    session_id = str(pack.get("session_id") or "")
+    log_event(
+        "render_doc_regenerate_requested",
+        request_id=request_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+    )
+
+    job = create_render_job(
+        pack_id=pack_id,
+        session_id=session_id,
+        user_id=None,
+        doc_id=doc_id,
+        status="queued",
+        max_attempts=5,
+        request_id=request_id,
+    )
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise HTTPException(status_code=500, detail="Failed to create render job")
+
+    docs = _load_documents_registry()
+    title = doc_id
+    for d in docs:
+        if str(d.get("doc_id")) == doc_id:
+            title = _doc_title(d)
+            break
+
+    render_request = _build_render_request(
+        doc_id=doc_id,
+        title=title,
+        pack_id=pack_id,
+        session_id=session_id,
+    )
+    msg = json.dumps(
+        {
+            "job_id": job_id,
+            "pack_id": pack_id,
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "render_request": render_request,
+        },
+        ensure_ascii=False,
+    )
+    _redis_client().rpush(RENDER_QUEUE_NAME, msg)
+    log_event(
+        "render_job_created",
+        request_id=request_id,
+        render_job_id=job_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        session_id=session_id,
+    )
+    return {"ok": True, "pack_id": pack_id, "doc_id": doc_id, "job_id": job_id}
+
+
+@app.get("/packs/{pack_id}/documents")
+def packs_documents(pack_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+    owner = pack.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    docs = [d for d in _load_documents_registry() if bool(d.get("is_enabled"))]
+    latest_jobs = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
+    by_doc = {str(j.get("doc_id")): j for j in latest_jobs}
+
+    out = []
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        j = by_doc.get(doc_id)
+        status = "queued" if j else "queued"
+        file_id = None
+        attempts = 0
+        last_error = None
+        if j:
+            status = str(j.get("status") or "queued")
+            attempts = int(j.get("attempts") or 0)
+            last_error = j.get("last_error")
+            if status == "ready":
+                file_id = get_latest_file_id_for_render_job(str(j.get("id")), request_id=request_id)
+        out.append(
+            {
+                "doc_id": doc_id,
+                "title": _doc_title(d),
+                "status": status,
+                "file_id": file_id,
+                "attempts": attempts,
+                "last_error": last_error,
+            }
+        )
+
+    log_event(
+        "render_status_listed",
+        request_id=request_id,
+        pack_id=pack_id,
+        docs_count=len(out),
+    )
+    return {"ok": True, "pack_id": pack_id, "documents": out}
 
 
 @app.post("/events/client")
