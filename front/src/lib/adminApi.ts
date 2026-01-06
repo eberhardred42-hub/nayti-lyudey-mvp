@@ -3,8 +3,12 @@ import { getUserToken } from "./userSession";
 
 type ApiErrorBody = { detail?: string };
 
-function friendlyAdminError(detail?: string): string {
-  switch (detail) {
+type ApiErrorCodeBody = {
+  detail?: string | { code?: string; message?: string };
+};
+
+function friendlyAdminError(codeOrDetail?: string): string {
+  switch (codeOrDetail) {
     case "admin_login_disabled":
       return "Админка отключена на сервере";
     case "password_required":
@@ -19,6 +23,12 @@ function friendlyAdminError(detail?: string): string {
       return "Админ-сессия недействительна";
     case "expired_admin_token":
       return "Админ-сессия истекла";
+    case "JOB_NOT_FOUND":
+      return "Job не найден";
+    case "ALREADY_IN_PROGRESS":
+      return "Уже есть queued/rendering для этого pack+doc";
+    case "INVALID_STATUS":
+      return "Requeue доступен только для failed";
     default:
       return "Ошибка админки";
   }
@@ -36,8 +46,16 @@ export async function adminFetch(path: string, init?: RequestInit) {
     // ignore
   }
   if (!r.ok) {
-    const body = (data || {}) as ApiErrorBody;
-    const msg = friendlyAdminError(body.detail) || "Ошибка";
+    const body = (data || {}) as ApiErrorCodeBody;
+    let code: string | undefined;
+    let message: string | undefined;
+    if (typeof body.detail === "string") {
+      code = body.detail;
+    } else if (body.detail && typeof body.detail === "object") {
+      code = body.detail.code;
+      message = body.detail.message;
+    }
+    const msg = message || friendlyAdminError(code) || "Ошибка";
     const err: any = new Error(msg);
     err.status = r.status;
     err.detail = body.detail;
@@ -82,4 +100,36 @@ export async function adminLogin(password: string) {
     throw err;
   }
   return data as { ok: boolean; admin_token: string; expires_in_sec: number };
+}
+
+export async function adminRenderJobsList(params?: {
+  status?: string;
+  pack_id?: string;
+  doc_id?: string;
+  limit?: number;
+}) {
+  const url = new URL("/api/admin/render-jobs", window.location.origin);
+  if (params?.status) url.searchParams.set("status", params.status);
+  if (params?.pack_id) url.searchParams.set("pack_id", params.pack_id);
+  if (params?.doc_id) url.searchParams.set("doc_id", params.doc_id);
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  return adminFetch(url.pathname + url.search, { method: "GET" });
+}
+
+export async function adminRenderJobDetails(jobId: string) {
+  return adminFetch(`/api/admin/render-jobs/${encodeURIComponent(jobId)}`, { method: "GET" });
+}
+
+export async function adminRenderJobRequeue(jobId: string) {
+  return adminFetch(`/api/admin/render-jobs/${encodeURIComponent(jobId)}/requeue`, { method: "POST" });
+}
+
+export async function adminRenderJobsRequeueFailed(limit?: number) {
+  const url = new URL("/api/admin/render-jobs/requeue-failed", window.location.origin);
+  if (limit) url.searchParams.set("limit", String(limit));
+  return adminFetch(url.pathname + url.search, { method: "POST" });
+}
+
+export async function adminFileDownloadUrl(fileId: string) {
+  return adminFetch(`/api/admin/files/${encodeURIComponent(fileId)}/download`, { method: "GET" });
 }

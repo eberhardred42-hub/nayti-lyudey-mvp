@@ -1543,6 +1543,287 @@ def get_latest_file_id_for_render_job(job_id: str, request_id: str = "unknown") 
             raise
 
 
+def list_render_jobs_admin(
+    status: Optional[str] = None,
+    pack_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    limit: int = 100,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    """Admin: list render jobs with optional filters."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_render_jobs_admin",
+        request_id=request_id,
+        status=status,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        limit=limit,
+    )
+    limit = max(1, min(500, int(limit or 100)))
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status = %s")
+        params.append(status)
+    if pack_id:
+        clauses.append("pack_id = %s")
+        params.append(pack_id)
+    if doc_id:
+        clauses.append("doc_id = %s")
+        params.append(doc_id)
+
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT
+                    id,
+                    pack_id,
+                    doc_id,
+                    status,
+                    attempts,
+                    max_attempts,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM render_jobs
+                {where_sql}
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_render_jobs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_render_jobs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def has_active_render_job(
+    pack_id: str,
+    doc_id: str,
+    request_id: str = "unknown",
+) -> bool:
+    """True if there is any queued/rendering job for the given pack+doc."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="has_active_render_job",
+        request_id=request_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM render_jobs
+                WHERE pack_id = %s
+                  AND doc_id = %s
+                  AND status IN ('queued', 'rendering')
+                LIMIT 1
+                """,
+                (pack_id, doc_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="has_active_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return bool(row)
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="has_active_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_failed_render_jobs(limit: int = 50, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """Admin: list failed render jobs (most recent first)."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_failed_render_jobs",
+        request_id=request_id,
+        limit=limit,
+    )
+    limit = max(1, min(500, int(limit or 50)))
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    pack_id,
+                    session_id,
+                    doc_id,
+                    status,
+                    attempts,
+                    max_attempts,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM render_jobs
+                WHERE status = 'failed'
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_failed_render_jobs",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_failed_render_jobs",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_artifacts_for_render_job(job_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """Resolve artifacts for a job via artifacts.meta.render_job_id, with optional file_id."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_artifacts_for_render_job",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    a.id AS artifact_id,
+                    a.kind,
+                    a.format,
+                    a.created_at,
+                    af.id AS file_id,
+                    af.content_type,
+                    af.size_bytes
+                FROM artifacts a
+                LEFT JOIN artifact_files af ON af.artifact_id = a.id
+                WHERE (a.meta->>'render_job_id') = %s
+                ORDER BY a.created_at DESC
+                """,
+                (job_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_artifacts_for_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_artifacts_for_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_file_download_info(file_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Admin: resolve (bucket, key) for a file_id without user ownership checks."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_file_download_info",
+        request_id=request_id,
+        file_id=file_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    id AS file_id,
+                    artifact_id,
+                    bucket,
+                    object_key,
+                    content_type,
+                    size_bytes,
+                    etag,
+                    created_at
+                FROM artifact_files
+                WHERE id = %s
+                """,
+                (file_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_file_download_info",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_file_download_info",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
 # ==========================================================================
 # Render job operations (Stage 9.4.2)
 # ==========================================================================

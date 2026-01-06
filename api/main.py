@@ -26,6 +26,13 @@ from db import (
     list_packs_for_user,
 )
 from db import (
+    get_file_download_info,
+    has_active_render_job,
+    list_artifacts_for_render_job,
+    list_failed_render_jobs,
+    list_render_jobs_admin,
+)
+from db import (
     ensure_user,
     get_user_by_id,
     create_admin_session,
@@ -399,6 +406,310 @@ def admin_audit(limit: int = 50, action: str = "", target_type: str = "", reques
         request_id=request_id,
     )
     return {"ok": True, "items": rows}
+
+
+def _admin_error(code: str, message: str, status_code: int):
+    raise HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+@app.get("/admin/render-jobs")
+def admin_render_jobs_list(
+    status: str = "",
+    pack_id: str = "",
+    doc_id: str = "",
+    limit: int = 100,
+    request: Request = None,
+):
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    _ = _require_admin(request)
+    rows = list_render_jobs_admin(
+        status=(status or "").strip() or None,
+        pack_id=(pack_id or "").strip() or None,
+        doc_id=(doc_id or "").strip() or None,
+        limit=limit,
+        request_id=request_id,
+    )
+    normalized = []
+    for r in rows:
+        normalized.append(
+            {
+                "id": str(r.get("id")),
+                "pack_id": str(r.get("pack_id")),
+                "doc_id": str(r.get("doc_id")),
+                "status": r.get("status"),
+                "attempts": int(r.get("attempts") or 0),
+                "max_attempts": int(r.get("max_attempts") or 0),
+                "last_error": r.get("last_error"),
+                "created_at": to_iso(r.get("created_at")),
+                "updated_at": to_iso(r.get("updated_at")),
+            }
+        )
+    return {"ok": True, "items": normalized}
+
+
+@app.get("/admin/render-jobs/{job_id}")
+def admin_render_jobs_get(job_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+    job_id = (job_id or "").strip()
+    if not job_id:
+        _admin_error("BAD_REQUEST", "job_id is required", 400)
+
+    row = get_render_job(job_id, request_id=request_id)
+    if not row:
+        _admin_error("JOB_NOT_FOUND", "Job not found", 404)
+
+    artifacts = list_artifacts_for_render_job(job_id, request_id=request_id)
+    normalized_artifacts = []
+    for a in artifacts:
+        normalized_artifacts.append(
+            {
+                "artifact_id": str(a.get("artifact_id")),
+                "kind": a.get("kind"),
+                "format": a.get("format"),
+                "created_at": to_iso(a.get("created_at")),
+                "file_id": str(a.get("file_id")) if a.get("file_id") else None,
+                "content_type": a.get("content_type"),
+                "size_bytes": a.get("size_bytes"),
+            }
+        )
+
+    latest_file_id = None
+    try:
+        latest_file_id = get_latest_file_id_for_render_job(job_id, request_id=request_id)
+    except Exception:
+        latest_file_id = None
+
+    job = {
+        "id": str(row.get("id")),
+        "pack_id": str(row.get("pack_id")),
+        "doc_id": str(row.get("doc_id")),
+        "status": row.get("status"),
+        "attempts": int(row.get("attempts") or 0),
+        "max_attempts": int(row.get("max_attempts") or 0),
+        "last_error": row.get("last_error"),
+        "created_at": to_iso(row.get("created_at")),
+        "updated_at": to_iso(row.get("updated_at")),
+    }
+    return {
+        "ok": True,
+        "job": job,
+        "artifacts": normalized_artifacts,
+        "latest_file_id": latest_file_id,
+    }
+
+
+def _enqueue_render_job_same_as_user_endpoints(
+    *,
+    pack_id: str,
+    session_id: str,
+    doc_id: str,
+    request_id: str,
+):
+    # Same payload format as /packs/{pack_id}/render/{doc_id}
+    docs = _load_documents_registry()
+    title = doc_id
+    for d in docs:
+        if str(d.get("doc_id")) == doc_id:
+            title = _doc_title(d)
+            break
+
+    render_request = _build_render_request(
+        doc_id=doc_id,
+        title=title,
+        pack_id=pack_id,
+        session_id=session_id,
+    )
+    msg = json.dumps(
+        {
+            "job_id": None,  # filled by caller
+            "pack_id": pack_id,
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "render_request": render_request,
+        },
+        ensure_ascii=False,
+    )
+    return render_request, msg
+
+
+@app.post("/admin/render-jobs/{job_id}/requeue")
+def admin_render_jobs_requeue(job_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    job_id = (job_id or "").strip()
+    if not job_id:
+        _admin_error("BAD_REQUEST", "job_id is required", 400)
+
+    old = get_render_job(job_id, request_id=request_id)
+    if not old:
+        _admin_error("JOB_NOT_FOUND", "Job not found", 404)
+
+    old_status = str(old.get("status") or "")
+    if old_status != "failed":
+        _admin_error("INVALID_STATUS", "Only failed jobs can be requeued", 400)
+
+    pack_id = str(old.get("pack_id") or "")
+    session_id = str(old.get("session_id") or "")
+    doc_id = str(old.get("doc_id") or "")
+    if not pack_id or not session_id or not doc_id:
+        _admin_error("JOB_INCOMPLETE", "Job record is incomplete", 500)
+
+    if has_active_render_job(pack_id=pack_id, doc_id=doc_id, request_id=request_id):
+        _admin_error("ALREADY_IN_PROGRESS", "Job already queued/rendering for this pack+doc", 409)
+
+    new_job = create_render_job(
+        pack_id=pack_id,
+        session_id=session_id,
+        user_id=None,
+        doc_id=doc_id,
+        status="queued",
+        max_attempts=int(old.get("max_attempts") or 5),
+        request_id=request_id,
+    )
+    new_job_id = str(new_job.get("id") or "")
+    if not new_job_id:
+        _admin_error("CREATE_FAILED", "Failed to create render job", 500)
+
+    render_request, msg_template = _enqueue_render_job_same_as_user_endpoints(
+        pack_id=pack_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        request_id=request_id,
+    )
+    payload = json.loads(msg_template)
+    payload["job_id"] = new_job_id
+    msg = json.dumps(payload, ensure_ascii=False)
+    try:
+        _redis_client().rpush(RENDER_QUEUE_NAME, msg)
+    except Exception as e:
+        _admin_error("ENQUEUE_FAILED", f"Failed to enqueue render job: {e}", 500)
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="render_job_requeue",
+        target_type="render_job",
+        target_id=job_id,
+        before_obj={
+            "job_id": job_id,
+            "status": old_status,
+            "attempts": int(old.get("attempts") or 0),
+            "last_error": old.get("last_error"),
+        },
+        after_obj={
+            "new_job_id": new_job_id,
+            "pack_id": pack_id,
+            "doc_id": doc_id,
+            "status": "queued",
+            "render_request_meta": (render_request or {}).get("meta") if isinstance(render_request, dict) else None,
+        },
+        summary=None,
+    )
+
+    return {"ok": True, "old_job_id": job_id, "new_job_id": new_job_id}
+
+
+@app.post("/admin/render-jobs/requeue-failed")
+def admin_render_jobs_requeue_failed(limit: int = 50, request: Request = None):
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    rows = list_failed_render_jobs(limit=limit, request_id=request_id)
+    enqueued = 0
+    skipped_in_progress = 0
+    skipped_incomplete = 0
+    errors: list[str] = []
+
+    for old in rows:
+        try:
+            pack_id = str(old.get("pack_id") or "")
+            session_id = str(old.get("session_id") or "")
+            doc_id = str(old.get("doc_id") or "")
+            if not pack_id or not session_id or not doc_id:
+                skipped_incomplete += 1
+                continue
+            if has_active_render_job(pack_id=pack_id, doc_id=doc_id, request_id=request_id):
+                skipped_in_progress += 1
+                continue
+            new_job = create_render_job(
+                pack_id=pack_id,
+                session_id=session_id,
+                user_id=None,
+                doc_id=doc_id,
+                status="queued",
+                max_attempts=int(old.get("max_attempts") or 5),
+                request_id=request_id,
+            )
+            new_job_id = str(new_job.get("id") or "")
+            if not new_job_id:
+                errors.append("create_failed")
+                continue
+            _, msg_template = _enqueue_render_job_same_as_user_endpoints(
+                pack_id=pack_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                request_id=request_id,
+            )
+            payload = json.loads(msg_template)
+            payload["job_id"] = new_job_id
+            msg = json.dumps(payload, ensure_ascii=False)
+            _redis_client().rpush(RENDER_QUEUE_NAME, msg)
+            enqueued += 1
+        except Exception as e:
+            errors.append(str(e))
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="render_job_requeue_failed_bulk",
+        target_type="render_job",
+        target_id="bulk",
+        before_obj={"failed_considered": len(rows)},
+        after_obj={
+            "enqueued": enqueued,
+            "skipped_in_progress": skipped_in_progress,
+            "skipped_incomplete": skipped_incomplete,
+            "errors": len(errors),
+        },
+        summary=None,
+    )
+
+    return {
+        "ok": True,
+        "failed_considered": len(rows),
+        "enqueued": enqueued,
+        "skipped_in_progress": skipped_in_progress,
+        "skipped_incomplete": skipped_incomplete,
+        "errors": errors[:10],
+    }
+
+
+@app.get("/admin/files/{file_id}/download")
+def admin_files_download(file_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+
+    row = get_file_download_info(file_id=file_id, request_id=request_id)
+    if not row:
+        _admin_error("FILE_NOT_FOUND", "File not found", 404)
+    bucket = row.get("bucket")
+    key = row.get("object_key")
+    if not bucket or not key:
+        _admin_error("FILE_INCOMPLETE", "File record is incomplete", 500)
+    expires = 600
+    url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+    return {"ok": True, "url": url, "expires_in_sec": expires}
 
 
 def log_event(event: str, level: str = "info", **fields):
