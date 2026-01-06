@@ -9,6 +9,7 @@ from datetime import datetime
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
+from db import list_user_files
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
@@ -1296,6 +1297,60 @@ def files_download(file_id: str, request: Request):
         expires_in_sec=expires,
     )
     return {"ok": True, "url": url, "expires_in_sec": expires}
+
+
+@app.get("/me/files")
+def me_files(request: Request):
+    """Auth-required: list files that belong to current user."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    rows = list_user_files(user_id=user_id, request_id=request_id)
+    normalized = []
+    for r in rows:
+        normalized.append(
+            {
+                "file_id": str(r.get("file_id")),
+                "artifact_id": str(r.get("artifact_id")),
+                "kind": r.get("kind"),
+                "created_at": to_iso(r.get("created_at")),
+                "content_type": r.get("content_type"),
+                "size_bytes": r.get("size_bytes"),
+                "doc_id": r.get("doc_id"),
+                "status": "ready",
+            }
+        )
+    log_event(
+        "me_files_listed",
+        request_id=request_id,
+        user_id=user_id,
+        files_count=len(normalized),
+    )
+    return {"ok": True, "files": normalized}
+
+
+@app.post("/events/client")
+async def events_client(request: Request):
+    """Receive client-side analytics events (minimal).
+
+    Stores nothing; only logs.
+    """
+    request_id = get_request_id_from_request(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    event = None
+    props = None
+    if isinstance(body, dict):
+        event = body.get("event")
+        props = body.get("props")
+    log_event(
+        "client_event",
+        request_id=request_id,
+        client_event=event,
+        props=props,
+    )
+    return {"ok": True}
 
 
 @app.get("/debug/session")

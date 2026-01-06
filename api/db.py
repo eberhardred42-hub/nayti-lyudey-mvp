@@ -125,6 +125,7 @@ def init_db():
                 kind TEXT NULL,
                 format TEXT NULL,
                 payload_json JSONB NULL,
+                meta JSONB NULL,
                 created_at TIMESTAMPTZ DEFAULT now()
             )
         """)
@@ -144,6 +145,11 @@ def init_db():
         cur.execute("""
             ALTER TABLE artifacts
             ADD COLUMN IF NOT EXISTS payload_json JSONB
+        """)
+
+        cur.execute("""
+            ALTER TABLE artifacts
+            ADD COLUMN IF NOT EXISTS meta JSONB
         """)
 
         # Files stored in S3-compatible storage (MinIO locally), metadata in Postgres.
@@ -607,22 +613,51 @@ def get_artifact_file_by_artifact(artifact_id: str, request_id: str = "unknown")
 
 
 def list_user_files(user_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
-    """List files for a user.
-
-    Current DB schema does not yet associate sessions/artifacts with a user,
-    so this is a stub until user ownership is introduced.
-    """
+    """List artifact-backed files that belong to the given user."""
     start = time.perf_counter()
     _log_event("db_query_start", query_name="list_user_files", request_id=request_id, user_id=user_id)
-    _log_event(
-        "db_query_ok",
-        query_name="list_user_files",
-        request_id=request_id,
-        user_id=user_id,
-        duration_ms=round((time.perf_counter() - start) * 1000, 2),
-        rowcount=0,
-    )
-    return []
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    af.id AS file_id,
+                    af.artifact_id,
+                    a.kind,
+                    af.created_at,
+                    af.content_type,
+                    af.size_bytes,
+                    (a.meta->>'doc_id') AS doc_id
+                FROM artifact_files af
+                JOIN artifacts a ON a.id = af.artifact_id
+                JOIN sessions s ON s.session_id = a.session_id
+                WHERE s.user_id = %s
+                ORDER BY af.created_at DESC
+                """,
+                (user_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_user_files",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_user_files",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
 
 
 def set_session_user(session_id: str, user_id: str, request_id: str = "unknown") -> None:
@@ -672,6 +707,7 @@ def create_artifact(
     kind: str,
     format: str,
     payload_json: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
     request_id: str = "unknown",
 ) -> Dict[str, Any]:
     """Create an artifact record."""
@@ -691,9 +727,9 @@ def create_artifact(
         try:
             cur.execute(
                 """
-                INSERT INTO artifacts (id, session_id, kind, format, payload_json)
-                VALUES (%s, %s, %s, %s, %s)
-                RETURNING id, session_id, kind, format, payload_json, created_at
+                INSERT INTO artifacts (id, session_id, kind, format, payload_json, meta)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, session_id, kind, format, payload_json, meta, created_at
                 """,
                 (
                     artifact_id,
@@ -701,6 +737,7 @@ def create_artifact(
                     kind,
                     format,
                     psycopg2.extras.Json(payload_json) if payload_json is not None else None,
+                    psycopg2.extras.Json(meta) if meta is not None else None,
                 ),
             )
             row = cur.fetchone()
