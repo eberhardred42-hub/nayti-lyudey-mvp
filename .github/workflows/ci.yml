@@ -34,13 +34,13 @@ jobs:
           curl -fsS http://localhost:8000/health/llm
 
       - name: Stage 5 tests
-        run: bash tests/test-stage5.sh
+        run: bash scripts/qa/test_persistence_postgres.sh
 
       - name: Stage 6 tests
-        run: bash tests/test-stage6.sh
+        run: bash scripts/qa/test_observability_request_ids.sh
 
       - name: Stage 7 tests
-        run: bash tests/test-stage7.sh
+        run: bash scripts/qa/test_llm_clarifications.sh
 
       - name: Diagnostics (always)
         if: always()
