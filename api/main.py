@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import urllib.request
 from urllib.parse import urlparse
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from pydantic import BaseModel
 import uuid
 import redis
@@ -50,6 +50,7 @@ from db import (
     list_artifacts_admin,
     get_artifact_by_id,
 )
+from db import get_legal_offer_acceptance, upsert_legal_offer_acceptance
 from db import (
     create_config_version,
     get_active_config_store,
@@ -74,6 +75,29 @@ from sms_client import send_otp_sms, health_sms_env, SmsSendError
 
 app = FastAPI()
 SESSIONS = {}
+
+
+def _offer_markdown_path() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "static", "legal", "offer.md")
+
+
+def _offer_version_hash() -> str:
+    path = _offer_markdown_path()
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        # Stable fallback (still non-secret)
+        return "missing"
+
+
+def _require_offer_accepted(*, user_id: str, request_id: str) -> dict:
+    row = get_legal_offer_acceptance(user_id=user_id, request_id=request_id)
+    if not row:
+        raise HTTPException(status_code=412, detail="OFFER_NOT_ACCEPTED")
+    return row
 
 
 # ==========================================================================
@@ -1894,9 +1918,66 @@ def auth_otp_verify(body: OtpVerify, request: Request):
 @app.post("/legal/offer/accept")
 def legal_offer_accept(request: Request):
     request_id = get_request_id_from_request(request)
-    _ = _require_user_id(request)
-    log_event("legal_offer_accepted", request_id=request_id)
-    return {"ok": True}
+    user_id = _require_user_id(request)
+
+    log_event(
+        "offer_accept_clicked",
+        request_id=request_id,
+        user_id=user_id,
+    )
+
+    try:
+        version_hash = _offer_version_hash()
+        row = upsert_legal_offer_acceptance(user_id=user_id, version_hash=version_hash, request_id=request_id)
+        log_event(
+            "offer_accepted_ok",
+            request_id=request_id,
+            user_id=user_id,
+            version_hash=row.get("version_hash"),
+        )
+        return {"ok": True, "accepted_at": to_iso(row.get("accepted_at")), "version_hash": row.get("version_hash")}
+    except Exception as e:
+        log_event(
+            "offer_accept_error",
+            level="error",
+            request_id=request_id,
+            user_id=user_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="OFFER_ACCEPT_FAILED")
+
+
+@app.get("/legal/offer")
+def legal_offer_get(request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _get_user_id(request)
+    log_event(
+        "offer_viewed",
+        request_id=request_id,
+        user_id=user_id,
+        version_hash=_offer_version_hash(),
+    )
+    path = _offer_markdown_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        raise HTTPException(status_code=500, detail="OFFER_NOT_AVAILABLE")
+    return Response(content=text, media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/legal/offer/status")
+def legal_offer_status(request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    row = get_legal_offer_acceptance(user_id=user_id, request_id=request_id)
+    return {
+        "ok": True,
+        "accepted": bool(row),
+        "accepted_at": to_iso(row.get("accepted_at")) if row else None,
+        "version_hash": row.get("version_hash") if row else None,
+        "current_version_hash": _offer_version_hash(),
+    }
 
 
 def _is_debug_enabled() -> bool:
@@ -3292,6 +3373,8 @@ def render_jobs_create(body: RenderJobCreateBody, request: Request):
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
 
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
+
     doc_id = (body.doc_id or "").strip()
     if not doc_id:
         raise HTTPException(status_code=400, detail="doc_id is required")
@@ -3422,6 +3505,8 @@ def ml_job_mock(body: MlJobCreateBody, request: Request):
     """
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
     session_id = (body.session_id or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
@@ -3474,6 +3559,8 @@ def me_packs(request: Request):
 def packs_render(pack_id: str, request: Request):
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
 
     pack = get_pack(pack_id, request_id=request_id)
     if not pack:
@@ -3577,6 +3664,8 @@ def packs_render(pack_id: str, request: Request):
 def packs_render_doc(pack_id: str, doc_id: str, request: Request):
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
     pack = get_pack(pack_id, request_id=request_id)
     if not pack:
         raise HTTPException(status_code=404, detail="Pack not found")

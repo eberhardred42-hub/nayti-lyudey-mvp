@@ -223,6 +223,20 @@ def init_db():
             )
         """)
 
+        # Legal offer acceptance (per user).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS legal_offer_acceptances (
+                user_id TEXT PRIMARY KEY,
+                accepted_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                version_hash TEXT NOT NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_legal_offer_acceptances_accepted_at
+            ON legal_offer_acceptances(accepted_at)
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS admin_sessions (
                 id UUID PRIMARY KEY,
@@ -1902,6 +1916,99 @@ def get_file_download_info(file_id: str, request_id: str = "unknown") -> Optiona
                 query_name="get_file_download_info",
                 request_id=request_id,
                 file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_legal_offer_acceptance(user_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Return offer acceptance row for user_id if present."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_legal_offer_acceptance",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT user_id, accepted_at, version_hash
+                FROM legal_offer_acceptances
+                WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_legal_offer_acceptance",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_legal_offer_acceptance",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def upsert_legal_offer_acceptance(
+    *,
+    user_id: str,
+    version_hash: str,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """Create or update offer acceptance for the user."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="upsert_legal_offer_acceptance",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO legal_offer_acceptances (user_id, accepted_at, version_hash)
+                VALUES (%s, now(), %s)
+                ON CONFLICT (user_id)
+                DO UPDATE SET accepted_at = now(), version_hash = EXCLUDED.version_hash
+                RETURNING user_id, accepted_at, version_hash
+                """,
+                (user_id, version_hash),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="upsert_legal_offer_acceptance",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="upsert_legal_offer_acceptance",
+                request_id=request_id,
+                user_id=user_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )
