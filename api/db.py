@@ -1349,6 +1349,7 @@ def get_file_download_info_for_user(
                 SELECT
                     af.id AS file_id,
                     af.artifact_id,
+                    a.meta->>'pack_id' AS pack_id,
                     af.bucket,
                     af.object_key,
                     af.content_type,
@@ -1869,16 +1870,18 @@ def get_file_download_info(file_id: str, request_id: str = "unknown") -> Optiona
             cur.execute(
                 """
                 SELECT
-                    id AS file_id,
-                    artifact_id,
-                    bucket,
-                    object_key,
-                    content_type,
-                    size_bytes,
-                    etag,
-                    created_at
-                FROM artifact_files
-                WHERE id = %s
+                    af.id AS file_id,
+                    af.artifact_id,
+                    a.meta->>'pack_id' AS pack_id,
+                    af.bucket,
+                    af.object_key,
+                    af.content_type,
+                    af.size_bytes,
+                    af.etag,
+                    af.created_at
+                FROM artifact_files af
+                JOIN artifacts a ON a.id = af.artifact_id
+                WHERE af.id = %s
                 """,
                 (file_id,),
             )

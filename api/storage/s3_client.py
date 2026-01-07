@@ -1,6 +1,7 @@
 import json
 import os
 import time
+from urllib.parse import urlparse
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -30,9 +31,30 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _normalize_endpoint(raw: Optional[str], *, default_scheme: str) -> Optional[str]:
+    if raw is None:
+        return None
+    v = raw.strip()
+    if not v:
+        return None
+    if "://" not in v:
+        return f"{default_scheme}://{v}"
+    return v
+
+
+def _host_from_endpoint(endpoint: Optional[str]) -> Optional[str]:
+    if not endpoint:
+        return None
+    try:
+        u = urlparse(endpoint)
+        return (u.netloc or "").strip() or None
+    except Exception:
+        return None
+
+
 def _s3_settings() -> Dict[str, Any]:
-    endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
-    presign_endpoint = (os.environ.get("S3_PRESIGN_ENDPOINT") or "").strip() or None
+    endpoint = _normalize_endpoint(os.environ.get("S3_ENDPOINT"), default_scheme="http")
+    presign_endpoint = _normalize_endpoint(os.environ.get("S3_PRESIGN_ENDPOINT"), default_scheme="https")
     region = (os.environ.get("S3_REGION") or "us-east-1").strip()
     access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip() or None
     secret_key = (os.environ.get("S3_SECRET_KEY") or "").strip() or None
@@ -212,9 +234,10 @@ def health_s3_env() -> Dict[str, Any]:
     """Env-only health payload for S3 (no network requests)."""
     provider = (os.environ.get("S3_PROVIDER") or "s3").strip().lower()
     bucket = (os.environ.get("S3_BUCKET") or "").strip() or None
-    endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
-
     s = _s3_settings()
+    endpoint = s.get("endpoint")
+    presign_endpoint = s.get("presign_endpoint")
+
     has_credentials = bool(s.get("access_key")) and bool(s.get("secret_key"))
 
     ok = bool(bucket) and bool(endpoint) and provider == "s3"
@@ -223,6 +246,8 @@ def health_s3_env() -> Dict[str, Any]:
         "ok": ok,
         "provider": "s3",
         "endpoint": endpoint,
+        "s3_endpoint_host": _host_from_endpoint(endpoint),
+        "s3_presign_host": _host_from_endpoint(presign_endpoint),
         "bucket": bucket,
         "has_credentials": has_credentials,
     }

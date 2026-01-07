@@ -6,6 +6,7 @@ import random
 import hashlib
 import hmac
 import urllib.request
+from urllib.parse import urlparse
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
@@ -1742,6 +1743,20 @@ def admin_files_download(file_id: str, request: Request):
         _admin_error("FILE_INCOMPLETE", "File record is incomplete", 500)
     expires = 600
     url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+
+    presign_host = None
+    try:
+        presign_host = (urlparse(url).netloc or "").strip() or None
+    except Exception:
+        presign_host = None
+
+    log_event(
+        "presign_url_issued",
+        request_id=request_id,
+        file_id=file_id,
+        pack_id=row.get("pack_id"),
+        host=presign_host,
+    )
     return {"ok": True, "url": url, "expires_in_sec": expires}
 
 
@@ -2787,7 +2802,8 @@ def health_s3(request: Request):
         request_id=request_id,
         ok=payload.get("ok"),
         bucket=payload.get("bucket"),
-        endpoint=payload.get("endpoint"),
+        s3_endpoint_host=payload.get("s3_endpoint_host"),
+        s3_presign_host=payload.get("s3_presign_host"),
         has_credentials=payload.get("has_credentials"),
     )
     return payload
@@ -3240,6 +3256,20 @@ def files_download(file_id: str, request: Request):
 
     expires = 600
     url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+
+    presign_host = None
+    try:
+        presign_host = (urlparse(url).netloc or "").strip() or None
+    except Exception:
+        presign_host = None
+
+    log_event(
+        "presign_url_issued",
+        request_id=request_id,
+        file_id=file_id,
+        pack_id=row.get("pack_id"),
+        host=presign_host,
+    )
 
     log_event(
         "file_presigned",
