@@ -1,103 +1,211 @@
 # Admin Runbook
 
-Этот документ — краткий операторский гайд по админ‑консоли и основным сценариям эксплуатации.
+Этот документ — операторский гайд по админ‑консоли и основным эксплуатационным сценариям.
 
-## Доступ в админку
+Админ‑API защищено заголовком `X-Admin-Token`.
 
-Админ‑эндпоинты требуют заголовок `X-Admin-Token`.
+## Как устроен доступ
 
-### Предусловия (env)
+Доступ состоит из двух шагов:
 
-В docker‑compose `api` читает:
+1) **OTP user login** → получаем user token (Bearer)
+2) **Admin login** → проверяем allowlist телефона + admin password → получаем `admin_token` для `X-Admin-Token`
 
-- `ADMIN_PHONE_ALLOWLIST` — номера в E.164 через запятую (пример: `+79990000000,+79990000001`)
-- `ADMIN_PASSWORD_SALT` — соль для PBKDF2
-- `ADMIN_PASSWORD_HASH` — hex(PBKDF2-HMAC-SHA256(password, salt, 100000))
-- `ADMIN_SESSION_TTL_HOURS` — TTL админ‑сессии (по умолчанию 12)
+### 1) OTP user login
 
-### Как сгенерировать `ADMIN_PASSWORD_HASH`
+В этом репо OTP — **mock** (для локальных сценариев):
+- `POST /auth/otp/request` — генерирует и сохраняет код в памяти процесса API
+- `POST /auth/otp/verify` — проверяет код и возвращает user token (Bearer)
+
+Для локальной отладки можно получить код через debug эндпоинт (только если `DEBUG=1`):
+- `GET /debug/otp/latest?phone=<E164>`
+
+Также поддержан упрощённый способ для ручных тестов без OTP:
+- `Authorization: Bearer mockphone:+79991234567`
+
+Важно: админ‑проверка использует **номер телефона из Bearer user token**, поэтому номер должен совпадать с allowlist.
+
+### 2) Allowlist телефона (ADMIN_PHONE_ALLOWLIST)
+
+- `ADMIN_PHONE_ALLOWLIST` — список номеров в E.164 через запятую.
+- Если allowlist пуст — админ‑логин отключён (`admin_login_disabled`).
+- Если номер не в allowlist — `not_allowed`.
+
+### 3) Admin password (ADMIN_PASSWORD_HASH / ADMIN_PASSWORD_SALT)
+
+- `ADMIN_PASSWORD_SALT` — соль.
+- `ADMIN_PASSWORD_HASH` — ожидаемый hash в hex.
+- Алгоритм: `PBKDF2-HMAC-SHA256(password, salt, 100000)`.
+
+Как сгенерировать hash (пример; НЕ коммитить реальный пароль):
 
 ```bash
 python3 - <<'PY'
 import hashlib
-pwd = "admin123"
-salt = "smoke-salt"
+pwd = "admin123"         # пример
+salt = "smoke-salt"      # пример
 dk = hashlib.pbkdf2_hmac("sha256", pwd.encode("utf-8"), salt.encode("utf-8"), 100_000)
 print(dk.hex())
 PY
 ```
 
-### Логин (curl)
+### 4) Admin session TTL 12h
 
-1) Получите user token (через OTP / mock OTP).
-2) Выполните админ‑логин:
+- TTL задаётся `ADMIN_SESSION_TTL_HOURS` (по умолчанию 12 часов).
+- При `POST /admin/login` создаётся запись в БД `admin_sessions` со сроком действия.
+- В `X-Admin-Token` передаётся **одноразово выданный** `admin_token` (plain), в БД хранится только `token_hash`.
 
-```bash
-curl -sS -X POST http://localhost:8000/admin/login \
-  -H "Authorization: Bearer <USER_TOKEN>" \
-  -H 'Content-Type: application/json' \
-  --data '{"admin_password":"<PASSWORD>"}'
-```
+## Где хранятся значения и как менять безопасно
 
-Ответ содержит `admin_token`. Его нужно прокидывать в `X-Admin-Token`.
+### Где лежит конфигурация доступа
 
-## Alerts Center
+Локально (docker compose) переменные прокидываются в сервис `api` из окружения:
+- `ADMIN_PHONE_ALLOWLIST`
+- `ADMIN_PASSWORD_HASH`
+- `ADMIN_PASSWORD_SALT`
+- `ADMIN_SESSION_TTL_HOURS`
 
-### Что это
+См. [infra/docker-compose.yml](../../infra/docker-compose.yml).
 
-Каждый вызов `send_alert(...)` записывает событие в БД как artifact `kind=alert_event` (best‑effort) и (опционально) шлёт webhook, если задан `ALERT_WEBHOOK_URL`.
+Шаблон локальных значений (без секретов): [infra/.env.example](../../infra/.env.example).
 
-### Операции
+### Как менять безопасно
 
-- Список: `GET /admin/alerts?limit=100&severity=warning&event=bad_config_fallback`
-- Ack: `POST /admin/alerts/{id}/ack`
+- Никогда не коммитить реальные значения секретов в репозиторий.
+- Менять env только через секрет‑хранилище/переменные окружения окружения (staging/prod), затем перезапуск `api`.
+- При смене `ADMIN_PASSWORD_SALT` все текущие `X-Admin-Token` фактически станут невалидными (удобно для принудительного logout).
 
-Ack хранится в `artifacts.meta`:
-- `acked_at`
-- `acked_by_user_id`
+## Как устроен аудит
 
-## Logs Viewer
+Аудит пишется в два слоя:
 
-Единый просмотр «следов» из двух источников:
+### 1) admin_audit_log (таблица)
 
-- artifacts (любые `kind`, включая `admin_event`, `alert_event`, и т.д.)
-- render jobs (как записи `kind=render_job`)
+Таблица: `admin_audit_log`.
+Пишется через `record_admin_audit(...)`.
+
+Что там есть (по факту схемы):
+- `admin_user_id`, `admin_session_id`
+- `action` (например: `config_publish`, `document_access_update`, `admin_login`)
+- `target_type` (например: `config_store`, `document_access`, `admin_session`)
+- `target_id`
+- `before_hash` / `after_hash` (SHA256 от JSON “до/после”, без хранения полного объекта)
+- `request_id`, `ip`, `user_agent`, `created_at`
 
 Эндпоинт:
+- `GET /admin/audit?limit=50&action=config_publish&target_type=config_store`
 
-- `GET /admin/logs?kind=<artifact_kind|render_job>&pack_id=<...>&doc_id=<...>&status=<...>&limit=200`
+### 2) admin_event artifacts (артефакты)
 
-UI делает клиентское маскирование потенциально чувствительных данных в JSON.
+В БД в таблицу `artifacts` пишутся события `kind=admin_event` (best-effort). Это используется для “следов” в Logs Viewer.
 
-## Config lifecycle (безопасное управление конфигами)
+### Как найти «что сломалось после publish»
 
-Ключевая идея: при `CONFIG_SOURCE=db` сервис берёт активную валидную версию из БД, а при отсутствии/невалидности — fallback на file + запись алерта `bad_config_fallback`.
+1) В `GET /admin/audit` найти событие `action=config_publish` и забрать `request_id`.
+2) В `GET /admin/logs` отфильтровать по этому `request_id` (и/или `kind=admin_event`).
+3) Проверить Alerts:
+   - `GET /admin/alerts?event=bad_config_fallback`
+   - `GET /admin/alerts?event=render_job_failed`
+4) Проверить рендер‑очередь:
+   - `GET /admin/render-jobs?status=failed`
 
-Основные операции:
+## Разделы админки (UI) и что реально работает
 
-- Draft: `POST /admin/config/{key}/draft`
-- Update: `POST /admin/config/{key}/update`
-- Validate: `POST /admin/config/{key}/validate?version=N`
-- Dry-run: `POST /admin/config/{key}/dry-run?version=N`
-- Publish: `POST /admin/config/{key}/publish?version=N`
-- Rollback: `POST /admin/config/{key}/rollback`
+Примечание: часть разделов присутствует как UI‑страницы, но некоторые из них сейчас **заглушки**.
 
-Поддерживаемые ключи: `documents_registry`, `blueprint`, `resources`.
+### Overview
 
-## Documents governance
+- UI: заглушка.
+- API: `GET /admin/overview` существует (можно использовать через прокси роуты фронта).
 
-- Список: `GET /admin/documents`
-- Метаданные: `POST /admin/documents/{doc_id}/metadata`
-- Доступ: `POST /admin/documents/{doc_id}/access` (`enabled`, `tier=free|paid`)
+### Jobs (requeue/retry)
 
-## Render jobs
+- UI: есть.
+- API:
+  - `GET /admin/render-jobs`
+  - `GET /admin/render-jobs/{job_id}`
+  - `POST /admin/render-jobs/{job_id}/requeue` (только для `failed`)
+  - `POST /admin/render-jobs/requeue-failed`
 
-- Список: `GET /admin/render-jobs`
-- Детали: `GET /admin/render-jobs/{id}`
-- Requeue: `POST /admin/render-jobs/{id}/requeue` (только `failed`)
-- Requeue failed batch: `POST /admin/render-jobs/requeue-failed`
+### Packs (render/regenerate)
 
-## Smoke / QA
+- UI: заглушка.
+- Пак‑операции сейчас живут в user API Stage 9.4:
+  - `POST /packs/{pack_id}/render`
+  - `POST /packs/{pack_id}/render/{doc_id}`
+  - `GET /packs/{pack_id}/documents`
+
+### Documents (описания/tier/enabled)
+
+- UI: есть.
+- API:
+  - `GET /admin/documents`
+  - `POST /admin/documents/{doc_id}/metadata`
+  - `POST /admin/documents/{doc_id}/access`
+
+### Configs (draft/validate/dry-run/publish/rollback)
+
+- UI: есть.
+- API:
+  - `POST /admin/config/{key}/draft`
+  - `POST /admin/config/{key}/update`
+  - `POST /admin/config/{key}/validate?version=N`
+  - `POST /admin/config/{key}/dry-run?version=N`
+  - `POST /admin/config/{key}/publish?version=N`
+  - `POST /admin/config/{key}/rollback`
+
+Ключи: `documents_registry`, `blueprint`, `resources`.
+
+### Pricing/Promos
+
+- UI: заглушка.
+- Backend API для pricing/promos в этом репо не реализован.
+
+### Flags
+
+- UI: заглушка.
+- Backend API для flags в этом репо не реализован.
+
+### Alerts/Logs
+
+- UI: есть.
+- API:
+  - `GET /admin/alerts`, `POST /admin/alerts/{id}/ack`
+  - `GET /admin/logs`
+
+## Правила безопасного админа
+
+- Всегда делать `validate` + `dry-run` перед `publish`.
+- `publish` делать только в staging.
+- После publish мониторить:
+  - рост `admin/alerts` (например `bad_config_fallback`, `render_job_failed`)
+  - рост failed render jobs (`/admin/render-jobs?status=failed`)
+  - всплеск 500/ошибок в логах (по `request_id`)
+- Если после publish выросли ошибки рендера/500 — делать `rollback` на предыдущую валидную версию.
+
+## Частые проблемы и куда смотреть
+
+### request_id
+
+Почти все существенные события логируются с `request_id`. Это ключ для склейки:
+- API logs
+- admin_event artifacts
+- audit entries
+
+### render_job_id
+
+Если ломается рендер PDF:
+- смотреть `render_jobs.last_error`, `attempts`, `max_attempts`
+- в worker логах искать `render_error` / `render_retry_scheduled`
+- `file_id` резолвится по `artifacts.meta.render_job_id` (см. `get_latest_file_id_for_render_job`)
+
+### artifacts.meta.render_job_id
+
+Если status `ready`, но в UI нет `file_id`:
+- проверить, что у PDF‑артефакта проставлен `meta.render_job_id`
+- проверить, что `artifact_files` создан и связан с artifact
+
+## Smoke / QA (локально)
 
 - End-to-end рендер пайплайна: `./scripts/smoke-stage9.4.sh`
 - Админ‑сценарии (alerts/logs/config/docs + рендер): `./scripts/smoke-admin.sh`
