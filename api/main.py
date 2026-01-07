@@ -44,6 +44,12 @@ from db import (
     list_admin_audit_log,
 )
 from db import (
+    ack_alert_event,
+    list_alert_events,
+    list_artifacts_admin,
+    get_artifact_by_id,
+)
+from db import (
     create_config_version,
     get_active_config_store,
     get_config_version,
@@ -1108,6 +1114,180 @@ def _admin_error(code: str, message: str, status_code: int):
         status_code=status_code,
         detail={"code": code, "message": message},
     )
+
+
+@app.get("/admin/overview")
+def admin_overview(request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+    # Minimal operator overview (can be extended later).
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "config": {
+            "config_source": CONFIG_SOURCE,
+            "cache_ttl_sec": CONFIG_CACHE_TTL_SEC,
+        },
+    }
+
+
+@app.get("/admin/alerts")
+def admin_alerts_list(
+    limit: int = 100,
+    severity: str = "",
+    event: str = "",
+    request: Request = None,
+):
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    _ = _require_admin(request)
+    rows = list_alert_events(
+        limit=limit,
+        severity=(severity or "").strip() or None,
+        event=(event or "").strip() or None,
+        request_id=request_id,
+    )
+    items: list[dict] = []
+    for r in rows:
+        payload = r.get("payload_json") or {}
+        meta = r.get("meta") or {}
+        items.append(
+            {
+                "id": str(r.get("id")),
+                "severity": (payload.get("severity") if isinstance(payload, dict) else None),
+                "event": (payload.get("event") if isinstance(payload, dict) else None),
+                "request_id": (payload.get("request_id") if isinstance(payload, dict) else None),
+                "ts": (payload.get("ts") if isinstance(payload, dict) else None),
+                "context": (payload.get("context") if isinstance(payload, dict) else None),
+                "acked_at": (meta.get("acked_at") if isinstance(meta, dict) else None),
+                "acked_by_user_id": (meta.get("acked_by_user_id") if isinstance(meta, dict) else None),
+                "created_at": to_iso(r.get("created_at")),
+            }
+        )
+    return {"ok": True, "items": items}
+
+
+@app.post("/admin/alerts/{alert_id}/ack")
+def admin_alerts_ack(alert_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    alert_id = (alert_id or "").strip()
+    if not alert_id:
+        _admin_error("BAD_REQUEST", "alert_id is required", 400)
+
+    before = None
+    try:
+        prev = get_artifact_by_id(artifact_id=alert_id, request_id=request_id)
+        if prev and str(prev.get("kind")) == "alert_event":
+            before = {"meta": prev.get("meta"), "payload": prev.get("payload_json")}
+    except Exception:
+        before = None
+
+    updated = ack_alert_event(alert_id=alert_id, admin_user_id=admin_user_id or None, request_id=request_id)
+    if not updated:
+        _admin_error("ALERT_NOT_FOUND", "Alert not found", 404)
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="alert_ack",
+        target_type="alert_event",
+        target_id=alert_id,
+        before_obj=before,
+        after_obj={"meta": updated.get("meta")},
+        summary=None,
+    )
+
+    return {"ok": True, "id": alert_id, "meta": updated.get("meta")}
+
+
+@app.get("/admin/logs")
+def admin_logs(
+    kind: str = "",
+    pack_id: str = "",
+    doc_id: str = "",
+    status: str = "",
+    limit: int = 200,
+    request: Request = None,
+):
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    _ = _require_admin(request)
+
+    safe_limit = int(limit or 200)
+    if safe_limit <= 0:
+        safe_limit = 200
+    if safe_limit > 1000:
+        safe_limit = 1000
+
+    kind_q = (kind or "").strip()
+    pack_q = (pack_id or "").strip() or None
+    doc_q = (doc_id or "").strip() or None
+    status_q = (status or "").strip() or None
+
+    include_jobs = (not kind_q) or (kind_q == "render_job")
+    include_artifacts = (not kind_q) or (kind_q != "render_job")
+
+    items: list[dict] = []
+    if include_artifacts:
+        rows = list_artifacts_admin(
+            kind=(kind_q if kind_q and kind_q != "render_job" else None),
+            pack_id=pack_q,
+            doc_id=doc_q,
+            limit=safe_limit,
+            request_id=request_id,
+        )
+        for r in rows:
+            items.append(
+                {
+                    "source": "artifact",
+                    "id": str(r.get("id")),
+                    "kind": str(r.get("kind")),
+                    "created_at": to_iso(r.get("created_at")),
+                    "payload_json": r.get("payload_json"),
+                    "meta": r.get("meta"),
+                    "session_id": r.get("session_id"),
+                }
+            )
+
+    if include_jobs:
+        rows = list_render_jobs_admin(
+            status=status_q,
+            pack_id=pack_q,
+            doc_id=doc_q,
+            limit=safe_limit,
+            request_id=request_id,
+        )
+        for r in rows:
+            items.append(
+                {
+                    "source": "render_job",
+                    "id": str(r.get("id")),
+                    "kind": "render_job",
+                    "created_at": to_iso(r.get("updated_at") or r.get("created_at")),
+                    "payload_json": {
+                        "pack_id": str(r.get("pack_id")),
+                        "doc_id": str(r.get("doc_id")),
+                        "status": r.get("status"),
+                        "attempts": int(r.get("attempts") or 0),
+                        "max_attempts": int(r.get("max_attempts") or 0),
+                        "last_error": r.get("last_error"),
+                        "updated_at": to_iso(r.get("updated_at")),
+                        "created_at": to_iso(r.get("created_at")),
+                    },
+                    "meta": None,
+                    "session_id": None,
+                }
+            )
+
+    def _ts_key(it: dict) -> str:
+        return str(it.get("created_at") or "")
+
+    items.sort(key=_ts_key, reverse=True)
+    items = items[:safe_limit]
+    return {"ok": True, "items": items}
 
 
 class AdminDocumentMetadataBody(BaseModel):

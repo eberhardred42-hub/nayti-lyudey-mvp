@@ -43,6 +43,8 @@ function friendlyAdminError(codeOrDetail?: string): string {
       return "Документ не найден";
     case "INVALID_TIER":
       return "tier должен быть free или paid";
+    case "ALERT_NOT_FOUND":
+      return "Алерт не найден";
     default:
       return "Ошибка админки";
   }
@@ -88,6 +90,10 @@ export async function adminAudit(params?: { limit?: number; action?: string; tar
   if (params?.action) url.searchParams.set("action", params.action);
   if (params?.target_type) url.searchParams.set("target_type", params.target_type);
   return adminFetch(url.pathname + url.search, { method: "GET" });
+}
+
+export async function adminOverview() {
+  return adminFetch("/api/admin/overview", { method: "GET" });
 }
 
 export async function adminLogin(password: string) {
@@ -217,4 +223,32 @@ export async function adminDocumentUpdateAccess(docId: string, payload: { enable
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+}
+
+export async function adminAlertsList(params?: { limit?: number; severity?: string; event?: string }) {
+  const url = new URL("/api/admin/alerts", window.location.origin);
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  if (params?.severity) url.searchParams.set("severity", params.severity);
+  if (params?.event) url.searchParams.set("event", params.event);
+  return adminFetch(url.pathname + url.search, { method: "GET" });
+}
+
+export async function adminAlertAck(alertId: string) {
+  return adminFetch(`/api/admin/alerts/${encodeURIComponent(alertId)}/ack`, { method: "POST" });
+}
+
+export async function adminLogs(params?: {
+  kind?: string;
+  pack_id?: string;
+  doc_id?: string;
+  status?: string;
+  limit?: number;
+}) {
+  const url = new URL("/api/admin/logs", window.location.origin);
+  if (params?.kind) url.searchParams.set("kind", params.kind);
+  if (params?.pack_id) url.searchParams.set("pack_id", params.pack_id);
+  if (params?.doc_id) url.searchParams.set("doc_id", params.doc_id);
+  if (params?.status) url.searchParams.set("status", params.status);
+  if (params?.limit) url.searchParams.set("limit", String(params.limit));
+  return adminFetch(url.pathname + url.search, { method: "GET" });
 }
