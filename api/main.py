@@ -2199,15 +2199,55 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 # Initialize database on startup
+_DB_INIT_OK = False
+_DB_INIT_ERROR: str | None = None
 try:
     init_db()
+    _DB_INIT_OK = True
 except Exception as e:
+    _DB_INIT_OK = False
+    _DB_INIT_ERROR = str(e)
     log_event(
         "db_error",
         level="error",
         route="startup",
         method="system",
         error=str(e),
+    )
+
+
+@app.on_event("startup")
+async def _staging_boot_log():
+    domain = (os.environ.get("DOMAIN") or "").strip() or None
+    llm_provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower() or None
+
+    try:
+        sms = health_sms_env() or {}
+    except Exception as e:
+        sms = {"ok": False, "error": str(e)}
+
+    try:
+        s3 = health_s3_env() or {}
+    except Exception as e:
+        s3 = {"ok": False, "error": str(e)}
+
+    log_event(
+        "staging_boot",
+        route="startup",
+        method="system",
+        debug=_is_debug_enabled(),
+        domain=domain,
+        config_source=CONFIG_SOURCE,
+        db_init_ok=_DB_INIT_OK,
+        db_init_error=_DB_INIT_ERROR,
+        llm_provider=llm_provider,
+        sms_provider=sms.get("provider"),
+        sms_mode=sms.get("mode"),
+        sms_has_key=sms.get("has_key"),
+        s3_ok=s3.get("ok"),
+        s3_bucket=s3.get("bucket"),
+        s3_endpoint_host=s3.get("s3_endpoint_host"),
+        s3_presign_host=s3.get("s3_presign_host"),
     )
 
 class SessionCreate(BaseModel):
@@ -3841,6 +3881,8 @@ async def events_client(request: Request):
 @app.get("/debug/session")
 def debug_session(session_id: str, request: Request):
     """Read-only session debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id, request_id=request_id)
@@ -3869,6 +3911,8 @@ def debug_session(session_id: str, request: Request):
 @app.get("/debug/messages")
 def debug_messages(session_id: str, request: Request, limit: int = 50):
     """Read-only messages debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id, request_id=request_id)
@@ -3898,6 +3942,8 @@ def debug_messages(session_id: str, request: Request, limit: int = 50):
 @app.get("/debug/report/free")
 def debug_report_free(session_id: str, request: Request):
     """Read-only free report debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id)

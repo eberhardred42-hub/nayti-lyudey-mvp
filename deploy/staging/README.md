@@ -9,7 +9,7 @@
   - `A`/`AAAA` для `api.${DOMAIN}`
   - `A`/`AAAA` для `s3.${DOMAIN}`
 - На сервере установлены Docker и Docker Compose v2.
-- Открыты входящие порты **80** и **443**.
+- На уровне сервера (security group / firewall) открыты входящие порты: **22** (SSH), **80** и **443**.
 
 ## 1) Создать `.env.staging`
 
@@ -49,6 +49,47 @@ docker compose \
 curl -fsS https://api.${DOMAIN}/health
 ```
 
+Минимальная проверка «сквозного» флоу (через публичный домен):
+
+```bash
+export DOMAIN="${DOMAIN}"
+export API="https://api.${DOMAIN}"
+export USER_ID="staging-smoke"
+
+# 1) Создать сессию
+SESSION_ID=$(curl -fsS -X POST "$API/sessions" \
+  -H 'Content-Type: application/json' \
+  -H "X-User-Id: $USER_ID" \
+  -d '{"profession_query":"QA smoke"}' | python3 -c 'import sys, json; print(json.load(sys.stdin)["session_id"])')
+echo "session_id=$SESSION_ID"
+
+# 2) Прочитать оферту (опционально)
+curl -fsS -H "X-User-Id: $USER_ID" "$API/legal/offer" >/dev/null
+
+# 3) Принять оферту (обязательно для pack/render)
+curl -fsS -X POST -H "X-User-Id: $USER_ID" "$API/legal/offer/accept" >/dev/null
+
+# 4) Создать pack
+PACK_ID=$(curl -fsS -X POST "$API/ml/job" \
+  -H 'Content-Type: application/json' \
+  -H "X-User-Id: $USER_ID" \
+  -d "{\"session_id\":\"$SESSION_ID\"}" | python3 -c 'import sys, json; print(json.load(sys.stdin)["pack_id"])')
+echo "pack_id=$PACK_ID"
+
+# 5) Запустить render
+curl -fsS -X POST -H "X-User-Id: $USER_ID" "$API/packs/$PACK_ID/render" >/dev/null
+
+# 6) Дождаться появления файлов и взять ссылку на скачивание
+for i in $(seq 1 60); do
+  FILE_ID=$(curl -fsS -H "X-User-Id: $USER_ID" "$API/me/files" | python3 -c 'import sys, json; d=json.load(sys.stdin); f=(d.get("files") or []); print(f[0]["file_id"] if f else "")')
+  if [ -n "$FILE_ID" ]; then break; fi
+  sleep 2
+done
+echo "file_id=$FILE_ID"
+
+curl -fsS -H "X-User-Id: $USER_ID" "$API/files/$FILE_ID/download" | python3 -c 'import sys, json; print(json.load(sys.stdin)["url"])'
+```
+
 Открыть фронт:
 - `https://${DOMAIN}`
 
@@ -60,3 +101,4 @@ curl -fsS https://api.${DOMAIN}/health
 - Сервисы `db`, `redis`, `minio`, `render` **не публикуют порты наружу**.
 - Все сервисы находятся в одном docker network (`staging`).
 - MinIO console намеренно не публикуется.
+- По умолчанию `DEBUG=0`, а `/debug/*` недоступны.

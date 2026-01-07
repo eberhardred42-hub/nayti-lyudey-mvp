@@ -34,6 +34,7 @@ services:
       redis:
         condition: service_healthy
     environment:
+      DOMAIN: ${DOMAIN}
       DEBUG: ${DEBUG:-0}
       CONFIG_SOURCE: ${CONFIG_SOURCE:-file}
       SMS_PROVIDER: ${SMS_PROVIDER:-mock}
@@ -98,6 +99,7 @@ services:
       render:
         condition: service_started
     environment:
+      DOMAIN: ${DOMAIN}
       DEBUG: ${DEBUG:-0}
       DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@db:5432/nlyudi
 
