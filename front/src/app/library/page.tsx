@@ -26,6 +26,12 @@ type PackDocumentItem = {
   file_id: string | null;
   attempts: number;
   last_error: string | null;
+  access?: {
+    tier: string;
+    enabled: boolean;
+    is_locked: boolean;
+    reason: string | null;
+  };
 };
 
 function getOrCreateUserId(): string {
@@ -262,17 +268,29 @@ export default function LibraryPage() {
                     <td style={{ padding: 8 }}>
                       <div>{d.title}</div>
                       <div style={{ opacity: 0.7, fontSize: 12 }}>{d.doc_id}</div>
+                      {d.access?.is_locked ? (
+                        <div style={{ marginTop: 4, color: "crimson", fontSize: 12 }}>
+                          Locked: {d.access.tier}
+                          {d.access.reason ? ` (${d.access.reason})` : ""}
+                        </div>
+                      ) : null}
                     </td>
                     <td style={{ padding: 8 }}>{d.status}</td>
                     <td style={{ padding: 8 }}>{d.file_id ? d.file_id : "—"}</td>
                     <td style={{ padding: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
-                      <button disabled={packLoading} onClick={() => regenerateDoc(selectedPackId, d.doc_id)}>
-                        Пересобрать
-                      </button>
-                      {d.file_id && (
-                        <button disabled={packLoading} onClick={() => download(d.file_id as string)}>
-                          Скачать
-                        </button>
+                      {d.access?.is_locked ? (
+                        <span style={{ opacity: 0.7 }}>Недоступно</span>
+                      ) : (
+                        <>
+                          <button disabled={packLoading} onClick={() => regenerateDoc(selectedPackId, d.doc_id)}>
+                            Пересобрать
+                          </button>
+                          {d.file_id && (
+                            <button disabled={packLoading} onClick={() => download(d.file_id as string)}>
+                              Скачать
+                            </button>
+                          )}
+                        </>
                       )}
                     </td>
                   </tr>

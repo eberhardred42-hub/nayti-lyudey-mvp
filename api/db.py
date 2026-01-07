@@ -213,6 +213,147 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_packs_user_created
             ON packs(user_id, created_at)
         """)
+
+        # Admin users (phone allowlist + sessions).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id UUID PRIMARY KEY,
+                phone_e164 TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_sessions (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                token_hash TEXT NOT NULL,
+                salt TEXT NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                revoked_at TIMESTAMPTZ NULL
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_user_id
+            ON admin_sessions(user_id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires_at
+            ON admin_sessions(expires_at)
+        """)
+
+        # Admin audit log (investigable admin actions).
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS admin_audit_log (
+                id UUID PRIMARY KEY,
+                admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                admin_session_id UUID NOT NULL REFERENCES admin_sessions(id) ON DELETE CASCADE,
+                action TEXT NOT NULL,
+                target_type TEXT NOT NULL,
+                target_id TEXT NULL,
+                before_hash TEXT NULL,
+                after_hash TEXT NULL,
+                summary TEXT NULL,
+                request_id TEXT NULL,
+                ip TEXT NULL,
+                user_agent TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_user_id
+            ON admin_audit_log(admin_user_id)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at
+            ON admin_audit_log(created_at)
+        """)
+
+        # Config store: versioned JSON configs managed via admin.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS config_store (
+                id UUID PRIMARY KEY,
+                key TEXT NOT NULL,
+                version INT NOT NULL,
+                payload_json JSONB NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                validation_status TEXT NOT NULL DEFAULT 'draft',
+                validation_errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+                comment TEXT NULL,
+                created_by_user_id UUID NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (key, version)
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key
+            ON config_store(key)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key_active
+            ON config_store(key, is_active)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key_version
+            ON config_store(key, version)
+        """)
+
+        # Stage 9.4.x: document metadata + access control overlays.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_metadata (
+                doc_id TEXT PRIMARY KEY,
+                title TEXT NULL,
+                description TEXT NULL,
+                updated_by_user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_access (
+                doc_id TEXT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                tier TEXT NOT NULL DEFAULT 'free' CHECK (tier IN ('free', 'paid')),
+                updated_by_user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        # Forward-compatible ALTERs for older DBs.
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS title TEXT""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS description TEXT""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS updated_by_user_id UUID""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ""")
+
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS enabled BOOLEAN""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS tier TEXT""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS updated_by_user_id UUID""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ""")
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_metadata_updated
+            ON document_metadata(updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_access_updated
+            ON document_access(updated_at)
+            """
+        )
         
         conn.commit()
 
@@ -740,7 +881,7 @@ def set_session_user(session_id: str, user_id: str, request_id: str = "unknown")
 
 
 def create_artifact(
-    session_id: str,
+    session_id: Optional[str],
     kind: str,
     format: str,
     payload_json: Optional[Dict[str, Any]] = None,
@@ -794,6 +935,392 @@ def create_artifact(
                 query_name="create_artifact",
                 request_id=request_id,
                 artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Admin users + sessions
+# ==========================================================================
+
+
+def ensure_user(
+    user_id: str,
+    phone_e164: str,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="ensure_user",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO users (id, phone_e164)
+                VALUES (%s, %s)
+                ON CONFLICT (phone_e164) DO UPDATE SET id = EXCLUDED.id
+                RETURNING id, phone_e164, created_at
+                """,
+                (user_id, phone_e164),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="ensure_user",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="ensure_user",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_user_by_id(user_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_user_by_id",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, phone_e164, created_at
+                FROM users
+                WHERE id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_user_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_user_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_admin_session(
+    user_id: str,
+    token_hash: str,
+    salt: str,
+    expires_at: datetime,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    session_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_admin_session",
+        request_id=request_id,
+        admin_session_id=session_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO admin_sessions (id, user_id, token_hash, salt, expires_at)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING id, user_id, expires_at, created_at, revoked_at
+                """,
+                (session_id, user_id, token_hash, salt, expires_at),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_admin_session_by_token_hash(
+    token_hash: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_admin_session_by_token_hash",
+        request_id=request_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, user_id, token_hash, salt, expires_at, created_at, revoked_at
+                FROM admin_sessions
+                WHERE token_hash = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (token_hash,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_admin_session_by_token_hash",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_admin_session_by_token_hash",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def revoke_admin_session(admin_session_id: str, request_id: str = "unknown") -> int:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="revoke_admin_session",
+        request_id=request_id,
+        admin_session_id=admin_session_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE admin_sessions
+                SET revoked_at = now()
+                WHERE id = %s AND revoked_at IS NULL
+                """,
+                (admin_session_id,),
+            )
+            _log_event(
+                "db_query_ok",
+                query_name="revoke_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(cur.rowcount or 0)
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="revoke_admin_session",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_admin_audit_log(
+    admin_user_id: str,
+    admin_session_id: str,
+    action: str,
+    target_type: str,
+    target_id: Optional[str],
+    before_hash: Optional[str],
+    after_hash: Optional[str],
+    summary: Optional[str],
+    request_id: Optional[str],
+    ip: Optional[str],
+    user_agent: Optional[str],
+    request_id_log: str = "unknown",
+) -> Dict[str, Any]:
+    audit_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_admin_audit_log",
+        request_id=request_id_log,
+        admin_audit_id=audit_id,
+        action=action,
+        target_type=target_type,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO admin_audit_log (
+                    id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id, admin_user_id, admin_session_id, action, target_type, target_id,
+                          before_hash, after_hash, summary, request_id, ip, user_agent, created_at
+                """,
+                (
+                    audit_id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent,
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_admin_audit_log",
+                request_id=request_id_log,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_admin_audit_log",
+                request_id=request_id_log,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_admin_audit_log(
+    limit: int = 50,
+    action: Optional[str] = None,
+    target_type: Optional[str] = None,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_admin_audit_log",
+        request_id=request_id,
+        limit=limit,
+        action=action,
+        target_type=target_type,
+    )
+
+    safe_limit = int(limit or 50)
+    if safe_limit <= 0:
+        safe_limit = 50
+    if safe_limit > 200:
+        safe_limit = 200
+
+    where = []
+    args: list[Any] = []
+    if action:
+        where.append("action = %s")
+        args.append(action)
+    if target_type:
+        where.append("target_type = %s")
+        args.append(target_type)
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT
+                    id,
+                    admin_user_id,
+                    admin_session_id,
+                    action,
+                    target_type,
+                    target_id,
+                    before_hash,
+                    after_hash,
+                    summary,
+                    request_id,
+                    ip,
+                    user_agent,
+                    created_at
+                FROM admin_audit_log
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*args, safe_limit),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="list_admin_audit_log",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_admin_audit_log",
+                request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )
@@ -1091,6 +1618,1188 @@ def get_latest_file_id_for_render_job(job_id: str, request_id: str = "unknown") 
                 query_name="get_latest_file_id_for_render_job",
                 request_id=request_id,
                 render_job_id=job_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_render_jobs_admin(
+    status: Optional[str] = None,
+    pack_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    limit: int = 100,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    """Admin: list render jobs with optional filters."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_render_jobs_admin",
+        request_id=request_id,
+        status=status,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        limit=limit,
+    )
+    limit = max(1, min(500, int(limit or 100)))
+
+    clauses: List[str] = []
+    params: List[Any] = []
+    if status:
+        clauses.append("status = %s")
+        params.append(status)
+    if pack_id:
+        clauses.append("pack_id = %s")
+        params.append(pack_id)
+    if doc_id:
+        clauses.append("doc_id = %s")
+        params.append(doc_id)
+
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT
+                    id,
+                    pack_id,
+                    doc_id,
+                    status,
+                    attempts,
+                    max_attempts,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM render_jobs
+                {where_sql}
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (*params, limit),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_render_jobs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_render_jobs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def has_active_render_job(
+    pack_id: str,
+    doc_id: str,
+    request_id: str = "unknown",
+) -> bool:
+    """True if there is any queued/rendering job for the given pack+doc."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="has_active_render_job",
+        request_id=request_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT 1
+                FROM render_jobs
+                WHERE pack_id = %s
+                  AND doc_id = %s
+                  AND status IN ('queued', 'rendering')
+                LIMIT 1
+                """,
+                (pack_id, doc_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="has_active_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return bool(row)
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="has_active_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_failed_render_jobs(limit: int = 50, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """Admin: list failed render jobs (most recent first)."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_failed_render_jobs",
+        request_id=request_id,
+        limit=limit,
+    )
+    limit = max(1, min(500, int(limit or 50)))
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    pack_id,
+                    session_id,
+                    doc_id,
+                    status,
+                    attempts,
+                    max_attempts,
+                    last_error,
+                    created_at,
+                    updated_at
+                FROM render_jobs
+                WHERE status = 'failed'
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_failed_render_jobs",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_failed_render_jobs",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_artifacts_for_render_job(job_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    """Resolve artifacts for a job via artifacts.meta.render_job_id, with optional file_id."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_artifacts_for_render_job",
+        request_id=request_id,
+        render_job_id=job_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    a.id AS artifact_id,
+                    a.kind,
+                    a.format,
+                    a.created_at,
+                    af.id AS file_id,
+                    af.content_type,
+                    af.size_bytes
+                FROM artifacts a
+                LEFT JOIN artifact_files af ON af.artifact_id = a.id
+                WHERE (a.meta->>'render_job_id') = %s
+                ORDER BY a.created_at DESC
+                """,
+                (job_id,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_artifacts_for_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_artifacts_for_render_job",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_file_download_info(file_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    """Admin: resolve (bucket, key) for a file_id without user ownership checks."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_file_download_info",
+        request_id=request_id,
+        file_id=file_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    id AS file_id,
+                    artifact_id,
+                    bucket,
+                    object_key,
+                    content_type,
+                    size_bytes,
+                    etag,
+                    created_at
+                FROM artifact_files
+                WHERE id = %s
+                """,
+                (file_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_file_download_info",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_file_download_info",
+                request_id=request_id,
+                file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Config store operations (Admin)
+# ==========================================================================
+
+
+def get_active_config_store(key: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_active_config_store",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, payload_json, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s AND is_active = TRUE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_active_config_store",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_active_config_store",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_config_versions(key: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_config_versions",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s
+                ORDER BY version DESC
+                """,
+                (key,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_config_versions",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_config_versions",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_config_version(key: str, version: int, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_config_version",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, payload_json, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s AND version = %s
+                LIMIT 1
+                """,
+                (key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_config_version(
+    *,
+    key: str,
+    version: int,
+    payload_json: Dict[str, Any],
+    is_active: bool,
+    validation_status: str,
+    validation_errors: list,
+    comment: Optional[str],
+    created_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    cfg_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_config_version",
+        request_id=request_id,
+        config_id=cfg_id,
+        key=key,
+        version=version,
+        is_active=is_active,
+        validation_status=validation_status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO config_store (
+                    id, key, version, payload_json, is_active, validation_status, validation_errors, comment, created_by_user_id
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s)
+                RETURNING id, key, version, payload_json, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (
+                    cfg_id,
+                    key,
+                    int(version),
+                    json.dumps(payload_json, ensure_ascii=False),
+                    bool(is_active),
+                    validation_status,
+                    json.dumps(validation_errors or [], ensure_ascii=False),
+                    comment,
+                    created_by_user_id,
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def update_config_payload(
+    *,
+    key: str,
+    version: int,
+    payload_json: Dict[str, Any],
+    comment: Optional[str],
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="update_config_payload",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE config_store
+                SET payload_json = %s::jsonb,
+                    comment = %s,
+                    validation_status = 'draft',
+                    validation_errors = '[]'::jsonb
+                WHERE key = %s AND version = %s AND is_active = FALSE
+                RETURNING id, key, version, payload_json, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (json.dumps(payload_json, ensure_ascii=False), comment, key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="update_config_payload",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="update_config_payload",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def set_config_validation(
+    *,
+    key: str,
+    version: int,
+    validation_status: str,
+    validation_errors: list,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="set_config_validation",
+        request_id=request_id,
+        key=key,
+        version=version,
+        validation_status=validation_status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE config_store
+                SET validation_status = %s,
+                    validation_errors = %s::jsonb
+                WHERE key = %s AND version = %s
+                RETURNING id, key, version, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (validation_status, json.dumps(validation_errors or [], ensure_ascii=False), key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="set_config_validation",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="set_config_validation",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_latest_inactive_version(key: str, request_id: str = "unknown") -> Optional[int]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_latest_inactive_version",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT version
+                FROM config_store
+                WHERE key = %s AND is_active = FALSE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_latest_inactive_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(row[0]) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_latest_inactive_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def publish_config_version(key: str, version: int, request_id: str = "unknown") -> bool:
+    """Set the given version active, disable previous actives."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="publish_config_version",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("BEGIN")
+            cur.execute(
+                """
+                UPDATE config_store
+                SET is_active = FALSE
+                WHERE key = %s AND is_active = TRUE
+                """,
+                (key,),
+            )
+            cur.execute(
+                """
+                UPDATE config_store
+                SET is_active = TRUE
+                WHERE key = %s AND version = %s
+                """,
+                (key, int(version)),
+            )
+            ok = cur.rowcount > 0
+            conn.commit()
+            _log_event(
+                "db_query_ok",
+                query_name="publish_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return ok
+        except Exception as e:
+            conn.rollback()
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="publish_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Document metadata/access overlays (Admin)
+# ==========================================================================
+
+
+def get_document_metadata_map(
+    doc_ids: List[str],
+    request_id: str = "unknown",
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch metadata rows for the given doc_ids. Returns {doc_id: row}."""
+    clean = [str(d or "").strip() for d in (doc_ids or []) if str(d or "").strip()]
+    if not clean:
+        return {}
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_metadata_map",
+        request_id=request_id,
+        docs_count=len(clean),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT doc_id, title, description, updated_by_user_id, updated_at
+                FROM document_metadata
+                WHERE doc_id = ANY(%s)
+                """,
+                (clean,),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_metadata_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            out: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                out[str(r.get("doc_id"))] = dict(r)
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_metadata_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_document_access_map(
+    doc_ids: List[str],
+    request_id: str = "unknown",
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch access rows for the given doc_ids. Returns {doc_id: row}."""
+    clean = [str(d or "").strip() for d in (doc_ids or []) if str(d or "").strip()]
+    if not clean:
+        return {}
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_access_map",
+        request_id=request_id,
+        docs_count=len(clean),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT doc_id, enabled, tier, updated_by_user_id, updated_at
+                FROM document_access
+                WHERE doc_id = ANY(%s)
+                """,
+                (clean,),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_access_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            out: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                out[str(r.get("doc_id"))] = dict(r)
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_access_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def upsert_document_metadata(
+    *,
+    doc_id: str,
+    title: Optional[str],
+    description: Optional[str],
+    updated_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    doc_id = str(doc_id or "").strip()
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="upsert_document_metadata",
+        request_id=request_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO document_metadata (doc_id, title, description, updated_by_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (doc_id) DO UPDATE
+                SET title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    updated_at = now()
+                RETURNING doc_id, title, description, updated_by_user_id, updated_at
+                """,
+                (doc_id, title, description, updated_by_user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="upsert_document_metadata",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="upsert_document_metadata",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def upsert_document_access(
+    *,
+    doc_id: str,
+    enabled: bool,
+    tier: str,
+    updated_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    doc_id = str(doc_id or "").strip()
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="upsert_document_access",
+        request_id=request_id,
+        doc_id=doc_id,
+        enabled=bool(enabled),
+        tier=str(tier or ""),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO document_access (doc_id, enabled, tier, updated_by_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (doc_id) DO UPDATE
+                SET enabled = EXCLUDED.enabled,
+                    tier = EXCLUDED.tier,
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    updated_at = now()
+                RETURNING doc_id, enabled, tier, updated_by_user_id, updated_at
+                """,
+                (doc_id, bool(enabled), str(tier or "free"), updated_by_user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="upsert_document_access",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="upsert_document_access",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Alerts / Logs (Admin)
+# ==========================================================================
+
+
+def list_alert_events(
+    *,
+    limit: int = 50,
+    severity: Optional[str] = None,
+    event: Optional[str] = None,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_alert_events",
+        request_id=request_id,
+        limit=limit,
+        severity=severity,
+        alert_event=event,
+    )
+
+    safe_limit = int(limit or 50)
+    if safe_limit <= 0:
+        safe_limit = 50
+    if safe_limit > 500:
+        safe_limit = 500
+
+    where = ["kind = 'alert_event'"]
+    args: list[Any] = []
+    if severity:
+        where.append("(payload_json->>'severity') = %s")
+        args.append(severity)
+    if event:
+        where.append("(payload_json->>'event') = %s")
+        args.append(event)
+    where_sql = "WHERE " + " AND ".join(where)
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT id, kind, format, payload_json, meta, created_at
+                FROM artifacts
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*args, safe_limit),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="list_alert_events",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_alert_events",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def ack_alert_event(
+    *,
+    alert_id: str,
+    admin_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="ack_alert_event",
+        request_id=request_id,
+        alert_id=alert_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE artifacts
+                SET meta = COALESCE(meta, '{}'::jsonb) || jsonb_build_object(
+                    'acked_at', (now() at time zone 'utc')::text,
+                    'acked_by_user_id', %s
+                )
+                WHERE id = %s AND kind = 'alert_event'
+                RETURNING id, kind, format, payload_json, meta, created_at
+                """,
+                (admin_user_id, alert_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="ack_alert_event",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="ack_alert_event",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_artifacts_admin(
+    *,
+    kind: Optional[str] = None,
+    pack_id: Optional[str] = None,
+    doc_id: Optional[str] = None,
+    limit: int = 100,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_artifacts_admin",
+        request_id=request_id,
+        kind=kind,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        limit=limit,
+    )
+
+    safe_limit = int(limit or 100)
+    if safe_limit <= 0:
+        safe_limit = 100
+    if safe_limit > 1000:
+        safe_limit = 1000
+
+    where: list[str] = []
+    args: list[Any] = []
+    if kind:
+        where.append("kind = %s")
+        args.append(kind)
+    if pack_id:
+        where.append("(meta->>'pack_id') = %s")
+        args.append(pack_id)
+    if doc_id:
+        where.append("(meta->>'doc_id') = %s")
+        args.append(doc_id)
+
+    where_sql = ""
+    if where:
+        where_sql = "WHERE " + " AND ".join(where)
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"""
+                SELECT id, session_id, kind, format, payload_json, meta, created_at
+                FROM artifacts
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (*args, safe_limit),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="list_artifacts_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_artifacts_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_artifact_by_id(
+    *,
+    artifact_id: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_artifact_by_id",
+        request_id=request_id,
+        artifact_id=artifact_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, session_id, kind, format, payload_json, meta, created_at
+                FROM artifacts
+                WHERE id = %s
+                LIMIT 1
+                """,
+                (artifact_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_artifact_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_artifact_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_previous_valid_version(key: str, current_version: int, request_id: str = "unknown") -> Optional[int]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_previous_valid_version",
+        request_id=request_id,
+        key=key,
+        current_version=current_version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT version
+                FROM config_store
+                WHERE key = %s
+                  AND validation_status = 'valid'
+                  AND version < %s
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key, int(current_version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_previous_valid_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(row[0]) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_previous_valid_version",
+                request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )

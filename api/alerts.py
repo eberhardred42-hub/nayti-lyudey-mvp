@@ -5,6 +5,8 @@ import urllib.request
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from db import create_artifact
+
 
 def log_event(event: str, level: str = "info", **fields):
     payload: Dict[str, Any] = {
@@ -30,10 +32,6 @@ def send_alert(
     Uses env `ALERT_WEBHOOK_URL`. If not set, it's a no-op.
     Never logs the webhook URL.
     """
-    webhook_url = (os.environ.get("ALERT_WEBHOOK_URL") or "").strip()
-    if not webhook_url:
-        return False
-
     payload = {
         "severity": severity,
         "event": event,
@@ -41,6 +39,36 @@ def send_alert(
         "ts": datetime.utcnow().isoformat() + "Z",
         "context": context or {},
     }
+
+    # Always persist alerts for investigations (best-effort).
+    try:
+        create_artifact(
+            session_id=None,
+            kind="alert_event",
+            format="json",
+            payload_json=payload,
+            meta={"acked_at": None, "acked_by_user_id": None},
+            request_id=request_id,
+        )
+        log_event(
+            "alert_recorded",
+            request_id=request_id,
+            alert_event=event,
+            severity=severity,
+        )
+    except Exception as e:
+        log_event(
+            "alert_record_error",
+            level="error",
+            request_id=request_id,
+            alert_event=event,
+            severity=severity,
+            error=str(e),
+        )
+
+    webhook_url = (os.environ.get("ALERT_WEBHOOK_URL") or "").strip()
+    if not webhook_url:
+        return False
 
     start = time.perf_counter()
     try:
