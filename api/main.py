@@ -70,6 +70,7 @@ from db import (
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
+from sms_client import send_otp_sms, health_sms_env, SmsSendError
 
 app = FastAPI()
 SESSIONS = {}
@@ -1841,6 +1842,14 @@ def auth_otp_request(body: OtpRequest, request: Request):
     # Minimal mock: always generate a code; in real mode we would send SMS.
     code = str(int(time.time()))[-6:].rjust(6, "0")
     OTP_LATEST[phone] = code
+
+    # In mock mode we don't send SMS, but verify still works.
+    if provider != "mock":
+        try:
+            send_otp_sms(phone=phone, code=code, request_id=request_id)
+        except SmsSendError as e:
+            # Do not leak secrets/OTP; return a stable error code.
+            raise HTTPException(status_code=502, detail=e.code)
     log_event(
         "auth_otp_requested",
         request_id=request_id,
@@ -2776,12 +2785,7 @@ def health_llm_endpoint():
 @app.get("/health/sms")
 def health_sms():
     """Check SMS provider configuration (env-only; no network)."""
-    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
-    # We deliberately don't validate credentials here (Stage 9.3.0 baseline).
-    return {
-        "ok": True,
-        "provider": provider,
-    }
+    return health_sms_env()
 
 
 @app.get("/health/s3")

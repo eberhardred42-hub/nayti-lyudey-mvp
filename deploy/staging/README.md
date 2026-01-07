@@ -25,6 +25,11 @@ cp deploy/staging/.env.staging.example deploy/staging/.env.staging
 - `MINIO_ROOT_PASSWORD`
 - `ADMIN_PHONE_ALLOWLIST`, `ADMIN_PASSWORD_SALT`, `ADMIN_PASSWORD_HASH`
 
+Если хотите реальную отправку OTP по SMS через SMSAero:
+- установите `SMS_PROVIDER=smsaero`
+- заполните `SMSAERO_EMAIL` и `SMSAERO_API_KEY`
+- при необходимости заполните `SMS_SENDER`
+
 По умолчанию `ACME_CA` указывает на Let’s Encrypt **staging**. Для боевого сертификата замените на production directory (и учтите rate limits).
 
 ## 2) Поднять стэк
