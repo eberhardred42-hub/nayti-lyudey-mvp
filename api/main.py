@@ -6,7 +6,8 @@ import random
 import hashlib
 import hmac
 import urllib.request
-from fastapi import FastAPI, Request, HTTPException
+from urllib.parse import urlparse
+from fastapi import FastAPI, Request, HTTPException, Response
 from pydantic import BaseModel
 import uuid
 import redis
@@ -49,6 +50,7 @@ from db import (
     list_artifacts_admin,
     get_artifact_by_id,
 )
+from db import get_legal_offer_acceptance, upsert_legal_offer_acceptance
 from db import (
     create_config_version,
     get_active_config_store,
@@ -69,9 +71,33 @@ from db import (
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
+from sms_client import send_otp_sms, health_sms_env, SmsSendError
 
 app = FastAPI()
 SESSIONS = {}
+
+
+def _offer_markdown_path() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, "static", "legal", "offer.md")
+
+
+def _offer_version_hash() -> str:
+    path = _offer_markdown_path()
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return hashlib.sha256(data).hexdigest()
+    except Exception:
+        # Stable fallback (still non-secret)
+        return "missing"
+
+
+def _require_offer_accepted(*, user_id: str, request_id: str) -> dict:
+    row = get_legal_offer_acceptance(user_id=user_id, request_id=request_id)
+    if not row:
+        raise HTTPException(status_code=412, detail="OFFER_NOT_ACCEPTED")
+    return row
 
 
 # ==========================================================================
@@ -1742,6 +1768,20 @@ def admin_files_download(file_id: str, request: Request):
         _admin_error("FILE_INCOMPLETE", "File record is incomplete", 500)
     expires = 600
     url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
+
+    presign_host = None
+    try:
+        presign_host = (urlparse(url).netloc or "").strip() or None
+    except Exception:
+        presign_host = None
+
+    log_event(
+        "presign_url_issued",
+        request_id=request_id,
+        file_id=file_id,
+        pack_id=row.get("pack_id"),
+        host=presign_host,
+    )
     return {"ok": True, "url": url, "expires_in_sec": expires}
 
 
@@ -1826,6 +1866,14 @@ def auth_otp_request(body: OtpRequest, request: Request):
     # Minimal mock: always generate a code; in real mode we would send SMS.
     code = str(int(time.time()))[-6:].rjust(6, "0")
     OTP_LATEST[phone] = code
+
+    # In mock mode we don't send SMS, but verify still works.
+    if provider != "mock":
+        try:
+            send_otp_sms(phone=phone, code=code, request_id=request_id)
+        except SmsSendError as e:
+            # Do not leak secrets/OTP; return a stable error code.
+            raise HTTPException(status_code=502, detail=e.code)
     log_event(
         "auth_otp_requested",
         request_id=request_id,
@@ -1870,9 +1918,66 @@ def auth_otp_verify(body: OtpVerify, request: Request):
 @app.post("/legal/offer/accept")
 def legal_offer_accept(request: Request):
     request_id = get_request_id_from_request(request)
-    _ = _require_user_id(request)
-    log_event("legal_offer_accepted", request_id=request_id)
-    return {"ok": True}
+    user_id = _require_user_id(request)
+
+    log_event(
+        "offer_accept_clicked",
+        request_id=request_id,
+        user_id=user_id,
+    )
+
+    try:
+        version_hash = _offer_version_hash()
+        row = upsert_legal_offer_acceptance(user_id=user_id, version_hash=version_hash, request_id=request_id)
+        log_event(
+            "offer_accepted_ok",
+            request_id=request_id,
+            user_id=user_id,
+            version_hash=row.get("version_hash"),
+        )
+        return {"ok": True, "accepted_at": to_iso(row.get("accepted_at")), "version_hash": row.get("version_hash")}
+    except Exception as e:
+        log_event(
+            "offer_accept_error",
+            level="error",
+            request_id=request_id,
+            user_id=user_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=500, detail="OFFER_ACCEPT_FAILED")
+
+
+@app.get("/legal/offer")
+def legal_offer_get(request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _get_user_id(request)
+    log_event(
+        "offer_viewed",
+        request_id=request_id,
+        user_id=user_id,
+        version_hash=_offer_version_hash(),
+    )
+    path = _offer_markdown_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    except Exception:
+        raise HTTPException(status_code=500, detail="OFFER_NOT_AVAILABLE")
+    return Response(content=text, media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/legal/offer/status")
+def legal_offer_status(request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    row = get_legal_offer_acceptance(user_id=user_id, request_id=request_id)
+    return {
+        "ok": True,
+        "accepted": bool(row),
+        "accepted_at": to_iso(row.get("accepted_at")) if row else None,
+        "version_hash": row.get("version_hash") if row else None,
+        "current_version_hash": _offer_version_hash(),
+    }
 
 
 def _is_debug_enabled() -> bool:
@@ -2094,15 +2199,55 @@ async def request_id_middleware(request: Request, call_next):
     return response
 
 # Initialize database on startup
+_DB_INIT_OK = False
+_DB_INIT_ERROR: str | None = None
 try:
     init_db()
+    _DB_INIT_OK = True
 except Exception as e:
+    _DB_INIT_OK = False
+    _DB_INIT_ERROR = str(e)
     log_event(
         "db_error",
         level="error",
         route="startup",
         method="system",
         error=str(e),
+    )
+
+
+@app.on_event("startup")
+async def _staging_boot_log():
+    domain = (os.environ.get("DOMAIN") or "").strip() or None
+    llm_provider = (os.environ.get("LLM_PROVIDER") or "").strip().lower() or None
+
+    try:
+        sms = health_sms_env() or {}
+    except Exception as e:
+        sms = {"ok": False, "error": str(e)}
+
+    try:
+        s3 = health_s3_env() or {}
+    except Exception as e:
+        s3 = {"ok": False, "error": str(e)}
+
+    log_event(
+        "staging_boot",
+        route="startup",
+        method="system",
+        debug=_is_debug_enabled(),
+        domain=domain,
+        config_source=CONFIG_SOURCE,
+        db_init_ok=_DB_INIT_OK,
+        db_init_error=_DB_INIT_ERROR,
+        llm_provider=llm_provider,
+        sms_provider=sms.get("provider"),
+        sms_mode=sms.get("mode"),
+        sms_has_key=sms.get("has_key"),
+        s3_ok=s3.get("ok"),
+        s3_bucket=s3.get("bucket"),
+        s3_endpoint_host=s3.get("s3_endpoint_host"),
+        s3_presign_host=s3.get("s3_presign_host"),
     )
 
 class SessionCreate(BaseModel):
@@ -2761,12 +2906,7 @@ def health_llm_endpoint():
 @app.get("/health/sms")
 def health_sms():
     """Check SMS provider configuration (env-only; no network)."""
-    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
-    # We deliberately don't validate credentials here (Stage 9.3.0 baseline).
-    return {
-        "ok": True,
-        "provider": provider,
-    }
+    return health_sms_env()
 
 
 @app.get("/health/s3")
@@ -2787,7 +2927,8 @@ def health_s3(request: Request):
         request_id=request_id,
         ok=payload.get("ok"),
         bucket=payload.get("bucket"),
-        endpoint=payload.get("endpoint"),
+        s3_endpoint_host=payload.get("s3_endpoint_host"),
+        s3_presign_host=payload.get("s3_presign_host"),
         has_credentials=payload.get("has_credentials"),
     )
     return payload
@@ -3241,6 +3382,20 @@ def files_download(file_id: str, request: Request):
     expires = 600
     url = presign_get(bucket=bucket, key=key, expires_sec=expires, request_id=request_id)
 
+    presign_host = None
+    try:
+        presign_host = (urlparse(url).netloc or "").strip() or None
+    except Exception:
+        presign_host = None
+
+    log_event(
+        "presign_url_issued",
+        request_id=request_id,
+        file_id=file_id,
+        pack_id=row.get("pack_id"),
+        host=presign_host,
+    )
+
     log_event(
         "file_presigned",
         request_id=request_id,
@@ -3257,6 +3412,8 @@ def render_jobs_create(body: RenderJobCreateBody, request: Request):
     """Auth-required: create an async render job and enqueue it to Redis."""
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
 
     doc_id = (body.doc_id or "").strip()
     if not doc_id:
@@ -3388,6 +3545,8 @@ def ml_job_mock(body: MlJobCreateBody, request: Request):
     """
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
     session_id = (body.session_id or "").strip()
     if not session_id:
         raise HTTPException(status_code=400, detail="session_id is required")
@@ -3440,6 +3599,8 @@ def me_packs(request: Request):
 def packs_render(pack_id: str, request: Request):
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
 
     pack = get_pack(pack_id, request_id=request_id)
     if not pack:
@@ -3543,6 +3704,8 @@ def packs_render(pack_id: str, request: Request):
 def packs_render_doc(pack_id: str, doc_id: str, request: Request):
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+
+    _require_offer_accepted(user_id=user_id, request_id=request_id)
     pack = get_pack(pack_id, request_id=request_id)
     if not pack:
         raise HTTPException(status_code=404, detail="Pack not found")
@@ -3718,6 +3881,8 @@ async def events_client(request: Request):
 @app.get("/debug/session")
 def debug_session(session_id: str, request: Request):
     """Read-only session debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id, request_id=request_id)
@@ -3746,6 +3911,8 @@ def debug_session(session_id: str, request: Request):
 @app.get("/debug/messages")
 def debug_messages(session_id: str, request: Request, limit: int = 50):
     """Read-only messages debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id, request_id=request_id)
@@ -3775,6 +3942,8 @@ def debug_messages(session_id: str, request: Request, limit: int = 50):
 @app.get("/debug/report/free")
 def debug_report_free(session_id: str, request: Request):
     """Read-only free report debug endpoint."""
+    if not _is_debug_enabled():
+        raise HTTPException(status_code=404, detail="Not found")
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     db_session = get_session(session_id)

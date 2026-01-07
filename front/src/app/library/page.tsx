@@ -55,6 +55,12 @@ async function sendClientEvent(event: string, props?: Record<string, unknown>) {
   }
 }
 
+function errMsg(e: unknown, fallback: string): string {
+  if (e instanceof Error) return e.message || fallback;
+  if (typeof e === "string") return e || fallback;
+  return fallback;
+}
+
 export default function LibraryPage() {
   const [files, setFiles] = useState<FileItem[]>([]);
   const [packs, setPacks] = useState<PackItem[]>([]);
@@ -65,7 +71,79 @@ export default function LibraryPage() {
   const [packLoading, setPackLoading] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
 
+  const [offerAccepted, setOfferAccepted] = useState<boolean | null>(null);
+  const [showOfferModal, setShowOfferModal] = useState(false);
+  const [offerText, setOfferText] = useState<string | null>(null);
+  const [offerLoading, setOfferLoading] = useState(false);
+  const [offerCheckbox, setOfferCheckbox] = useState(false);
+  const [offerError, setOfferError] = useState<string | null>(null);
+
   const userId = useMemo(() => (typeof window !== "undefined" ? getOrCreateUserId() : ""), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadOfferStatus() {
+      try {
+        const r = await fetch("/api/legal/offer/status", {
+          headers: { "X-User-Id": userId },
+        });
+        const data = await r.json();
+        if (!r.ok) throw new Error(data?.detail || "Ошибка проверки оферты");
+        if (!cancelled) setOfferAccepted(Boolean(data?.accepted));
+      } catch {
+        // если не получилось проверить, считаем что не принято
+        if (!cancelled) setOfferAccepted(false);
+      }
+    }
+    if (userId) loadOfferStatus();
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
+
+  async function ensureOfferAccepted(): Promise<boolean> {
+    if (offerAccepted === true) return true;
+    setShowOfferModal(true);
+    return false;
+  }
+
+  async function loadOfferTextIfNeeded() {
+    if (offerText) return;
+    setOfferLoading(true);
+    setOfferError(null);
+    try {
+      const r = await fetch("/api/legal/offer", { headers: { "X-User-Id": userId } });
+      const text = await r.text();
+      if (!r.ok) throw new Error("Не удалось загрузить оферту");
+      setOfferText(text);
+      sendClientEvent("offer_viewed");
+    } catch (e: unknown) {
+      setOfferError(errMsg(e, "Ошибка"));
+    } finally {
+      setOfferLoading(false);
+    }
+  }
+
+  async function acceptOffer() {
+    setOfferError(null);
+    sendClientEvent("offer_accept_clicked");
+    try {
+      const r = await fetch("/api/legal/offer/accept", {
+        method: "POST",
+        headers: { "X-User-Id": userId },
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data?.detail || "Ошибка принятия оферты");
+      setOfferAccepted(true);
+      setShowOfferModal(false);
+      setOfferCheckbox(false);
+      sendClientEvent("offer_accepted_ok");
+    } catch (e: unknown) {
+      const msg = errMsg(e, "Ошибка");
+      setOfferError(msg);
+      sendClientEvent("offer_accept_error", { error: msg });
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
@@ -153,6 +231,7 @@ export default function LibraryPage() {
 
   async function renderPack(packId: string) {
     if (!packId) return;
+    if (!(await ensureOfferAccepted())) return;
     sendClientEvent("ui_render_pack_clicked", { pack_id: packId });
     setPackLoading(true);
     setPackError(null);
@@ -165,15 +244,17 @@ export default function LibraryPage() {
       if (!r.ok) throw new Error(data?.detail || "Ошибка запуска рендера");
       sendClientEvent("ui_render_pack_ok", { pack_id: packId, jobs_created: data.jobs_created, jobs_skipped: data.jobs_skipped });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      const msg = errMsg(e, "Ошибка");
+      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: msg });
+      setPackError(msg);
     } finally {
       setPackLoading(false);
     }
   }
 
   async function regenerateDoc(packId: string, docId: string) {
+    if (!(await ensureOfferAccepted())) return;
     sendClientEvent("ui_render_doc_regenerate_clicked", { pack_id: packId, doc_id: docId });
     setPackLoading(true);
     setPackError(null);
@@ -186,9 +267,10 @@ export default function LibraryPage() {
       if (!r.ok) throw new Error(data?.detail || "Ошибка регенерации документа");
       sendClientEvent("ui_render_doc_regenerate_ok", { pack_id: packId, doc_id: docId, job_id: data.job_id });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      const msg = errMsg(e, "Ошибка");
+      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: msg });
+      setPackError(msg);
     } finally {
       setPackLoading(false);
     }
@@ -206,9 +288,10 @@ export default function LibraryPage() {
       if (data?.url) {
         window.location.href = data.url;
       }
-    } catch (e: any) {
-      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: e?.message || "error" });
-      setError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      const msg = errMsg(e, "Ошибка");
+      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: msg });
+      setError(msg);
     }
   }
 
@@ -338,6 +421,81 @@ export default function LibraryPage() {
           </div>
         )}
       </section>
+
+      {showOfferModal && (
+        <div
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.5)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+            zIndex: 50,
+          }}
+        >
+          <div style={{ background: "white", maxWidth: 800, width: "100%", padding: 16, borderRadius: 8 }}>
+            <h3 style={{ marginTop: 0 }}>Оферта</h3>
+            <p style={{ marginTop: 0 }}>
+              Перед генерацией документов нужно прочитать и принять оферту.
+            </p>
+
+            <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
+              <button
+                onClick={async () => {
+                  await loadOfferTextIfNeeded();
+                }}
+              >
+                Прочитать оферту
+              </button>
+
+              <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  checked={offerCheckbox}
+                  onChange={(e) => setOfferCheckbox(e.target.checked)}
+                />
+                <span>Я согласен</span>
+              </label>
+            </div>
+
+            {offerLoading && <div style={{ marginTop: 12 }}>Загружаю текст…</div>}
+            {offerError && <div style={{ marginTop: 12, color: "crimson" }}>{offerError}</div>}
+
+            {offerText && (
+              <div
+                style={{
+                  marginTop: 12,
+                  border: "1px solid #ddd",
+                  borderRadius: 6,
+                  padding: 12,
+                  maxHeight: 320,
+                  overflow: "auto",
+                  whiteSpace: "pre-wrap",
+                  fontSize: 14,
+                }}
+              >
+                {offerText}
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 12, justifyContent: "flex-end", marginTop: 16 }}>
+              <button
+                onClick={() => {
+                  setShowOfferModal(false);
+                  setOfferCheckbox(false);
+                }}
+              >
+                Закрыть
+              </button>
+              <button disabled={!offerCheckbox} onClick={acceptOffer}>
+                Принять
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

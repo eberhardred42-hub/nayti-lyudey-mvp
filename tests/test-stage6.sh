@@ -35,7 +35,7 @@ wait_url() {
 
 step "Starting services (docker compose)"
 if command -v docker >/dev/null 2>&1; then
-  $COMPOSE up -d --build
+  env DEBUG=1 $COMPOSE up -d --build
 else
   echo "docker not found, assuming services already running"
 fi
