@@ -54,6 +54,12 @@ from db import (
     set_config_validation,
     update_config_payload,
 )
+from db import (
+    get_document_access_map,
+    get_document_metadata_map,
+    upsert_document_access,
+    upsert_document_metadata,
+)
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
@@ -206,6 +212,16 @@ def _admin_session_ttl_hours() -> int:
         return v if v > 0 else 12
     except Exception:
         return 12
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if not s:
+        return default
+    return s in {"1", "true", "yes", "y", "on"}
 
 
 def _pbkdf2_hex(value: str, salt: str, iterations: int = 100_000) -> str:
@@ -1094,6 +1110,164 @@ def _admin_error(code: str, message: str, status_code: int):
     )
 
 
+class AdminDocumentMetadataBody(BaseModel):
+    title: Optional[str] = None
+    description: Optional[str] = None
+
+
+class AdminDocumentAccessBody(BaseModel):
+    enabled: bool
+    tier: str
+
+
+@app.get("/admin/documents")
+def admin_documents_list(request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+    docs = _load_documents_registry(request_id=request_id)
+    doc_ids = [str(d.get("doc_id") or "").strip() for d in docs if str(d.get("doc_id") or "").strip()]
+
+    meta_map = get_document_metadata_map(doc_ids, request_id=request_id)
+    access_map = get_document_access_map(doc_ids, request_id=request_id)
+
+    items: list[dict] = []
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        meta_row = meta_map.get(doc_id)
+        access_row = access_map.get(doc_id)
+        items.append(
+            {
+                "doc_id": doc_id,
+                "title": _effective_doc_title(d, meta_row),
+                "description": (meta_row or {}).get("description") if isinstance(meta_row, dict) else None,
+                "registry": {
+                    "title": _doc_title(d),
+                    "is_enabled": bool(d.get("is_enabled")) if d.get("is_enabled") is not None else True,
+                },
+                "metadata": {
+                    "title": (meta_row or {}).get("title") if isinstance(meta_row, dict) else None,
+                    "description": (meta_row or {}).get("description") if isinstance(meta_row, dict) else None,
+                },
+                "access": {
+                    "enabled": bool((access_row or {}).get("enabled")) if isinstance(access_row, dict) and access_row.get("enabled") is not None else None,
+                    "tier": (access_row or {}).get("tier") if isinstance(access_row, dict) else None,
+                    "effective": _doc_access_info(d, access_row),
+                },
+            }
+        )
+
+    return {"ok": True, "items": items}
+
+
+@app.post("/admin/documents/{doc_id}/metadata")
+def admin_document_metadata_update(doc_id: str, body: AdminDocumentMetadataBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        _admin_error("BAD_REQUEST", "doc_id is required", 400)
+
+    docs = _load_documents_registry(request_id=request_id)
+    registry_doc = None
+    for d in docs:
+        if str(d.get("doc_id") or "").strip() == doc_id:
+            registry_doc = d
+            break
+    if not registry_doc:
+        _admin_error("DOC_NOT_FOUND", "Document not found in registry", 404)
+
+    before = get_document_metadata_map([doc_id], request_id=request_id).get(doc_id)
+
+    title = body.title
+    if title is not None:
+        title = str(title)
+        if not title.strip():
+            title = None
+
+    description = body.description
+    if description is not None:
+        description = str(description)
+        if not description.strip():
+            description = None
+
+    row = upsert_document_metadata(
+        doc_id=doc_id,
+        title=title,
+        description=description,
+        updated_by_user_id=admin_user_id or None,
+        request_id=request_id,
+    )
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="document_metadata_update",
+        target_type="document",
+        target_id=doc_id,
+        before_obj=before,
+        after_obj=row,
+        summary=None,
+    )
+
+    return {"ok": True, "doc_id": doc_id, "metadata": row}
+
+
+@app.post("/admin/documents/{doc_id}/access")
+def admin_document_access_update(doc_id: str, body: AdminDocumentAccessBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        _admin_error("BAD_REQUEST", "doc_id is required", 400)
+
+    tier = str(body.tier or "").strip().lower()
+    if tier not in {"free", "paid"}:
+        _admin_error("INVALID_TIER", "tier must be free|paid", 400)
+
+    docs = _load_documents_registry(request_id=request_id)
+    registry_doc = None
+    for d in docs:
+        if str(d.get("doc_id") or "").strip() == doc_id:
+            registry_doc = d
+            break
+    if not registry_doc:
+        _admin_error("DOC_NOT_FOUND", "Document not found in registry", 404)
+
+    before = get_document_access_map([doc_id], request_id=request_id).get(doc_id)
+
+    row = upsert_document_access(
+        doc_id=doc_id,
+        enabled=bool(body.enabled),
+        tier=tier,
+        updated_by_user_id=admin_user_id or None,
+        request_id=request_id,
+    )
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="document_access_update",
+        target_type="document",
+        target_id=doc_id,
+        before_obj=before,
+        after_obj=row,
+        summary=None,
+    )
+
+    # For response: effective without registry context (fallback tier=free)
+    return {"ok": True, "doc_id": doc_id, "access": row, "effective": _doc_access_info({"doc_id": doc_id}, row)}
+
+
 @app.get("/admin/render-jobs")
 def admin_render_jobs_list(
     status: str = "",
@@ -1599,6 +1773,62 @@ def _load_documents_registry(request_id: str = "unknown") -> list[dict]:
 def _doc_title(doc: dict) -> str:
     t = doc.get("title")
     return str(t) if t else str(doc.get("doc_id") or "document")
+
+
+def _effective_doc_title(doc: dict, meta_row: dict | None) -> str:
+    if meta_row and isinstance(meta_row, dict):
+        t = meta_row.get("title")
+        if t is not None and str(t).strip():
+            return str(t)
+    return _doc_title(doc)
+
+
+def _effective_doc_enabled(doc: dict, access_row: dict | None) -> bool:
+    # DB overlay wins. If no DB row, keep registry behavior (default True).
+    if access_row and isinstance(access_row, dict):
+        v = access_row.get("enabled")
+        if v is not None:
+            return bool(v)
+    v = doc.get("is_enabled")
+    if v is None:
+        return True
+    return bool(v)
+
+
+def _doc_access_info(doc: dict, access_row: dict | None) -> dict:
+    # Tier defaults to registry, DB overlay wins.
+    tier = "free"
+    enabled = True
+
+    t0 = str((doc or {}).get("tier") or "").strip().lower()
+    if t0 in {"free", "paid"}:
+        tier = t0
+
+    if access_row and isinstance(access_row, dict):
+        t = str(access_row.get("tier") or "").strip().lower()
+        if t in {"free", "paid"}:
+            tier = t
+        if access_row.get("enabled") is not None:
+            enabled = bool(access_row.get("enabled"))
+
+    force_all_free = _env_bool("DOCS_FORCE_ALL_FREE", False)
+    paid_visible = _env_bool("PAID_DOCS_VISIBLE", True)
+
+    eff_tier = "free" if force_all_free else tier
+    is_locked = False
+    reason: str | None = None
+    if not enabled:
+        reason = "DISABLED"
+    elif eff_tier == "paid" and not force_all_free:
+        is_locked = True
+        reason = "PAID_DOCS_HIDDEN" if not paid_visible else "PAID_DOCS_LOCKED"
+
+    return {
+        "tier": eff_tier,
+        "enabled": bool(enabled),
+        "is_locked": bool(is_locked),
+        "reason": reason,
+    }
 
 
 def _build_render_request(doc_id: str, title: str, pack_id: str, session_id: str) -> dict:
@@ -3039,7 +3269,17 @@ def packs_render(pack_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     session_id = str(pack.get("session_id") or "")
-    docs = [d for d in _load_documents_registry(request_id=request_id) if bool(d.get("is_enabled"))]
+    docs_all = _load_documents_registry(request_id=request_id)
+    doc_ids = [str(d.get("doc_id") or "").strip() for d in docs_all if str(d.get("doc_id") or "").strip()]
+    access_map = get_document_access_map(doc_ids, request_id=request_id)
+    meta_map = get_document_metadata_map(doc_ids, request_id=request_id)
+    docs = []
+    for d in docs_all:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        if _effective_doc_enabled(d, access_map.get(doc_id)):
+            docs.append(d)
     if not docs:
         raise HTTPException(status_code=500, detail="Documents registry is empty")
 
@@ -3091,7 +3331,7 @@ def packs_render(pack_id: str, request: Request):
 
         render_request = _build_render_request(
             doc_id=doc_id,
-            title=_doc_title(d),
+            title=_effective_doc_title(d, meta_map.get(doc_id)),
             pack_id=pack_id,
             session_id=session_id,
         )
@@ -3142,6 +3382,19 @@ def packs_render_doc(pack_id: str, doc_id: str, request: Request):
         doc_id=doc_id,
     )
 
+    docs = _load_documents_registry(request_id=request_id)
+    registry_doc = None
+    for d in docs:
+        if str(d.get("doc_id") or "").strip() == doc_id:
+            registry_doc = d
+            break
+    if not registry_doc:
+        raise HTTPException(status_code=404, detail="Doc not found")
+
+    access_row = get_document_access_map([doc_id], request_id=request_id).get(doc_id)
+    if not _effective_doc_enabled(registry_doc, access_row):
+        raise HTTPException(status_code=400, detail="DOCUMENT_DISABLED")
+
     job = create_render_job(
         pack_id=pack_id,
         session_id=session_id,
@@ -3163,12 +3416,8 @@ def packs_render_doc(pack_id: str, doc_id: str, request: Request):
         request_id=request_id,
     )
 
-    docs = _load_documents_registry(request_id=request_id)
-    title = doc_id
-    for d in docs:
-        if str(d.get("doc_id")) == doc_id:
-            title = _doc_title(d)
-            break
+    meta_row = get_document_metadata_map([doc_id], request_id=request_id).get(doc_id)
+    title = _effective_doc_title(registry_doc, meta_row)
 
     render_request = _build_render_request(
         doc_id=doc_id,
@@ -3209,7 +3458,17 @@ def packs_documents(pack_id: str, request: Request):
     if owner and owner != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    docs = [d for d in _load_documents_registry(request_id=request_id) if bool(d.get("is_enabled"))]
+    docs_all = _load_documents_registry(request_id=request_id)
+    doc_ids = [str(d.get("doc_id") or "").strip() for d in docs_all if str(d.get("doc_id") or "").strip()]
+    access_map = get_document_access_map(doc_ids, request_id=request_id)
+    meta_map = get_document_metadata_map(doc_ids, request_id=request_id)
+    docs = []
+    for d in docs_all:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        if _effective_doc_enabled(d, access_map.get(doc_id)):
+            docs.append(d)
     latest_jobs = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
     by_doc = {str(j.get("doc_id")): j for j in latest_jobs}
 
@@ -3219,6 +3478,7 @@ def packs_documents(pack_id: str, request: Request):
         if not doc_id:
             continue
         j = by_doc.get(doc_id)
+        access_info = _doc_access_info(d, access_map.get(doc_id))
         status = "queued" if j else "queued"
         file_id = None
         attempts = 0
@@ -3232,11 +3492,12 @@ def packs_documents(pack_id: str, request: Request):
         out.append(
             {
                 "doc_id": doc_id,
-                "title": _doc_title(d),
+                "title": _effective_doc_title(d, meta_map.get(doc_id)),
                 "status": status,
                 "file_id": file_id,
                 "attempts": attempts,
                 "last_error": last_error,
+                "access": access_info,
             }
         )
 

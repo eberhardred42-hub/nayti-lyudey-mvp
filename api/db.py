@@ -305,6 +305,55 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_config_store_key_version
             ON config_store(key, version)
         """)
+
+        # Stage 9.4.x: document metadata + access control overlays.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_metadata (
+                doc_id TEXT PRIMARY KEY,
+                title TEXT NULL,
+                description TEXT NULL,
+                updated_by_user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_access (
+                doc_id TEXT PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                tier TEXT NOT NULL DEFAULT 'free' CHECK (tier IN ('free', 'paid')),
+                updated_by_user_id UUID NULL REFERENCES users(id) ON DELETE SET NULL,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        # Forward-compatible ALTERs for older DBs.
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS title TEXT""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS description TEXT""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS updated_by_user_id UUID""")
+        cur.execute("""ALTER TABLE document_metadata ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ""")
+
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS enabled BOOLEAN""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS tier TEXT""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS updated_by_user_id UUID""")
+        cur.execute("""ALTER TABLE document_access ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ""")
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_metadata_updated
+            ON document_metadata(updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_access_updated
+            ON document_access(updated_at)
+            """
+        )
         
         conn.commit()
 
@@ -2251,6 +2300,219 @@ def publish_config_version(key: str, version: int, request_id: str = "unknown") 
                 "db_query_error",
                 level="error",
                 query_name="publish_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Document metadata/access overlays (Admin)
+# ==========================================================================
+
+
+def get_document_metadata_map(
+    doc_ids: List[str],
+    request_id: str = "unknown",
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch metadata rows for the given doc_ids. Returns {doc_id: row}."""
+    clean = [str(d or "").strip() for d in (doc_ids or []) if str(d or "").strip()]
+    if not clean:
+        return {}
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_metadata_map",
+        request_id=request_id,
+        docs_count=len(clean),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT doc_id, title, description, updated_by_user_id, updated_at
+                FROM document_metadata
+                WHERE doc_id = ANY(%s)
+                """,
+                (clean,),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_metadata_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            out: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                out[str(r.get("doc_id"))] = dict(r)
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_metadata_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_document_access_map(
+    doc_ids: List[str],
+    request_id: str = "unknown",
+) -> Dict[str, Dict[str, Any]]:
+    """Fetch access rows for the given doc_ids. Returns {doc_id: row}."""
+    clean = [str(d or "").strip() for d in (doc_ids or []) if str(d or "").strip()]
+    if not clean:
+        return {}
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_access_map",
+        request_id=request_id,
+        docs_count=len(clean),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT doc_id, enabled, tier, updated_by_user_id, updated_at
+                FROM document_access
+                WHERE doc_id = ANY(%s)
+                """,
+                (clean,),
+            )
+            rows = cur.fetchall() or []
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_access_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            out: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                out[str(r.get("doc_id"))] = dict(r)
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_access_map",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def upsert_document_metadata(
+    *,
+    doc_id: str,
+    title: Optional[str],
+    description: Optional[str],
+    updated_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    doc_id = str(doc_id or "").strip()
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="upsert_document_metadata",
+        request_id=request_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO document_metadata (doc_id, title, description, updated_by_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (doc_id) DO UPDATE
+                SET title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    updated_at = now()
+                RETURNING doc_id, title, description, updated_by_user_id, updated_at
+                """,
+                (doc_id, title, description, updated_by_user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="upsert_document_metadata",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="upsert_document_metadata",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def upsert_document_access(
+    *,
+    doc_id: str,
+    enabled: bool,
+    tier: str,
+    updated_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    doc_id = str(doc_id or "").strip()
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="upsert_document_access",
+        request_id=request_id,
+        doc_id=doc_id,
+        enabled=bool(enabled),
+        tier=str(tier or ""),
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO document_access (doc_id, enabled, tier, updated_by_user_id, updated_at)
+                VALUES (%s, %s, %s, %s, now())
+                ON CONFLICT (doc_id) DO UPDATE
+                SET enabled = EXCLUDED.enabled,
+                    tier = EXCLUDED.tier,
+                    updated_by_user_id = EXCLUDED.updated_by_user_id,
+                    updated_at = now()
+                RETURNING doc_id, enabled, tier, updated_by_user_id, updated_at
+                """,
+                (doc_id, bool(enabled), str(tier or "free"), updated_by_user_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="upsert_document_access",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="upsert_document_access",
                 request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),

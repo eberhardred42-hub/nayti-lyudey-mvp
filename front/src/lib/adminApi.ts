@@ -39,6 +39,10 @@ function friendlyAdminError(codeOrDetail?: string): string {
       return "Нельзя публиковать: сначала Validate";
     case "NO_ROLLBACK":
       return "Нет предыдущей valid версии для rollback";
+    case "DOC_NOT_FOUND":
+      return "Документ не найден";
+    case "INVALID_TIER":
+      return "tier должен быть free или paid";
     default:
       return "Ошибка админки";
   }
@@ -190,4 +194,27 @@ export async function adminConfigPublish(key: string, version: number) {
 
 export async function adminConfigRollback(key: string) {
   return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/rollback`, { method: "POST" });
+}
+
+export async function adminDocumentsList() {
+  return adminFetch("/api/admin/documents", { method: "GET" });
+}
+
+export async function adminDocumentUpdateMetadata(
+  docId: string,
+  payload: { title?: string | null; description?: string | null }
+) {
+  return adminFetch(`/api/admin/documents/${encodeURIComponent(docId)}/metadata`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function adminDocumentUpdateAccess(docId: string, payload: { enabled: boolean; tier: string }) {
+  return adminFetch(`/api/admin/documents/${encodeURIComponent(docId)}/access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 }
