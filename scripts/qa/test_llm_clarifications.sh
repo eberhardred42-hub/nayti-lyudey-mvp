@@ -20,15 +20,7 @@ fi
 
 step "Create session"
 SESSION_JSON="$(curl -sS -X POST -H "Content-Type: application/json" -d '{"profession_query":"stage7 llm"}' "$BASE_URL/sessions")"
-SESSION_ID="$(echo "$SESSION_JSON" | python3 - <<'PY'
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    print(d.get('session_id','') or '')
-except Exception:
-    print('')
-PY
-)"
+SESSION_ID="$(echo "$SESSION_JSON" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("session_id") or "").strip())' 2>/dev/null || true)"
 
 if [[ -z "$SESSION_ID" ]]; then
   echo "[error] Session creation failed"
@@ -57,19 +49,19 @@ CLAR_RESPONSE="$(curl -sS -X POST -H "Content-Type: application/json" \
   "$BASE_URL/chat/message")"
 
 step "Validate clarifications contain questions and quick replies"
-echo "$CLAR_RESPONSE" | python3 - <<'PY'
+echo "$CLAR_RESPONSE" | python3 -c '
 import json,sys
 payload=json.load(sys.stdin)
-qs=payload.get('clarifying_questions') or []
-qr=payload.get('quick_replies') or []
+qs=payload.get("clarifying_questions") or []
+qr=payload.get("quick_replies") or []
 if not qs:
-    sys.exit('clarifying_questions missing')
+  sys.exit("clarifying_questions missing")
 if not qr:
-    sys.exit('quick_replies missing')
-keywords=['город','формат','бюджет','занятость']
-if not any(any(k in (q or '').lower() for k in keywords) for q in qs):
-    sys.exit('questions missing expected topics')
-print('clarifications OK')
-PY
+  sys.exit("quick_replies missing")
+keywords=["город","формат","бюджет","занятость"]
+if not any(any(k in (q or "").lower() for k in keywords) for q in qs):
+  sys.exit("questions missing expected topics")
+print("clarifications OK")
+'
 
 echo "OK"

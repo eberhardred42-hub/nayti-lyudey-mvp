@@ -1831,6 +1831,10 @@ def auth_otp_request(body: OtpRequest, request: Request):
         request_id=request_id,
         provider=provider,
     )
+    # In mock mode, return code to enable smoke tests without relying on
+    # DEBUG-only endpoints.
+    if provider == "mock":
+        return {"ok": True, "code": code}
     return {"ok": True}
 
 
@@ -2598,7 +2602,12 @@ def chat_message(body: ChatMessage, request: Request):
             )
         
         log_reply(state=session["state"])
-        return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
+        return {
+            "reply": reply,
+            "quick_replies": quick_replies,
+            "clarifying_questions": clarifying_questions,
+            "should_show_free_result": False,
+        }
 
     if state == "awaiting_tasks":
         session["tasks"] = text

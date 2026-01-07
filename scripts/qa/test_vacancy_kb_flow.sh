@@ -17,15 +17,7 @@ step() {
 
 step "Create session"
 response="$(curl -sS -X POST "$BACKEND_URL/sessions" -H "Content-Type: application/json" -d '{"profession_query":"Senior Engineer"}')"
-session_id="$(echo "$response" | python3 - <<'PY'
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    print(d.get('session_id','') or '')
-except Exception:
-    print('')
-PY
-)"
+session_id="$(echo "$response" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("session_id") or "").strip())' 2>/dev/null || true)"
 
 if [[ -z "$session_id" ]]; then
   echo "[error] Failed to create session"

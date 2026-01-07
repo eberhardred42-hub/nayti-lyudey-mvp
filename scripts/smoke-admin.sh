@@ -84,12 +84,16 @@ curl -sf "$BASE_URL/health/s3" >/dev/null || fail "/health/s3"
 
 echo "[smoke-admin] auth (mock OTP)"
 
-curl -sf -X POST "$BASE_URL/auth/otp/request" \
+OTP_JSON=$(curl_json -X POST "$BASE_URL/auth/otp/request" \
   -H 'Content-Type: application/json' \
-  --data "{\"phone\":\"$PHONE\"}" >/dev/null || fail "otp request"
+  --data "{\"phone\":\"$PHONE\"}") || fail "otp request"
 
-CODE=$(curl_json "$BASE_URL/debug/otp/latest?phone=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$PHONE")" | \
-  python3 -c 'import sys,json; print(json.load(sys.stdin)["code"])') || fail "otp latest"
+CODE=$(python3 -c 'import sys,json; print((json.load(sys.stdin) or {}).get("code") or "")' <<<"$OTP_JSON")
+
+if [[ -z "${CODE:-}" ]]; then
+  CODE=$(curl_json "$BASE_URL/debug/otp/latest?phone=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$PHONE")" | \
+    python3 -c 'import sys,json; print(json.load(sys.stdin)["code"])') || fail "otp latest"
+fi
 
 CODE=${CODE:-}
 if [[ -z "$CODE" ]]; then
@@ -229,7 +233,7 @@ if [[ -z "${DOWNLOAD_URL:-}" ]]; then
   fail "download URL missing"
 fi
 
-MAGIC=$(curl -sfL "$DOWNLOAD_URL" | head -c 4)
+MAGIC=$(curl -sfL --range 0-3 "$DOWNLOAD_URL")
 if [[ "$MAGIC" != "%PDF" ]]; then
   fail "downloaded content is not a PDF (magic=$MAGIC)"
 fi

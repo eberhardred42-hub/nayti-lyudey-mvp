@@ -36,15 +36,7 @@ done
 
 step "Create session"
 resp="$(curl -sS -X POST "$BACKEND_URL/sessions" -H "Content-Type: application/json" -d '{"profession_query":"Senior Python Developer"}')"
-SESSION_ID="$(echo "$resp" | python3 - <<'PY'
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    print(d.get('session_id','') or '')
-except Exception:
-    print('')
-PY
-)"
+SESSION_ID="$(echo "$resp" | python3 -c 'import json,sys; d=json.load(sys.stdin); print((d.get("session_id") or "").strip())' 2>/dev/null || true)"
 if [[ -z "$SESSION_ID" ]]; then
   echo "[error] Failed to create session"
   echo "$resp"
