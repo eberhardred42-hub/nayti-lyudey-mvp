@@ -5,6 +5,7 @@ import secrets
 import random
 import hashlib
 import hmac
+import urllib.request
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 import uuid
@@ -12,6 +13,7 @@ import redis
 import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from alerts import send_alert
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
@@ -41,12 +43,133 @@ from db import (
     create_admin_audit_log,
     list_admin_audit_log,
 )
+from db import (
+    create_config_version,
+    get_active_config_store,
+    get_config_version,
+    get_latest_inactive_version,
+    get_previous_valid_version,
+    list_config_versions,
+    publish_config_version,
+    set_config_validation,
+    update_config_payload,
+)
 from llm_client import generate_questions_and_quick_replies, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
 
 app = FastAPI()
 SESSIONS = {}
+
+
+# ==========================================================================
+# Config resolver (file/db) with 30s cache + fallback + alert
+# ==========================================================================
+
+
+CONFIG_SOURCE = (os.environ.get("CONFIG_SOURCE") or "file").strip().lower() or "file"
+CONFIG_CACHE_TTL_SEC = 30.0
+
+# key -> {expires_at: float, payload: object, meta: dict}
+_CONFIG_CACHE: dict[str, dict] = {}
+
+
+def _config_cache_get(key: str) -> tuple[object | None, dict | None]:
+    rec = _CONFIG_CACHE.get(key)
+    if not rec:
+        return None, None
+    try:
+        if time.time() >= float(rec.get("expires_at") or 0):
+            return None, None
+    except Exception:
+        return None, None
+    return rec.get("payload"), (rec.get("meta") or {})
+
+
+def _config_cache_set(key: str, payload: object, meta: dict) -> None:
+    _CONFIG_CACHE[key] = {
+        "expires_at": time.time() + CONFIG_CACHE_TTL_SEC,
+        "payload": payload,
+        "meta": meta,
+    }
+
+
+def _stable_hash(obj: object) -> str:
+    raw = json.dumps(obj, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+SUPPORTED_CONFIG_KEYS = ["documents_registry", "blueprint", "resources"]
+
+
+def _load_file_config(key: str) -> object:
+    # file sources are minimal for now; documents_registry is backed by api/documents.v1.json
+    if key == "documents_registry":
+        here = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(here, "documents.v1.json")
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    # Other keys have no file backing yet.
+    return {}
+
+
+def resolve_config(key: str, request_id: str) -> tuple[object, dict]:
+    cached_payload, cached_meta = _config_cache_get(key)
+    if cached_payload is not None and cached_meta is not None:
+        return cached_payload, cached_meta
+
+    # Default: file
+    if CONFIG_SOURCE != "db":
+        payload = _load_file_config(key)
+        meta = {"source": "file", "version": 0, "hash": _stable_hash(payload)}
+        _config_cache_set(key, payload, meta)
+        return payload, meta
+
+    # DB source: use active valid config, else fallback
+    try:
+        row = get_active_config_store(key, request_id=request_id)
+    except Exception as e:
+        row = None
+        log_event(
+            "config_db_error",
+            level="error",
+            request_id=request_id,
+            key=key,
+            error=str(e),
+        )
+
+    if row and str(row.get("validation_status") or "").lower() == "valid":
+        payload = row.get("payload_json")
+        meta = {
+            "source": "db",
+            "version": int(row.get("version") or 0),
+            "hash": _stable_hash(payload),
+        }
+        _config_cache_set(key, payload, meta)
+        return payload, meta
+
+    # Fallback
+    payload = _load_file_config(key)
+    reason = "missing_active" if not row else f"status_{row.get('validation_status')}"
+    log_event(
+        "bad_config_fallback",
+        level="warning",
+        request_id=request_id,
+        key=key,
+        reason=reason,
+    )
+    try:
+        send_alert(
+            severity="warning",
+            event="bad_config_fallback",
+            request_id=request_id,
+            context={"key": key, "reason": reason},
+        )
+    except Exception:
+        pass
+    meta = {"source": "file", "version": 0, "hash": _stable_hash(payload), "fallback": True, "reason": reason}
+    _config_cache_set(key, payload, meta)
+    return payload, meta
 
 
 # ==========================================================================
@@ -408,6 +531,562 @@ def admin_audit(limit: int = 50, action: str = "", target_type: str = "", reques
     return {"ok": True, "items": rows}
 
 
+def _normalize_validation_errors(errors: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for e in errors or []:
+        if not isinstance(e, dict):
+            continue
+        out.append(
+            {
+                "code": str(e.get("code") or "INVALID").strip() or "INVALID",
+                "path": str(e.get("path") or "$").strip() or "$",
+                "message": str(e.get("message") or "").strip() or "Invalid",
+            }
+        )
+    return out
+
+
+def _validate_documents_registry(payload: object) -> tuple[str, list[dict]]:
+    errors: list[dict] = []
+    if not isinstance(payload, dict):
+        return "invalid", [{"code": "TYPE", "path": "$", "message": "Expected object"}]
+    docs = payload.get("documents")
+    if not isinstance(docs, list):
+        return "invalid", [{"code": "REQUIRED", "path": "$.documents", "message": "documents must be a list"}]
+
+    seen: set[str] = set()
+    for i, d in enumerate(docs):
+        p = f"$.documents[{i}]"
+        if not isinstance(d, dict):
+            errors.append({"code": "TYPE", "path": p, "message": "Expected object"})
+            continue
+        doc_id = (d.get("doc_id") or "").strip()
+        if not doc_id:
+            errors.append({"code": "REQUIRED", "path": p + ".doc_id", "message": "doc_id is required"})
+        else:
+            if doc_id in seen:
+                errors.append({"code": "DUPLICATE", "path": p + ".doc_id", "message": "doc_id must be unique"})
+            seen.add(doc_id)
+        title = d.get("title")
+        if title is None or not str(title).strip():
+            errors.append({"code": "REQUIRED", "path": p + ".title", "message": "title is required"})
+        is_enabled = d.get("is_enabled")
+        if not isinstance(is_enabled, bool):
+            errors.append({"code": "TYPE", "path": p + ".is_enabled", "message": "is_enabled must be boolean"})
+
+    return ("valid" if not errors else "invalid"), errors
+
+
+def _validate_config_payload(key: str, payload: object) -> tuple[str, list[dict]]:
+    # Allow storing invalid JSON drafts by keeping raw text inside payload.
+    # When present, validation must fail with a parse error.
+    if isinstance(payload, dict) and "__invalid_json__" in payload:
+        raw = payload.get("__invalid_json__")
+        msg = "Invalid JSON"
+        if isinstance(raw, str) and raw.strip():
+            # Keep message short; raw text is stored for editing via admin UI.
+            msg = "Invalid JSON (cannot parse)"
+        return "invalid", [{"code": "JSON_PARSE_ERROR", "path": "$", "message": msg}]
+    if key == "documents_registry":
+        return _validate_documents_registry(payload)
+    if key in {"blueprint", "resources"}:
+        if isinstance(payload, dict):
+            return "valid", []
+        return "invalid", [{"code": "TYPE", "path": "$", "message": "Expected object"}]
+    return "invalid", [{"code": "UNSUPPORTED_KEY", "path": "$", "message": "Unsupported key"}]
+
+
+def _config_snapshot(request_id: str) -> dict:
+    active_versions: dict[str, int] = {}
+    hashes: dict[str, str] = {}
+    sources: set[str] = set()
+    for k in SUPPORTED_CONFIG_KEYS:
+        payload, meta = resolve_config(k, request_id=request_id)
+        try:
+            v = int(meta.get("version") or 0)
+        except Exception:
+            v = 0
+        active_versions[k] = v
+        hashes[k] = str(meta.get("hash") or "")
+        sources.add(str(meta.get("source") or "file"))
+
+    source = "db" if (sources == {"db"}) else "file"
+    return {"source": source, "active_versions": active_versions, "hashes": hashes}
+
+
+def _record_config_snapshot_artifact(
+    *,
+    session_id: str,
+    pack_id: str,
+    doc_id: str,
+    render_job_id: str,
+    request_id: str,
+):
+    try:
+        snap = _config_snapshot(request_id=request_id)
+        create_artifact(
+            session_id=session_id,
+            kind="config_snapshot",
+            format="json",
+            payload_json=snap,
+            meta={"pack_id": pack_id, "doc_id": doc_id, "render_job_id": render_job_id},
+            request_id=request_id,
+        )
+    except Exception:
+        pass
+
+
+RENDER_DRYRUN_URL = (os.environ.get("RENDER_URL") or "").strip() or "http://localhost:8002"
+
+
+def _http_post_json_bytes(url: str, payload: dict, timeout_sec: float = 10.0) -> tuple[bool, bytes | None, str | None]:
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+            status = getattr(resp, "status", None)
+            body = resp.read()
+            if status != 200:
+                return False, None, f"http_{status}"
+            return True, body, None
+    except Exception as e:
+        return False, None, str(e)
+
+
+@app.get("/admin/config/keys")
+def admin_config_keys(request: Request):
+    _ = _require_admin(request)
+    return {"ok": True, "keys": SUPPORTED_CONFIG_KEYS}
+
+
+@app.get("/admin/config/{key}/versions")
+def admin_config_versions(key: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+    rows = list_config_versions(key, request_id=request_id)
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": str(r.get("id")),
+                "key": str(r.get("key")),
+                "version": int(r.get("version") or 0),
+                "is_active": bool(r.get("is_active")),
+                "validation_status": str(r.get("validation_status") or "draft"),
+                "validation_errors": r.get("validation_errors") or [],
+                "comment": r.get("comment"),
+                "created_at": to_iso(r.get("created_at")),
+            }
+        )
+    return {"ok": True, "items": items}
+
+
+@app.get("/admin/config/{key}/versions/{version}")
+def admin_config_get(key: str, version: int, request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+    row = get_config_version(key, int(version), request_id=request_id)
+    if not row:
+        _admin_error("VERSION_NOT_FOUND", "Version not found", 404)
+
+    payload_json = row.get("payload_json") or {}
+    payload_text: str | None = None
+    if isinstance(payload_json, dict) and "__invalid_json__" in payload_json:
+        raw = payload_json.get("__invalid_json__")
+        if isinstance(raw, str):
+            payload_text = raw
+    return {
+        "ok": True,
+        "item": {
+            "id": str(row.get("id")),
+            "key": str(row.get("key")),
+            "version": int(row.get("version") or 0),
+            "is_active": bool(row.get("is_active")),
+            "validation_status": str(row.get("validation_status") or "draft"),
+            "validation_errors": row.get("validation_errors") or [],
+            "comment": row.get("comment"),
+            "payload_json": payload_json,
+            "payload_text": payload_text,
+            "created_at": to_iso(row.get("created_at")),
+        },
+    }
+
+
+@app.post("/admin/config/{key}/draft")
+def admin_config_draft(key: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+
+    active = get_active_config_store(key, request_id=request_id)
+    if active:
+        base_payload = active.get("payload_json") or {}
+        active_version = int(active.get("version") or 0)
+    else:
+        base_payload = _load_file_config(key)
+        active_version = 0
+
+    # Pick a new version that cannot conflict with existing rows.
+    try:
+        existing = list_config_versions(key, request_id=request_id)
+        max_existing_version = max([int(r.get("version") or 0) for r in existing] or [0])
+    except Exception:
+        max_existing_version = 0
+    new_version = max(active_version, max_existing_version) + 1
+
+    created = create_config_version(
+        key=key,
+        version=new_version,
+        payload_json=base_payload if isinstance(base_payload, dict) else {},
+        is_active=False,
+        validation_status="draft",
+        validation_errors=[],
+        comment=None,
+        created_by_user_id=admin_user_id or None,
+        request_id=request_id,
+    )
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_draft",
+        target_type="config_store",
+        target_id=f"{key}:{new_version}",
+        before_obj={"base": "active" if bool(active) else "file"},
+        after_obj={"key": key, "version": new_version},
+        summary=None,
+    )
+
+    return {"ok": True, "key": key, "version": int(created.get("version") or new_version)}
+
+
+class AdminConfigUpdateBody(BaseModel):
+    # Support both parsed JSON and raw text. Raw text allows saving drafts even
+    # when JSON is invalid; validation will surface JSON_PARSE_ERROR.
+    payload_json: dict | None = None
+    payload_text: str | None = None
+    comment: str | None = None
+
+
+@app.post("/admin/config/{key}/update")
+def admin_config_update(key: str, body: AdminConfigUpdateBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+
+    v = get_latest_inactive_version(key, request_id=request_id)
+    if v is None:
+        _admin_error("NO_DRAFT", "No draft version", 400)
+
+    payload_to_store: dict
+    if body.payload_text is not None:
+        raw = str(body.payload_text)
+        try:
+            parsed = json.loads(raw)
+            payload_to_store = parsed if isinstance(parsed, dict) else {"value": parsed}
+        except Exception:
+            payload_to_store = {"__invalid_json__": raw}
+    else:
+        payload_to_store = body.payload_json or {}
+
+    updated = update_config_payload(
+        key=key,
+        version=int(v),
+        payload_json=payload_to_store,
+        comment=(body.comment or None),
+        request_id=request_id,
+    )
+    if not updated:
+        _admin_error("UPDATE_FAILED", "Failed to update draft", 500)
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_update",
+        target_type="config_store",
+        target_id=f"{key}:{v}",
+        before_obj=None,
+        after_obj={"key": key, "version": int(v)},
+        summary=None,
+    )
+
+    return {"ok": True, "key": key, "version": int(v)}
+
+
+@app.post("/admin/config/{key}/validate")
+def admin_config_validate(key: str, version: int, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+    row = get_config_version(key, int(version), request_id=request_id)
+    if not row:
+        _admin_error("VERSION_NOT_FOUND", "Version not found", 404)
+
+    status, errors = _validate_config_payload(key, row.get("payload_json"))
+    errors = _normalize_validation_errors(errors)
+    set_config_validation(
+        key=key,
+        version=int(version),
+        validation_status=status,
+        validation_errors=errors,
+        request_id=request_id,
+    )
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_validate",
+        target_type="config_store",
+        target_id=f"{key}:{version}",
+        before_obj=None,
+        after_obj={"status": status, "errors": errors},
+        summary=None,
+    )
+
+    return {"ok": True, "status": status, "errors": errors}
+
+
+@app.post("/admin/config/{key}/dry-run")
+def admin_config_dry_run(key: str, version: int, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+    row = get_config_version(key, int(version), request_id=request_id)
+    if not row:
+        _admin_error("VERSION_NOT_FOUND", "Version not found", 404)
+
+    # If the selected version is invalid, dry-run must not crash; surface the reason.
+    v_status, v_errors = _validate_config_payload(key, row.get("payload_json"))
+    v_errors = _normalize_validation_errors(v_errors)
+    if v_status != "valid":
+        out = {
+            "ok": False,
+            "error": {"code": "INVALID_CONFIG", "message": "Config is invalid", "details": v_errors},
+        }
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="config_dry_run",
+            target_type="config_store",
+            target_id=f"{key}:{version}",
+            before_obj=None,
+            after_obj={"ok": False, "error": out.get("error")},
+            summary=None,
+        )
+        return out
+
+    # Pre-flight: build minimal render payload using current docs registry.
+    if key == "documents_registry":
+        payload = row.get("payload_json") or {}
+        docs_payload = payload.get("documents") if isinstance(payload, dict) else None
+        docs = [d for d in (docs_payload or []) if isinstance(d, dict) and bool(d.get("is_enabled"))]
+    else:
+        docs = [d for d in _load_documents_registry(request_id=request_id) if bool(d.get("is_enabled"))]
+    if not docs:
+        out = {"ok": False, "error": {"code": "NO_DOCUMENTS", "message": "No enabled documents"}}
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="config_dry_run",
+            target_type="config_store",
+            target_id=f"{key}:{version}",
+            before_obj=None,
+            after_obj={"ok": False, "error": out.get("error")},
+            summary=None,
+        )
+        return out
+
+    doc0 = docs[0]
+    doc_id = str(doc0.get("doc_id") or "").strip() or "free_report"
+    title = _doc_title(doc0)
+    render_request = _build_render_request(doc_id=doc_id, title=title, pack_id="dryrun", session_id="dryrun")
+
+    start = time.perf_counter()
+    ok, pdf_bytes, err = _http_post_json_bytes(f"{RENDER_DRYRUN_URL.rstrip('/')}/render", render_request, timeout_sec=10.0)
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    if not ok or not pdf_bytes:
+        out = {
+            "ok": False,
+            "error": {"code": "RENDER_UNAVAILABLE", "message": err or "render failed"},
+            "elapsed_ms": elapsed_ms,
+        }
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="config_dry_run",
+            target_type="config_store",
+            target_id=f"{key}:{version}",
+            before_obj=None,
+            after_obj={"ok": False, "error": out.get("error"), "elapsed_ms": elapsed_ms},
+            summary=None,
+        )
+        return out
+
+    if not pdf_bytes.startswith(b"%PDF"):
+        out = {
+            "ok": False,
+            "error": {"code": "INVALID_PDF", "message": "Render returned non-PDF"},
+            "elapsed_ms": elapsed_ms,
+        }
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="config_dry_run",
+            target_type="config_store",
+            target_id=f"{key}:{version}",
+            before_obj=None,
+            after_obj={"ok": False, "error": out.get("error"), "elapsed_ms": elapsed_ms},
+            summary=None,
+        )
+        return out
+
+    out = {"ok": True, "pdf_bytes_size": len(pdf_bytes), "elapsed_ms": elapsed_ms}
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_dry_run",
+        target_type="config_store",
+        target_id=f"{key}:{version}",
+        before_obj=None,
+        after_obj=out,
+        summary=None,
+    )
+    return out
+
+
+@app.post("/admin/config/{key}/publish")
+def admin_config_publish(key: str, version: int, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+    row = get_config_version(key, int(version), request_id=request_id)
+    if not row:
+        _admin_error("VERSION_NOT_FOUND", "Version not found", 404)
+    if str(row.get("validation_status") or "").lower() != "valid":
+        _admin_error("PUBLISH_FORBIDDEN", "Config must be valid to publish", 400)
+
+    before_active = get_active_config_store(key, request_id=request_id)
+    before_obj = {
+        "active_version": int(before_active.get("version") or 0) if before_active else None,
+        "active_hash": _stable_hash(before_active.get("payload_json")) if before_active else None,
+    }
+    ok = publish_config_version(key, int(version), request_id=request_id)
+    if not ok:
+        _admin_error("PUBLISH_FAILED", "Failed to publish", 500)
+    after_row = get_active_config_store(key, request_id=request_id)
+    after_obj = {
+        "active_version": int(after_row.get("version") or 0) if after_row else None,
+        "active_hash": _stable_hash(after_row.get("payload_json")) if after_row else None,
+    }
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_publish",
+        target_type="config_store",
+        target_id=f"{key}:{version}",
+        before_obj=before_obj,
+        after_obj=after_obj,
+        summary=None,
+    )
+
+    # drop cache for this key so next resolver sees new active
+    _CONFIG_CACHE.pop(key, None)
+    return {"ok": True}
+
+
+@app.post("/admin/config/{key}/rollback")
+def admin_config_rollback(key: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+    admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+    admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+
+    key = (key or "").strip()
+    if key not in SUPPORTED_CONFIG_KEYS:
+        _admin_error("UNSUPPORTED_KEY", "Unsupported key", 400)
+
+    active = get_active_config_store(key, request_id=request_id)
+    if not active:
+        _admin_error("NO_ACTIVE", "No active config", 400)
+    cur_v = int(active.get("version") or 0)
+    prev_v = get_previous_valid_version(key, cur_v, request_id=request_id)
+    if prev_v is None:
+        _admin_error("NO_ROLLBACK", "No previous valid version", 400)
+
+    before_obj = {
+        "active_version": cur_v,
+        "active_hash": _stable_hash(active.get("payload_json")),
+    }
+    ok = publish_config_version(key, int(prev_v), request_id=request_id)
+    if not ok:
+        _admin_error("ROLLBACK_FAILED", "Failed to rollback", 500)
+    after = get_active_config_store(key, request_id=request_id)
+    after_obj = {
+        "active_version": int(after.get("version") or 0) if after else None,
+        "active_hash": _stable_hash(after.get("payload_json")) if after else None,
+    }
+
+    record_admin_audit(
+        request=request,
+        admin_user_id=admin_user_id,
+        admin_session_id=admin_session_id,
+        action="config_rollback",
+        target_type="config_store",
+        target_id=f"{key}:{prev_v}",
+        before_obj=before_obj,
+        after_obj=after_obj,
+        summary=None,
+    )
+    _CONFIG_CACHE.pop(key, None)
+    return {"ok": True, "active_version": int(prev_v)}
+
+
 def _admin_error(code: str, message: str, status_code: int):
     raise HTTPException(
         status_code=status_code,
@@ -510,7 +1189,7 @@ def _enqueue_render_job_same_as_user_endpoints(
     request_id: str,
 ):
     # Same payload format as /packs/{pack_id}/render/{doc_id}
-    docs = _load_documents_registry()
+    docs = _load_documents_registry(request_id=request_id)
     title = doc_id
     for d in docs:
         if str(d.get("doc_id")) == doc_id:
@@ -896,13 +1575,12 @@ def _redis_client() -> redis.Redis:
 RENDER_QUEUE_NAME = (os.environ.get("RENDER_QUEUE") or "render_jobs").strip() or "render_jobs"
 
 
-def _load_documents_registry() -> list[dict]:
+def _load_documents_registry(request_id: str = "unknown") -> list[dict]:
     try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        path = os.path.join(here, "documents.v1.json")
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        docs = data.get("documents")
+        payload, _meta = resolve_config("documents_registry", request_id=request_id)
+        if not isinstance(payload, dict):
+            return []
+        docs = payload.get("documents")
         if isinstance(docs, list):
             out = []
             for d in docs:
@@ -914,7 +1592,7 @@ def _load_documents_registry() -> list[dict]:
                 out.append(d)
             return out
     except Exception:
-        pass
+        return []
     return []
 
 
@@ -2197,6 +2875,14 @@ def render_jobs_create(body: RenderJobCreateBody, request: Request):
     if not job_id:
         raise HTTPException(status_code=500, detail="Failed to create render job")
 
+    _record_config_snapshot_artifact(
+        session_id=session_id_str,
+        pack_id=pack_id_str,
+        doc_id=doc_id,
+        render_job_id=job_id,
+        request_id=request_id,
+    )
+
     render_request = {
         "doc_id": doc_id,
         "title": body.title,
@@ -2353,7 +3039,7 @@ def packs_render(pack_id: str, request: Request):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     session_id = str(pack.get("session_id") or "")
-    docs = [d for d in _load_documents_registry() if bool(d.get("is_enabled"))]
+    docs = [d for d in _load_documents_registry(request_id=request_id) if bool(d.get("is_enabled"))]
     if not docs:
         raise HTTPException(status_code=500, detail="Documents registry is empty")
 
@@ -2394,6 +3080,14 @@ def packs_render(pack_id: str, request: Request):
         if not job_id:
             continue
         created += 1
+
+        _record_config_snapshot_artifact(
+            session_id=session_id,
+            pack_id=pack_id,
+            doc_id=doc_id,
+            render_job_id=job_id,
+            request_id=request_id,
+        )
 
         render_request = _build_render_request(
             doc_id=doc_id,
@@ -2461,7 +3155,15 @@ def packs_render_doc(pack_id: str, doc_id: str, request: Request):
     if not job_id:
         raise HTTPException(status_code=500, detail="Failed to create render job")
 
-    docs = _load_documents_registry()
+    _record_config_snapshot_artifact(
+        session_id=session_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        render_job_id=job_id,
+        request_id=request_id,
+    )
+
+    docs = _load_documents_registry(request_id=request_id)
     title = doc_id
     for d in docs:
         if str(d.get("doc_id")) == doc_id:
@@ -2507,7 +3209,7 @@ def packs_documents(pack_id: str, request: Request):
     if owner and owner != user_id:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    docs = [d for d in _load_documents_registry() if bool(d.get("is_enabled"))]
+    docs = [d for d in _load_documents_registry(request_id=request_id) if bool(d.get("is_enabled"))]
     latest_jobs = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
     by_doc = {str(j.get("doc_id")): j for j in latest_jobs}
 

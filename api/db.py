@@ -273,6 +273,38 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_admin_audit_created_at
             ON admin_audit_log(created_at)
         """)
+
+        # Config store: versioned JSON configs managed via admin.
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS config_store (
+                id UUID PRIMARY KEY,
+                key TEXT NOT NULL,
+                version INT NOT NULL,
+                payload_json JSONB NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                validation_status TEXT NOT NULL DEFAULT 'draft',
+                validation_errors JSONB NOT NULL DEFAULT '[]'::jsonb,
+                comment TEXT NULL,
+                created_by_user_id UUID NULL,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (key, version)
+            )
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key
+            ON config_store(key)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key_active
+            ON config_store(key, is_active)
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_config_store_key_version
+            ON config_store(key, version)
+        """)
         
         conn.commit()
 
@@ -1818,6 +1850,453 @@ def get_file_download_info(file_id: str, request_id: str = "unknown") -> Optiona
                 query_name="get_file_download_info",
                 request_id=request_id,
                 file_id=file_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Config store operations (Admin)
+# ==========================================================================
+
+
+def get_active_config_store(key: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_active_config_store",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, payload_json, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s AND is_active = TRUE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_active_config_store",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_active_config_store",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_config_versions(key: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_config_versions",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s
+                ORDER BY version DESC
+                """,
+                (key,),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_config_versions",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_config_versions",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_config_version(key: str, version: int, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_config_version",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, key, version, payload_json, is_active, validation_status, validation_errors,
+                       comment, created_by_user_id, created_at
+                FROM config_store
+                WHERE key = %s AND version = %s
+                LIMIT 1
+                """,
+                (key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_config_version(
+    *,
+    key: str,
+    version: int,
+    payload_json: Dict[str, Any],
+    is_active: bool,
+    validation_status: str,
+    validation_errors: list,
+    comment: Optional[str],
+    created_by_user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    cfg_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_config_version",
+        request_id=request_id,
+        config_id=cfg_id,
+        key=key,
+        version=version,
+        is_active=is_active,
+        validation_status=validation_status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO config_store (
+                    id, key, version, payload_json, is_active, validation_status, validation_errors, comment, created_by_user_id
+                )
+                VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s::jsonb, %s, %s)
+                RETURNING id, key, version, payload_json, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (
+                    cfg_id,
+                    key,
+                    int(version),
+                    json.dumps(payload_json, ensure_ascii=False),
+                    bool(is_active),
+                    validation_status,
+                    json.dumps(validation_errors or [], ensure_ascii=False),
+                    comment,
+                    created_by_user_id,
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def update_config_payload(
+    *,
+    key: str,
+    version: int,
+    payload_json: Dict[str, Any],
+    comment: Optional[str],
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="update_config_payload",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE config_store
+                SET payload_json = %s::jsonb,
+                    comment = %s,
+                    validation_status = 'draft',
+                    validation_errors = '[]'::jsonb
+                WHERE key = %s AND version = %s AND is_active = FALSE
+                RETURNING id, key, version, payload_json, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (json.dumps(payload_json, ensure_ascii=False), comment, key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="update_config_payload",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="update_config_payload",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def set_config_validation(
+    *,
+    key: str,
+    version: int,
+    validation_status: str,
+    validation_errors: list,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="set_config_validation",
+        request_id=request_id,
+        key=key,
+        version=version,
+        validation_status=validation_status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE config_store
+                SET validation_status = %s,
+                    validation_errors = %s::jsonb
+                WHERE key = %s AND version = %s
+                RETURNING id, key, version, is_active, validation_status, validation_errors,
+                          comment, created_by_user_id, created_at
+                """,
+                (validation_status, json.dumps(validation_errors or [], ensure_ascii=False), key, int(version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="set_config_validation",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="set_config_validation",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_latest_inactive_version(key: str, request_id: str = "unknown") -> Optional[int]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_latest_inactive_version",
+        request_id=request_id,
+        key=key,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT version
+                FROM config_store
+                WHERE key = %s AND is_active = FALSE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_latest_inactive_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(row[0]) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_latest_inactive_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def publish_config_version(key: str, version: int, request_id: str = "unknown") -> bool:
+    """Set the given version active, disable previous actives."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="publish_config_version",
+        request_id=request_id,
+        key=key,
+        version=version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute("BEGIN")
+            cur.execute(
+                """
+                UPDATE config_store
+                SET is_active = FALSE
+                WHERE key = %s AND is_active = TRUE
+                """,
+                (key,),
+            )
+            cur.execute(
+                """
+                UPDATE config_store
+                SET is_active = TRUE
+                WHERE key = %s AND version = %s
+                """,
+                (key, int(version)),
+            )
+            ok = cur.rowcount > 0
+            conn.commit()
+            _log_event(
+                "db_query_ok",
+                query_name="publish_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return ok
+        except Exception as e:
+            conn.rollback()
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="publish_config_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_previous_valid_version(key: str, current_version: int, request_id: str = "unknown") -> Optional[int]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_previous_valid_version",
+        request_id=request_id,
+        key=key,
+        current_version=current_version,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT version
+                FROM config_store
+                WHERE key = %s
+                  AND validation_status = 'valid'
+                  AND version < %s
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (key, int(current_version)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_previous_valid_version",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return int(row[0]) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_previous_valid_version",
+                request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )

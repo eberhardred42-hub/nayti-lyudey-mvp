@@ -29,6 +29,16 @@ function friendlyAdminError(codeOrDetail?: string): string {
       return "Уже есть queued/rendering для этого pack+doc";
     case "INVALID_STATUS":
       return "Requeue доступен только для failed";
+    case "UNSUPPORTED_KEY":
+      return "Неизвестный ключ конфига";
+    case "VERSION_NOT_FOUND":
+      return "Версия конфига не найдена";
+    case "NO_DRAFT":
+      return "Нет черновика (сначала Draft)";
+    case "PUBLISH_FORBIDDEN":
+      return "Нельзя публиковать: сначала Validate";
+    case "NO_ROLLBACK":
+      return "Нет предыдущей valid версии для rollback";
     default:
       return "Ошибка админки";
   }
@@ -132,4 +142,52 @@ export async function adminRenderJobsRequeueFailed(limit?: number) {
 
 export async function adminFileDownloadUrl(fileId: string) {
   return adminFetch(`/api/admin/files/${encodeURIComponent(fileId)}/download`, { method: "GET" });
+}
+
+export async function adminConfigKeys() {
+  return adminFetch("/api/admin/config/keys", { method: "GET" });
+}
+
+export async function adminConfigVersions(key: string) {
+  return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/versions`, { method: "GET" });
+}
+
+export async function adminConfigGet(key: string, version: number) {
+  return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/versions/${encodeURIComponent(String(version))}`, {
+    method: "GET",
+  });
+}
+
+export async function adminConfigDraft(key: string) {
+  return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/draft`, { method: "POST" });
+}
+
+export async function adminConfigUpdate(key: string, payload_text: string, comment?: string) {
+  return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/update`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ payload_text, comment: comment || null }),
+  });
+}
+
+export async function adminConfigValidate(key: string, version: number) {
+  const url = new URL(`/api/admin/config/${encodeURIComponent(key)}/validate`, window.location.origin);
+  url.searchParams.set("version", String(version));
+  return adminFetch(url.pathname + url.search, { method: "POST" });
+}
+
+export async function adminConfigDryRun(key: string, version: number) {
+  const url = new URL(`/api/admin/config/${encodeURIComponent(key)}/dry-run`, window.location.origin);
+  url.searchParams.set("version", String(version));
+  return adminFetch(url.pathname + url.search, { method: "POST" });
+}
+
+export async function adminConfigPublish(key: string, version: number) {
+  const url = new URL(`/api/admin/config/${encodeURIComponent(key)}/publish`, window.location.origin);
+  url.searchParams.set("version", String(version));
+  return adminFetch(url.pathname + url.search, { method: "POST" });
+}
+
+export async function adminConfigRollback(key: string) {
+  return adminFetch(`/api/admin/config/${encodeURIComponent(key)}/rollback`, { method: "POST" });
 }
