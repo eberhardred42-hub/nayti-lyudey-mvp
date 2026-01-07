@@ -1,0 +1,53 @@
+name: Staging first run
+
+on:
+  workflow_dispatch:
+
+jobs:
+  staging-first-run:
+    runs-on: ubuntu-latest
+    env:
+      DEBUG: "1"
+      SMS_PROVIDER: mock
+      LLM_PROVIDER: mock
+
+      # Storage (MinIO)
+      S3_PROVIDER: s3
+      S3_ENDPOINT: http://minio:9000
+      S3_PRESIGN_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: nayti-lyudey
+      S3_ACCESS_KEY: minioadmin
+      S3_SECRET_KEY: minioadmin
+      S3_USE_SSL: "0"
+
+      # Internal URLs for compose network
+      DATABASE_URL: postgresql://postgres:postgres@db:5432/nlyudi
+      REDIS_URL: redis://redis:6379/0
+      RENDER_URL: http://render:8000
+      RENDER_TIMEOUT_SEC: "120"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build & start staging stack
+        run: |
+          docker compose -f infra/docker-compose.yml up -d --build \
+            db api ml front redis minio minio-init render render-worker
+
+      - name: First run check
+        run: |
+          chmod +x scripts/staging/first-run-check.sh
+          bash scripts/staging/first-run-check.sh
+
+      - name: Diagnostics (on failure)
+        if: failure()
+        run: |
+          docker compose -f infra/docker-compose.yml ps
+          docker compose -f infra/docker-compose.yml logs --no-color --tail=300 \
+            api render-worker render redis minio db || true
+
+      - name: Cleanup
+        if: always()
+        run: docker compose -f infra/docker-compose.yml down -v --remove-orphans
