@@ -1,7 +1,7 @@
 # Repo map (release prep)
 
 ## Верхний уровень
-- README и входные скрипты: [README.md](../README.md), [start-dev.sh](../start-dev.sh)
+- README и входные скрипты: [README.md](../README.md), [scripts/dev/start-dev.sh](../scripts/dev/start-dev.sh) (старый путь `./start-dev.sh` — wrapper)
 - Backend/API: [api/](../api/)
 - Frontend (Next.js): [front/](../front/)
 - Инфраструктура локального стенда (compose): [infra/](../infra/)
@@ -67,5 +67,5 @@ Frontend (Next.js API routes / proxy):
   - Разделы админки: [front/src/app/admin/(app)/](../front/src/app/admin/(app)/)
   - Proxy к backend admin API: [front/src/app/api/admin/](../front/src/app/api/admin/)
 - Переменные окружения (без секретов):
-  - Пример: [.env.example](../.env.example)
+  - Пример: [infra/.env.example](../infra/.env.example)
   - Проброс в compose: [infra/docker-compose.yml](../infra/docker-compose.yml)

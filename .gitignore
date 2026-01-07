@@ -16,6 +16,11 @@ dist/
 
 # Runtime artifacts
 artifacts/
+.dev-pids
+
+# Local env files
+.env
+.env.*
 
 # OS
 .DS_Store

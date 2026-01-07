@@ -1,11 +1,11 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "[DEPRECATED] Используйте: ./scripts/qa/test-stage5-code-only.sh" >&2
-exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/qa/test-stage5-code-only.sh" "$@"
 #!/bin/bash
 # Stage 5 Code Verification Test (without Docker)
 # Verifies all files exist, have correct structure, and no syntax errors
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$REPO_ROOT"
 
 echo "=== Stage 5 Code Verification (No Docker Required) ==="
 echo
