@@ -49,9 +49,18 @@ export default function Page() {
   const [userToken, setUserTokenState] = useState<string | null>(null);
   const [autoDoc, setAutoDoc] = useState<{ id: string; title: string; status: string } | null>(null);
   const [autoGenStarted, setAutoGenStarted] = useState(false);
-  const [pdfDocs, setPdfDocs] = useState<Array<{ id: string; title: string; status: string }>>([]);
+  const [pdfDocs, setPdfDocs] = useState<Array<{ id: string; doc_id: string; title: string; status: string }>>([]);
 
   const boxRef = useRef<HTMLDivElement | null>(null);
+
+  function statusLabel(status: string): string {
+    const s = (status || "").trim();
+    if (!s || s === "ready") return "";
+    if (s === "pending") return "в работе";
+    if (s === "error") return "ошибка";
+    if (s === "needs_input") return "нужны данные";
+    return "";
+  }
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -85,7 +94,7 @@ export default function Page() {
     return userId ? { "X-User-Id": userId } : {};
   }
 
-  async function refreshMeDocuments() {
+  async function refreshMeDocuments(): Promise<Array<{ id: string; doc_id: string; title: string; status: string }>> {
     try {
       const r = await fetch("/api/me/documents", {
         method: "GET",
@@ -93,7 +102,7 @@ export default function Page() {
         cache: "no-store",
       });
       const data = await readJsonSafe(r);
-      if (!data || typeof data !== "object") return;
+      if (!data || typeof data !== "object") return [];
       const dataObj = data as Record<string, unknown>;
       const docs: unknown[] = Array.isArray(dataObj.documents) ? (dataObj.documents as unknown[]) : [];
       const pdf = docs
@@ -103,14 +112,17 @@ export default function Page() {
           if (o.type !== "pdf") return null;
           const id = typeof o.id === "string" ? o.id : "";
           if (!id) return null;
+          const doc_id = typeof o.doc_id === "string" ? o.doc_id : "";
           const title = typeof o.title === "string" ? o.title : "Документ";
           const status = typeof o.status === "string" ? o.status : "";
-          return { id, title, status };
+          return { id, doc_id, title, status };
         })
-        .filter(Boolean) as Array<{ id: string; title: string; status: string }>;
+        .filter(Boolean) as Array<{ id: string; doc_id: string; title: string; status: string }>;
       setPdfDocs(pdf);
+      return pdf;
     } catch {
       // ignore
+      return [];
     }
   }
 
@@ -119,58 +131,27 @@ export default function Page() {
     if (autoGenStarted) return;
     setAutoGenStarted(true);
     try {
-      function normalizeCatalogItem(v: unknown): { id: string; title: string; sort_order: number } | null {
-        if (!v || typeof v !== "object") return null;
-        const o = v as Record<string, unknown>;
-        const id = typeof o.id === "string" ? o.id : "";
-        if (!id) return null;
-        const title = typeof o.title === "string" ? o.title : id;
-        const sort_order = typeof o.sort_order === "number" ? o.sort_order : Number(o.sort_order || 0);
-        return { id, title, sort_order: Number.isFinite(sort_order) ? sort_order : 0 };
-      }
-
-      const catR = await fetch("/api/documents/catalog", {
-        method: "GET",
-        headers: authHeaders(),
-        cache: "no-store",
-      });
-      const cat = await readJsonSafe(catR);
-      const catObj = cat && typeof cat === "object" ? (cat as Record<string, unknown>) : null;
-      const rawItems: unknown[] = Array.isArray(catObj?.items) ? (catObj.items as unknown[]) : [];
-      const items = rawItems.map(normalizeCatalogItem).filter(Boolean) as Array<{ id: string; title: string; sort_order: number }>;
-      items.sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0));
-      const first = items[0];
-      const docId = String(first?.id || "");
-      const title = String(first?.title || docId || "Документ");
-      if (!docId) return;
-
-      const genR = await fetch("/api/documents/generate", {
+      const genR = await fetch("/api/documents/generate_pack", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
-        body: JSON.stringify({ session_id: sid, doc_id: docId }),
+        body: JSON.stringify({ session_id: sid }),
       });
-      const gen = await readJsonSafe(genR);
-      const genObj = gen && typeof gen === "object" ? (gen as Record<string, unknown>) : null;
-      const doc = genObj?.document && typeof genObj.document === "object" ? (genObj.document as Record<string, unknown>) : null;
-      const status = String(doc?.status || "");
-      if (doc && typeof doc.id === "string" && doc.id) {
-        setAutoDoc({ id: String(doc.id), title: String(doc.title || title), status });
+
+      if (!genR.ok) {
+        pushAssistantOnce("Не удалось запустить генерацию пакета документов. Попробуй позже.");
+        return;
       }
 
-      if (status === "ready") {
-        pushAssistantOnce(`Документ «${String(doc?.title || title)}» готов. Нажми «Скачать».`);
-        await refreshMeDocuments();
-      } else if (status === "needs_input") {
-        const missing = Array.isArray(doc?.missing_fields) ? (doc.missing_fields as unknown[]) : [];
-        pushAssistantOnce(
-          `Пока не могу собрать документ «${String(doc?.title || title)}». Не хватает: ${missing.map(String).join(", ") || "данных"}.`
-        );
-      } else if (status === "error") {
-        pushAssistantOnce(`Не получилось собрать документ «${String(doc?.title || title)}». Попробуй позже.`);
-        await refreshMeDocuments();
+      const docsNow = await refreshMeDocuments();
+      const candidate = docsNow.find((d) => d.doc_id === "candidate_onepager") || null;
+      if (candidate) {
+        setAutoDoc({ id: candidate.id, title: candidate.title, status: candidate.status });
+        if (candidate.status === "ready") {
+          pushAssistantOnce(`Документ «${candidate.title}» готов. Нажми «Скачать».`);
+        }
       }
     } catch {
-      pushAssistantOnce("Не удалось запустить генерацию документа. Попробуй позже.");
+      pushAssistantOnce("Не удалось запустить генерацию пакета документов. Попробуй позже.");
     }
   }
 
@@ -518,7 +499,7 @@ export default function Page() {
                   <div key={d.id} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
                     <div style={{ flex: 1 }}>
                       {d.title}
-                      {d.status && d.status !== "ready" ? ` (${d.status})` : ""}
+                      {statusLabel(d.status) ? ` (${statusLabel(d.status)})` : ""}
                     </div>
                     {d.status === "ready" && (
                       <button className={styles.fullPackageBtn} onClick={() => downloadDocument(d.id, d.title)}>

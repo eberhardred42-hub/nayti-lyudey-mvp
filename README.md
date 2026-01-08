@@ -248,6 +248,12 @@ LLM обёрнут в `api/llm_client.py` и использует OpenAI-compati
 bash tests/quick-test.sh
 ```
 
+Локальный E2E смоук documents v1 (поднимает compose и проверяет PDF download):
+
+```bash
+bash scripts/smoke-documents-v1.sh
+```
+
 DEV e2e (не трогает контейнеры, только ходит в API):
 
 ```bash
@@ -258,8 +264,11 @@ BASE_URL="https://dev.naitilyudei.ru/api" bash scripts/smoke-documents-v1-dev.sh
 
 См. историю `git log -n 10 --oneline`. В последних коммитах:
 
-- Документы pipeline v1 + smoke’и + подключение smoke к DEV deploy.
-- Устойчивость фронта: безопасный JSON парсинг, чтобы одностраничник не падал на пустом ответе.
+- Интро-диалог: минимальный A/B/C/D флоу с подтверждением/исправлением (контракт `assistant_text/quick_replies/brief_state/ready_to_search` сохранён).
+- Документы: `POST /documents/generate_pack` — последовательная генерация всего бесплатного `auto_generate`-пака (строгий список из `api/documents/catalog.json`, без `search_brief`).
+- Идемпотентность документов: кеш по `(user_id, session_id, doc_id)` + `force=true` для принудительной регенерации.
+- Промпты: добавлены per-doc шаблоны для всех doc_id бесплатного пака в `api/prompts/docs/<doc_id>/`.
+- Смоуки обновлены под новый интро-флоу и формат ответа `generate_pack`.
 
 ## Инструкция для ChatGPT-ресёрчера
 

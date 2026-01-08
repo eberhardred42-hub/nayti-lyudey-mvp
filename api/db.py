@@ -1549,6 +1549,59 @@ def find_document_for_idempotency(
             raise
 
 
+def find_latest_document_by_identity(
+    *,
+    user_id: str,
+    session_id: str,
+    doc_id: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    """Return latest document row for the same (user, session, doc) regardless of template/source_hash."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="find_latest_document_by_identity",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT *
+                FROM documents
+                WHERE user_id = %s
+                  AND session_id = %s
+                  AND doc_id = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id, session_id, doc_id),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="find_latest_document_by_identity",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="find_latest_document_by_identity",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
 def update_document_record(
     *,
     document_id: str,

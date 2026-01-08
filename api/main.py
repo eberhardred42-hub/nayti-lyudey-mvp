@@ -24,6 +24,7 @@ from db import (
     create_document_record,
     create_document_template_version,
     find_document_for_idempotency,
+    find_latest_document_by_identity,
     get_active_document_template,
     get_document_for_user,
     get_document_template_by_id,
@@ -2311,6 +2312,226 @@ class IntroDialogueResponse(BaseModel):
     missing_fields: list[str] = []
 
 
+def _intro_mode_question() -> tuple[str, list[str]]:
+    text = (
+        "Как удобнее дать вводные?\n"
+        "A) Вставить текст вакансии\n"
+        "B) Описать своими словами\n"
+        "C) Отвечать на короткие вопросы\n"
+        "D) Пропустить и начать поиск"
+    )
+    qrs = ["A — текст вакансии", "B — своими словами", "C — вопросы", "D — пропустить"]
+    return text, qrs
+
+
+def _intro_detect_mode(text: str) -> str | None:
+    low = (text or "").strip().lower()
+    if not low:
+        return None
+    if low.startswith("a") or "текст ваканс" in low or "ваканси" in low:
+        return "A"
+    if low.startswith("b") or "своими" in low or "задач" in low or "опис" in low:
+        return "B"
+    if low.startswith("c") or "вопрос" in low:
+        return "C"
+    if low.startswith("d") or "пропуст" in low or "поехали" in low:
+        return "D"
+    # Compatibility with existing UI quick replies
+    if "есть текст" in low and "ваканс" in low:
+        return "A"
+    if "нет ваканс" in low and "задач" in low:
+        return "B"
+    return None
+
+
+def _intro_apply_text_to_kb(kb: dict, text: str, profession_query: str) -> None:
+    if not isinstance(kb, dict):
+        return
+    t = (text or "").strip()
+    if not t:
+        return
+
+    # Keep original text as raw vacancy/context (best-effort).
+    try:
+        if isinstance(kb.get("responsibilities"), dict):
+            if not kb["responsibilities"].get("raw_vacancy_text"):
+                kb["responsibilities"]["raw_vacancy_text"] = t
+    except Exception:
+        pass
+
+    # Parse work format / employment / salary / location.
+    try:
+        wf = parse_work_format(t)
+        if wf and isinstance(kb.get("company"), dict) and kb["company"].get("work_format") is None:
+            kb["company"]["work_format"] = wf
+    except Exception:
+        pass
+
+    try:
+        emp = parse_employment_type(t)
+        if emp and isinstance(kb.get("employment"), dict) and kb["employment"].get("employment_type") is None:
+            kb["employment"]["employment_type"] = emp
+    except Exception:
+        pass
+
+    try:
+        s_min, s_max, s_comment = parse_salary(t)
+        if isinstance(kb.get("compensation"), dict):
+            if s_min is not None and kb["compensation"].get("salary_min_rub") is None:
+                kb["compensation"]["salary_min_rub"] = s_min
+            if s_max is not None and kb["compensation"].get("salary_max_rub") is None:
+                kb["compensation"]["salary_max_rub"] = s_max
+            if s_comment and kb["compensation"].get("salary_comment") is None:
+                kb["compensation"]["salary_comment"] = s_comment
+    except Exception:
+        pass
+
+    try:
+        city, region = parse_location(t)
+        if isinstance(kb.get("company"), dict):
+            if city and kb["company"].get("company_location_city") is None:
+                kb["company"]["company_location_city"] = city
+            if region and kb["company"].get("company_location_region") is None:
+                kb["company"]["company_location_region"] = region
+    except Exception:
+        pass
+
+    # Fill role title if empty.
+    try:
+        if isinstance(kb.get("role"), dict):
+            if kb["role"].get("role_title") is None:
+                kb["role"]["role_title"] = (profession_query or t)[:120]
+    except Exception:
+        pass
+
+    # Extract tasks from message if it looks like a list.
+    try:
+        if isinstance(kb.get("responsibilities"), dict) and isinstance(kb["responsibilities"].get("tasks"), list):
+            if not kb["responsibilities"]["tasks"]:
+                lines = [ln.strip(" \t\r") for ln in t.split("\n") if ln.strip()]
+                bullets = []
+                for ln in lines:
+                    if ln.startswith(("-", "•", "*")):
+                        bullets.append(ln.lstrip("-*• ").strip())
+                if bullets:
+                    kb["responsibilities"]["tasks"] = [b for b in bullets if b][:10]
+                elif len(t) <= 180:
+                    kb["responsibilities"]["tasks"] = [t]
+    except Exception:
+        pass
+
+    try:
+        update_meta(kb)
+    except Exception:
+        pass
+
+
+def _brief_state_from_kb(profession_query: str, kb: dict, prev: dict | None = None) -> dict:
+    bs = dict(prev or {})
+    role_title = ""
+    try:
+        role_title = str(((kb.get("role") or {}).get("role_title") or "") if isinstance(kb.get("role"), dict) else "").strip()
+    except Exception:
+        role_title = ""
+    role_title = role_title or (profession_query or "").strip()
+
+    # Keep legacy shape for documents pipeline.
+    constraints: dict = {}
+    try:
+        company = kb.get("company") if isinstance(kb.get("company"), dict) else {}
+        comp = kb.get("compensation") if isinstance(kb.get("compensation"), dict) else {}
+        location = ""
+        city = str(company.get("company_location_city") or "").strip()
+        region = str(company.get("company_location_region") or "").strip()
+        wf = str(company.get("work_format") or "").strip()
+        if city:
+            location = city
+        elif region:
+            location = region
+        if wf:
+            location = (location + ", " + wf) if location else wf
+        if location:
+            constraints["location"] = location
+
+        budget = ""
+        smin = comp.get("salary_min_rub")
+        smax = comp.get("salary_max_rub")
+        scomment = str(comp.get("salary_comment") or "").strip()
+        if scomment:
+            budget = scomment
+        elif smin is not None and smax is not None:
+            budget = f"{smin}–{smax}"
+        elif smin is not None:
+            budget = str(smin)
+        elif smax is not None:
+            budget = str(smax)
+        if budget:
+            constraints["budget"] = budget
+    except Exception:
+        constraints = {}
+
+    if role_title:
+        bs["role"] = role_title
+    # Goal is optional; keep if already present.
+    if "goal" not in bs:
+        bs["goal"] = ""
+    bs["constraints"] = constraints
+    return bs
+
+
+def _intro_summary_text(profession_query: str, kb: dict) -> str:
+    parts: list[str] = []
+    role = ""
+    try:
+        role = str(((kb.get("role") or {}).get("role_title") or "") if isinstance(kb.get("role"), dict) else "").strip()
+    except Exception:
+        role = ""
+    role = role or (profession_query or "").strip()
+    if role:
+        parts.append(f"- Роль: {role}")
+
+    try:
+        company = kb.get("company") if isinstance(kb.get("company"), dict) else {}
+        city = str(company.get("company_location_city") or "").strip()
+        region = str(company.get("company_location_region") or "").strip()
+        wf = str(company.get("work_format") or "").strip()
+        loc = city or region
+        if loc or wf:
+            value = (loc + ", " + wf) if (loc and wf) else (loc or wf)
+            parts.append(f"- Локация/формат: {value}")
+    except Exception:
+        pass
+
+    try:
+        emp = kb.get("employment") if isinstance(kb.get("employment"), dict) else {}
+        et = str(emp.get("employment_type") or "").strip()
+        if et:
+            parts.append(f"- Занятость: {et}")
+    except Exception:
+        pass
+
+    try:
+        comp = kb.get("compensation") if isinstance(kb.get("compensation"), dict) else {}
+        smin = comp.get("salary_min_rub")
+        smax = comp.get("salary_max_rub")
+        scomment = str(comp.get("salary_comment") or "").strip()
+        budget = scomment
+        if not budget and smin is not None and smax is not None:
+            budget = f"{smin}–{smax}"
+        elif not budget and smin is not None:
+            budget = str(smin)
+        elif not budget and smax is not None:
+            budget = str(smax)
+        if budget:
+            parts.append(f"- Бюджет: {budget}")
+    except Exception:
+        pass
+
+    if not parts:
+        return "Собрал вводные, можно начинать поиск."
+    return "Собрал вводные:\n" + "\n".join(parts)
+
+
 def _read_prompt_file(rel_path: str) -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     path = os.path.join(here, rel_path)
@@ -2507,8 +2728,36 @@ def _required_fields_missing(brief_state: dict, required_fields: list[str]) -> l
 
 
 def _build_doc_messages(doc_id: str, profession_query: str, brief_state: dict) -> list[dict]:
-    system = _read_prompt_file(f"prompts/docs/{doc_id}/system.md")
-    tmpl = _read_prompt_file(f"prompts/docs/{doc_id}/user_template.md")
+    try:
+        system = _read_prompt_file(f"prompts/docs/{doc_id}/system.md")
+        tmpl = _read_prompt_file(f"prompts/docs/{doc_id}/user_template.md")
+    except FileNotFoundError:
+        cat = _catalog_item(doc_id) or {}
+        title = str(cat.get("title") or doc_id).strip() or doc_id
+        system = (
+            "Ты — ассистент, который готовит контент документа для найма.\n\n"
+            "Верни строго JSON (без Markdown и без пояснений):\n"
+            "{\n"
+            "  \"doc_markdown\": \"...\",\n"
+            "  \"missing_fields\": [\"...\"],\n"
+            "  \"quality_notes\": \"...\"\n"
+            "}\n\n"
+            "Правила:\n"
+            "- Ничего не выдумывай.\n"
+            "- Если данных не хватает — перечисли missing_fields.\n"
+            "- doc_markdown: простой markdown (заголовки #/##, списки, абзацы).\n"
+        )
+        tmpl = (
+            f"Сгенерируй документ: {title} (doc_id={doc_id}).\n\n"
+            "Контекст:\n"
+            "- profession_query: {{profession_query}}\n"
+            "- brief_state (JSON):\n"
+            "{{brief_state_json}}\n\n"
+            "Требования к doc_markdown:\n"
+            "- Структурируй материал с подзаголовками и списками.\n"
+            "- Дай практичные шаблоны/скрипты/чеклисты там, где это уместно.\n"
+            "Если не хватает данных — верни missing_fields (doc_markdown может быть неполным).\n"
+        )
     user = tmpl
     user = user.replace("{{profession_query}}", profession_query or "")
     user = user.replace("{{brief_state_json}}", json.dumps(brief_state or {}, ensure_ascii=False))
@@ -2981,14 +3230,41 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
+        profession_query = str(session.get("profession_query", "") or "")
+        kb = session.get("vacancy_kb") if isinstance(session.get("vacancy_kb"), dict) else make_empty_vacancy_kb()
+        try:
+            update_meta(kb)
+        except Exception:
+            pass
+
         brief_state = session.get("brief_state") if isinstance(session.get("brief_state"), dict) else {}
-        missing = _intro_missing_fields(brief_state)
+        intro_meta = brief_state.get("intro") if isinstance(brief_state.get("intro"), dict) else {}
+
+        phase = str(session.get("phase") or "INTRO_MODE").strip().upper() or "INTRO_MODE"
+        missing = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
+        missing = [str(x) for x in (missing or []) if str(x).strip()]
 
         if msg_type in {"intro_start", "intro"}:
-            q, qrs = _intro_fallback_question(missing)
-            payload = {
+            q, qrs = _intro_mode_question()
+            brief_state["intro"] = {"mode": None, "round": 0, "state": "MODE"}
+            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            try:
+                add_message(sid, "assistant", q, request_id=request_id)
+                update_session(
+                    sid,
+                    chat_state="intro",
+                    phase="INTRO_MODE",
+                    brief_state=brief_state,
+                    vacancy_kb=kb,
+                    request_id=request_id,
+                )
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "reply": q,
                 "assistant_text": q,
-                "quick_replies": qrs[:4],
+                "quick_replies": qrs,
                 "brief_patch": {},
                 "brief_state": brief_state,
                 "ready_to_search": False,
@@ -2996,12 +3272,6 @@ def chat_message(body: ChatMessage, request: Request):
                 "documents_ready": False,
                 "documents": [],
             }
-            try:
-                add_message(sid, "assistant", q, request_id=request_id)
-                update_session(sid, chat_state="intro", phase="INTRO", brief_state=brief_state, request_id=request_id)
-            except Exception:
-                pass
-            return {"ok": True, "reply": q, **payload}
 
         # intro_message
         if text:
@@ -3010,67 +3280,244 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
-        messages = _build_intro_messages(
-            profession_query=session.get("profession_query", ""),
-            brief_state=brief_state,
-            last_user_message=text,
-            missing_fields=missing,
-        )
+        low = (text or "").strip().lower()
 
-        fallback_q, fallback_qr = _intro_fallback_question(missing)
-        fallback = {
-            "assistant_text": fallback_q,
-            "quick_replies": fallback_qr[:4],
-            "brief_patch": {},
-            "ready_to_search": False,
-            "missing_fields": missing,
-        }
+        if phase == "INTRO_MODE":
+            mode = _intro_detect_mode(text)
+            if not mode:
+                q, qrs = _intro_mode_question()
+                assistant_text = "Не понял вариант. Выбери A/B/C/D.\n\n" + q
+                quick = qrs
+                next_phase = "INTRO_MODE"
+            else:
+                intro_meta = {"mode": mode, "round": 0, "state": "INPUT"}
+                brief_state["intro"] = intro_meta
+                if mode == "A":
+                    assistant_text = "Ок. Вставь, пожалуйста, текст вакансии целиком (можно без правок)."
+                    quick = []
+                    next_phase = "INTRO_VACANCY_TEXT"
+                elif mode == "B":
+                    assistant_text = "Ок. Опиши в 2–4 фразы: кого ищем, ключевые задачи, локация/формат, бюджет (если есть)."
+                    quick = ["Удалённо", "Офис", "Гибрид", "Поехали"]
+                    next_phase = "INTRO_FREE_TEXT"
+                elif mode == "C":
+                    assistant_text, quick, _qs = build_clarification_prompt(
+                        sid, kb, profession_query, last_user_message=text, request=request
+                    )
+                    if "Поехали" not in quick:
+                        quick = (quick or []) + ["Поехали"]
+                    next_phase = "INTRO_CLARIFY"
+                else:
+                    # D: minimal defaults
+                    try:
+                        if isinstance(kb.get("role"), dict) and kb["role"].get("role_title") is None:
+                            kb["role"]["role_title"] = (profession_query or "Специалист")[:120]
+                        if isinstance(kb.get("employment"), dict) and kb["employment"].get("employment_type") is None:
+                            kb["employment"]["employment_type"] = "full-time"
+                        if isinstance(kb.get("company"), dict) and kb["company"].get("work_format") is None:
+                            kb["company"]["work_format"] = "remote"
+                        if isinstance(kb.get("company"), dict) and kb["company"].get("company_location_region") is None:
+                            kb["company"]["company_location_region"] = "любой"
+                        if isinstance(kb.get("compensation"), dict) and kb["compensation"].get("salary_comment") is None:
+                            kb["compensation"]["salary_comment"] = "обсудим"
+                        update_meta(kb)
+                    except Exception:
+                        pass
+                    assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
+                    quick = ["Да, всё верно", "Исправить"]
+                    next_phase = "INTRO_CONFIRM"
 
-        raw = generate_json_messages(messages=messages, request_id=request_id, session_id=sid, fallback=fallback)
-        try:
-            model = IntroDialogueResponse.model_validate(raw)
-        except Exception as e:
-            log_event(
-                "intro_llm_invalid",
-                level="warning",
-                request_id=request_id,
-                session_id=sid,
-                error=str(e),
-            )
-            model = IntroDialogueResponse.model_validate(fallback)
-
-        assistant_text = (model.assistant_text or "").strip() or fallback_q
-        quick = [q for q in (model.quick_replies or []) if isinstance(q, str) and q.strip()][:4]
-        patch = model.brief_patch if isinstance(model.brief_patch, dict) else {}
-        if (not patch) and text:
+            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
             try:
-                patch = _intro_heuristic_patch(text=text, missing_fields=missing)
+                update_session(
+                    sid,
+                    chat_state="intro",
+                    phase=next_phase,
+                    brief_state=brief_state,
+                    vacancy_kb=kb,
+                    request_id=request_id,
+                )
             except Exception:
-                patch = {}
-        next_brief = _deep_merge_dict(brief_state, patch)
+                pass
+            try:
+                add_message(sid, "assistant", assistant_text, request_id=request_id)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "reply": assistant_text,
+                "assistant_text": assistant_text,
+                "quick_replies": quick[:6] if isinstance(quick, list) else [],
+                "brief_patch": {},
+                "brief_state": brief_state,
+                "ready_to_search": False,
+                "missing_fields": missing,
+                "documents_ready": False,
+                "documents": [],
+            }
 
-        server_missing = _intro_missing_fields(next_brief)
-        server_ready = len(server_missing) == 0
-        next_phase = "DONE" if server_ready else "CLARIFY"
+        if phase in {"INTRO_VACANCY_TEXT", "INTRO_FREE_TEXT", "INTRO_CLARIFY", "INTRO_CORRECT"}:
+            if text:
+                _intro_apply_text_to_kb(kb, text=text, profession_query=profession_query)
+                # Keep the free-form goal if user provided a short statement.
+                if phase in {"INTRO_FREE_TEXT", "INTRO_CLARIFY"}:
+                    if not str(brief_state.get("goal") or "").strip() and len(text.strip()) <= 220:
+                        brief_state["goal"] = text.strip()
 
-        try:
-            update_session(sid, chat_state="intro", phase=next_phase, brief_state=next_brief, request_id=request_id)
-        except Exception:
-            pass
-        try:
-            add_message(sid, "assistant", assistant_text, request_id=request_id)
-        except Exception:
-            pass
+            intro_meta = brief_state.get("intro") if isinstance(brief_state.get("intro"), dict) else {}
+            try:
+                intro_meta["round"] = int(intro_meta.get("round") or 0) + 1
+            except Exception:
+                intro_meta["round"] = 1
+            brief_state["intro"] = intro_meta
 
-        documents = []
-        documents_ready = False
-        if server_ready:
+            missing = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
+            missing = [str(x) for x in (missing or []) if str(x).strip()]
+
+            force_ready = False
+            if any(k in low for k in ["поехали", "хватит", "достаточно"]):
+                force_ready = True
+
+            rounds = int(intro_meta.get("round") or 0)
+            if (not missing) or (len(missing) <= 2) or (rounds >= 2) or force_ready:
+                assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
+                quick = ["Да, всё верно", "Исправить"]
+                next_phase = "INTRO_CONFIRM"
+            else:
+                assistant_text, quick, _qs = build_clarification_prompt(
+                    sid, kb, profession_query, last_user_message=text, request=request
+                )
+                if "Поехали" not in (quick or []):
+                    quick = (quick or []) + ["Поехали"]
+                next_phase = "INTRO_CLARIFY"
+
+            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            try:
+                update_session(
+                    sid,
+                    chat_state="intro",
+                    phase=next_phase,
+                    brief_state=brief_state,
+                    vacancy_kb=kb,
+                    request_id=request_id,
+                )
+            except Exception:
+                pass
+            try:
+                add_message(sid, "assistant", assistant_text, request_id=request_id)
+            except Exception:
+                pass
+            return {
+                "ok": True,
+                "reply": assistant_text,
+                "assistant_text": assistant_text,
+                "quick_replies": quick[:6] if isinstance(quick, list) else [],
+                "brief_patch": {},
+                "brief_state": brief_state,
+                "ready_to_search": False,
+                "missing_fields": missing,
+                "documents_ready": False,
+                "documents": [],
+            }
+
+        if phase == "INTRO_CONFIRM":
+            # Confirm or ask to correct.
+            is_yes = low.startswith("да") or low in {"ок", "верно", "всё верно", "да, всё верно"}
+            wants_fix = "исправ" in low or "поправ" in low
+
+            if wants_fix:
+                assistant_text = "Ок. Что поправить? Напиши одной фразой (например: 'локация — Москва, офис')."
+                quick = []
+                next_phase = "INTRO_CORRECT"
+                try:
+                    update_session(
+                        sid,
+                        chat_state="intro",
+                        phase=next_phase,
+                        brief_state=brief_state,
+                        vacancy_kb=kb,
+                        request_id=request_id,
+                    )
+                except Exception:
+                    pass
+                try:
+                    add_message(sid, "assistant", assistant_text, request_id=request_id)
+                except Exception:
+                    pass
+                return {
+                    "ok": True,
+                    "reply": assistant_text,
+                    "assistant_text": assistant_text,
+                    "quick_replies": quick,
+                    "brief_patch": {},
+                    "brief_state": brief_state,
+                    "ready_to_search": False,
+                    "missing_fields": missing,
+                    "documents_ready": False,
+                    "documents": [],
+                }
+
+            if not is_yes and text:
+                # Treat as additional info; go back to clarify.
+                _intro_apply_text_to_kb(kb, text=text, profession_query=profession_query)
+                try:
+                    update_meta(kb)
+                except Exception:
+                    pass
+                brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+                assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
+                quick = ["Да, всё верно", "Исправить"]
+                try:
+                    update_session(
+                        sid,
+                        chat_state="intro",
+                        phase="INTRO_CONFIRM",
+                        brief_state=brief_state,
+                        vacancy_kb=kb,
+                        request_id=request_id,
+                    )
+                except Exception:
+                    pass
+                try:
+                    add_message(sid, "assistant", assistant_text, request_id=request_id)
+                except Exception:
+                    pass
+                missing_now = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
+                missing_now = [str(x) for x in (missing_now or []) if str(x).strip()]
+                return {
+                    "ok": True,
+                    "reply": assistant_text,
+                    "assistant_text": assistant_text,
+                    "quick_replies": quick,
+                    "brief_patch": {},
+                    "brief_state": brief_state,
+                    "ready_to_search": False,
+                    "missing_fields": missing_now,
+                    "documents_ready": False,
+                    "documents": [],
+                }
+
+            # Confirmed.
+            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            documents = []
+            documents_ready = False
+            try:
+                update_session(
+                    sid,
+                    chat_state="intro",
+                    phase="DONE",
+                    brief_state=brief_state,
+                    vacancy_kb=kb,
+                    request_id=request_id,
+                )
+            except Exception:
+                pass
             try:
                 art = create_artifact(
                     session_id=sid,
                     kind="intro_brief",
                     format="json",
-                    payload_json={"title": "Бриф поиска", "brief_state": next_brief},
+                    payload_json={"title": "Бриф поиска", "brief_state": brief_state},
                     meta={"title": "Бриф поиска"},
                     request_id=request_id,
                 )
@@ -3080,24 +3527,31 @@ def chat_message(body: ChatMessage, request: Request):
                         "id": str(art.get("id")),
                         "kind": "intro_brief",
                         "title": "Бриф поиска",
-                        "content": next_brief,
+                        "content": brief_state,
                     }
                 ]
             except Exception:
                 documents_ready = False
 
-        return {
-            "ok": True,
-            "reply": assistant_text,
-            "assistant_text": assistant_text,
-            "quick_replies": quick,
-            "brief_patch": patch,
-            "brief_state": next_brief,
-            "ready_to_search": server_ready,
-            "missing_fields": server_missing,
-            "documents_ready": documents_ready,
-            "documents": documents,
-        }
+            assistant_text = "Отлично. Запускаю подготовку документов."
+            try:
+                add_message(sid, "assistant", assistant_text, request_id=request_id)
+            except Exception:
+                pass
+            missing_now = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
+            missing_now = [str(x) for x in (missing_now or []) if str(x).strip()]
+            return {
+                "ok": True,
+                "reply": assistant_text,
+                "assistant_text": assistant_text,
+                "quick_replies": [],
+                "brief_patch": {},
+                "brief_state": brief_state,
+                "ready_to_search": True,
+                "missing_fields": missing_now,
+                "documents_ready": documents_ready,
+                "documents": documents,
+            }
 
     if msg_type == "start":
         session["state"] = "awaiting_flow"
@@ -4108,6 +4562,12 @@ def documents_catalog(request: Request):
 class DocumentGenerateBody(BaseModel):
     session_id: str
     doc_id: str
+    force: bool = False
+
+
+class DocumentGeneratePackBody(BaseModel):
+    session_id: str
+    force: bool = False
 
 
 @app.post("/documents/generate")
@@ -4140,39 +4600,51 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
     brief_state = sess.get("brief_state") if isinstance(sess.get("brief_state"), dict) else {}
     profession_query = str(sess.get("profession_query") or "")
 
+    force = bool(getattr(body, "force", False))
+
+    if not force:
+        existing = find_latest_document_by_identity(
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            request_id=request_id,
+        )
+        if existing and str(existing.get("status") or "") in {"ready", "pending", "error", "needs_input"}:
+            status = str(existing.get("status") or "")
+            log_event(
+                "doc_generate_cached",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                artifact_id=str(existing.get("id")),
+                status=status,
+            )
+            return {
+                "ok": True,
+                "cached": True,
+                "document": {
+                    "id": str(existing.get("id")),
+                    "session_id": session_id,
+                    "doc_id": doc_id,
+                    "title": str(cat.get("title") or doc_id),
+                    "status": status,
+                    "created_at": to_iso(existing.get("created_at")),
+                    "download_url": (f"/api/documents/{str(existing.get('id'))}/download" if status == "ready" else None),
+                    "missing_fields": (existing.get("meta") or {}).get("missing_fields") if isinstance(existing.get("meta"), dict) else None,
+                },
+            }
+
     active_tpl = get_active_document_template(doc_id=doc_id, request_id=request_id)
     if not active_tpl:
         # Should not happen if seeding worked.
         log_event("doc_generate_error", level="error", request_id=request_id, user_id=user_id, session_id=session_id, doc_id=doc_id, error="missing_active_template")
-        return {"ok": True, "status": "error", "error_code": "missing_template", "error_message": "No active template"}
+        return {"ok": True, "cached": False, "status": "error", "error_code": "missing_template", "error_message": "No active template"}
 
     template_id = str(active_tpl.get("id"))
     template_version = int(active_tpl.get("version") or 0)
 
     source_hash = _stable_hash({"profession_query": profession_query, "brief_state": brief_state})
-    existing = find_document_for_idempotency(
-        user_id=user_id,
-        session_id=session_id,
-        doc_id=doc_id,
-        template_id=template_id,
-        source_hash=source_hash,
-        request_id=request_id,
-    )
-    if existing and str(existing.get("status") or "") in {"ready", "pending", "error", "needs_input"}:
-        status = str(existing.get("status") or "")
-        return {
-            "ok": True,
-            "document": {
-                "id": str(existing.get("id")),
-                "session_id": session_id,
-                "doc_id": doc_id,
-                "title": str(cat.get("title") or doc_id),
-                "status": status,
-                "created_at": to_iso(existing.get("created_at")),
-                "download_url": (f"/api/documents/{str(existing.get('id'))}/download" if status == "ready" else None),
-                "missing_fields": (existing.get("meta") or {}).get("missing_fields") if isinstance(existing.get("meta"), dict) else None,
-            },
-        }
 
     required_fields = cat.get("required_fields") or []
     missing_req = _required_fields_missing(brief_state, required_fields)
@@ -4202,6 +4674,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
         )
         return {
             "ok": True,
+            "cached": False,
             "document": {
                 "id": str(row.get("id")),
                 "session_id": session_id,
@@ -4316,6 +4789,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
         )
         return {
             "ok": True,
+            "cached": False,
             "document": {
                 "id": document_id,
                 "session_id": session_id,
@@ -4327,30 +4801,17 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
             },
         }
 
-    if llm_model.missing_fields:
-        update_document_record(
-            document_id=document_id,
-            status="needs_input",
-            meta={"missing_fields": llm_model.missing_fields, "required_fields": required_fields, "quality_notes": llm_model.quality_notes},
-            request_id=request_id,
-        )
-        return {
-            "ok": True,
-            "document": {
-                "id": document_id,
-                "session_id": session_id,
-                "doc_id": doc_id,
-                "title": str(cat.get("title") or doc_id),
-                "status": "needs_input",
-                "missing_fields": llm_model.missing_fields,
-            },
-        }
+    missing_fields = llm_model.missing_fields or []
+    doc_markdown = llm_model.doc_markdown or ""
+    if missing_fields:
+        todo = "\n".join([f"- {str(x)}" for x in missing_fields])
+        doc_markdown = (doc_markdown.strip() + "\n\n---\n\n## TODO (не хватает данных)\n\n" + todo + "\n").strip() + "\n"
 
     generated_at = datetime.utcnow().isoformat() + "Z"
     final_markdown = _apply_template_body(
         template_body=str(active_tpl.get("body") or ""),
         title=str(cat.get("title") or doc_id),
-        doc_markdown=llm_model.doc_markdown,
+        doc_markdown=doc_markdown,
         generated_at=generated_at,
     )
 
@@ -4399,7 +4860,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
             error_message="S3_BUCKET not configured",
             request_id=request_id,
         )
-        return {"ok": True, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_not_configured"}}
+        return {"ok": True, "cached": False, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_not_configured"}}
 
     sha256 = _sha256_hex(pdf_bytes)
     object_key = f"documents/{user_id}/{session_id}/{doc_id}/{template_version}-{document_id}.pdf"
@@ -4448,7 +4909,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
             error_message=str(e),
             request_id=request_id,
         )
-        return {"ok": True, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_failed"}}
+        return {"ok": True, "cached": False, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_failed"}}
 
     update_document_record(
         document_id=document_id,
@@ -4456,7 +4917,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
         s3_bucket=bucket,
         s3_key=object_key,
         sha256=sha256,
-        meta={"required_fields": required_fields, "quality_notes": llm_model.quality_notes},
+        meta={"required_fields": required_fields, "missing_fields": missing_fields, "quality_notes": llm_model.quality_notes},
         request_id=request_id,
     )
     log_event(
@@ -4470,6 +4931,7 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
     )
     return {
         "ok": True,
+        "cached": False,
         "document": {
             "id": document_id,
             "session_id": session_id,
@@ -4480,6 +4942,129 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
             "created_at": to_iso(row.get("created_at")),
         },
     }
+
+
+@app.post("/documents/generate_pack")
+def documents_generate_pack(body: DocumentGeneratePackBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    sess = get_session(session_id, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    owner = sess.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        set_session_user(session_id, user_id, request_id=request_id)
+    except Exception:
+        pass
+
+    force = bool(getattr(body, "force", False))
+
+    # Strict: only catalog items with auto_generate=true and is_free=true
+    catalog = _load_documents_catalog()
+    items = [it for it in (catalog or []) if bool((it or {}).get("auto_generate")) and bool((it or {}).get("is_free", True))]
+    items.sort(key=lambda x: int((x or {}).get("sort_order") or 0))
+
+    log_event(
+        "doc_pack_generate_start",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        docs_count=len(items),
+        force=force,
+    )
+
+    results: list[dict] = []
+    for it in items:
+        doc_id = str((it or {}).get("id") or "").strip()
+        if not doc_id:
+            continue
+
+        log_event(
+            "doc_pack_item_start",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            force=force,
+        )
+
+        try:
+            resp = documents_generate(DocumentGenerateBody(session_id=session_id, doc_id=doc_id, force=force), request)
+            cached = bool((resp or {}).get("cached")) if isinstance(resp, dict) else False
+            doc = (resp or {}).get("document") if isinstance(resp, dict) else None
+            doc_status = (doc or {}).get("status") if isinstance(doc, dict) else None
+
+            if cached:
+                item_status = "cached"
+            else:
+                item_status = "generated" if str(doc_status or "") == "ready" else "failed"
+
+            item = {
+                "doc_id": doc_id,
+                "title": str((it or {}).get("title") or doc_id),
+                "status": item_status,
+                "artifact_id": (str((doc or {}).get("id")) if isinstance(doc, dict) else None),
+                "url": ((doc or {}).get("download_url") if isinstance(doc, dict) else None),
+            }
+            if item_status == "failed":
+                error_code = (doc or {}).get("error_code") if isinstance(doc, dict) else None
+                error_message = (doc or {}).get("error_message") if isinstance(doc, dict) else None
+                item["error"] = {
+                    "code": str(error_code or "failed"),
+                    "message": str(error_message or doc_status or "failed"),
+                }
+
+            results.append(item)
+            log_event(
+                "doc_pack_item_done",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                cached=cached,
+                status=item_status,
+                doc_status=doc_status,
+                artifact_id=(str((doc or {}).get("id")) if isinstance(doc, dict) else None),
+            )
+        except Exception as e:
+            # Never fail the whole pack.
+            results.append(
+                {
+                    "doc_id": doc_id,
+                    "title": str((it or {}).get("title") or doc_id),
+                    "status": "failed",
+                    "artifact_id": None,
+                    "url": None,
+                    "error": {"code": "exception", "message": str(e)},
+                }
+            )
+            log_event(
+                "doc_pack_item_failed",
+                level="error",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                error=str(e),
+            )
+
+    log_event(
+        "doc_pack_generate_done",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        results_count=len(results),
+    )
+    return {"ok": True, "session_id": session_id, "results": results}
 
 
 @app.get("/documents/{document_id}/download")
