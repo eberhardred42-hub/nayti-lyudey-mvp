@@ -2303,6 +2303,69 @@ def list_packs_for_user(user_id: str, request_id: str = "unknown") -> List[Dict[
             raise
 
 
+def list_packs_admin(
+    *,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    limit: int = 100,
+    request_id: str = "unknown",
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_packs_admin",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        limit=limit,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            safe_limit = int(limit or 100)
+            if safe_limit <= 0:
+                safe_limit = 100
+            if safe_limit > 500:
+                safe_limit = 500
+
+            cur.execute(
+                """
+                SELECT
+                    p.pack_id,
+                    p.session_id,
+                    p.user_id,
+                    p.created_at,
+                    u.phone_e164
+                FROM packs p
+                LEFT JOIN users u ON u.id::text = p.user_id
+                WHERE (%s IS NULL OR p.user_id = %s)
+                  AND (%s IS NULL OR p.session_id = %s)
+                ORDER BY p.created_at DESC
+                LIMIT %s
+                """,
+                (user_id, user_id, session_id, session_id, safe_limit),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_packs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_packs_admin",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
 def list_latest_render_jobs_for_pack(pack_id: str, request_id: str = "unknown") -> List[Dict[str, Any]]:
     """Return latest job per doc_id for the pack."""
     start = time.perf_counter()

@@ -38,6 +38,7 @@ from db import (
     get_pack,
     get_render_job,
     list_latest_render_jobs_for_pack,
+    list_packs_admin,
     list_packs_for_user,
 )
 from db import (
@@ -4723,6 +4724,329 @@ def me_packs(request: Request):
         packs_count=len(normalized),
     )
     return {"ok": True, "packs": normalized}
+
+
+@app.get("/admin/packs")
+def admin_packs(request: Request, limit: int = 100, user_id: str = "", phone: str = "", session_id: str = ""):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+
+    resolved_user_id: Optional[str] = (user_id or "").strip() or None
+    if (phone or "").strip():
+        phone_e164 = _normalize_phone_e164(phone)
+        resolved_user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
+
+    resolved_session_id: Optional[str] = (session_id or "").strip() or None
+
+    rows = list_packs_admin(
+        user_id=resolved_user_id,
+        session_id=resolved_session_id,
+        limit=limit,
+        request_id=request_id,
+    )
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "pack_id": str(r.get("pack_id") or ""),
+                "session_id": str(r.get("session_id") or ""),
+                "user_id": (str(r.get("user_id")) if r.get("user_id") is not None else None),
+                "phone_e164": (str(r.get("phone_e164")) if r.get("phone_e164") is not None else None),
+                "created_at": to_iso(r.get("created_at")),
+            }
+        )
+    log_event(
+        "admin_packs_listed",
+        request_id=request_id,
+        user_id=resolved_user_id,
+        session_id=resolved_session_id,
+        packs_count=len(items),
+    )
+    return {"ok": True, "items": items}
+
+
+@app.get("/admin/packs/{pack_id}/documents")
+def admin_pack_documents(pack_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    _ = _require_admin(request)
+
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    docs_all = _load_documents_registry(request_id=request_id)
+    doc_ids = [str(d.get("doc_id") or "").strip() for d in docs_all if str(d.get("doc_id") or "").strip()]
+    access_map = get_document_access_map(doc_ids, request_id=request_id)
+    meta_map = get_document_metadata_map(doc_ids, request_id=request_id)
+    docs = []
+    for d in docs_all:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        if _effective_doc_enabled(d, access_map.get(doc_id)):
+            docs.append(d)
+
+    latest_jobs = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
+    by_doc = {str(j.get("doc_id")): j for j in latest_jobs}
+
+    out = []
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        j = by_doc.get(doc_id)
+        access_info = _doc_access_info(d, access_map.get(doc_id))
+        status = "queued" if j else "queued"
+        file_id = None
+        attempts = 0
+        last_error = None
+        if j:
+            status = str(j.get("status") or "queued")
+            attempts = int(j.get("attempts") or 0)
+            last_error = j.get("last_error")
+            if status == "ready":
+                file_id = get_latest_file_id_for_render_job(str(j.get("id")), request_id=request_id)
+        out.append(
+            {
+                "doc_id": doc_id,
+                "title": _effective_doc_title(d, meta_map.get(doc_id)),
+                "status": status,
+                "file_id": file_id,
+                "attempts": attempts,
+                "last_error": last_error,
+                "access": access_info,
+            }
+        )
+
+    log_event(
+        "admin_render_status_listed",
+        request_id=request_id,
+        pack_id=pack_id,
+        docs_count=len(out),
+    )
+    return {"ok": True, "pack_id": pack_id, "pack": {"pack_id": str(pack.get("pack_id")), "session_id": str(pack.get("session_id")), "user_id": pack.get("user_id")}, "documents": out}
+
+
+@app.post("/admin/packs/{pack_id}/render")
+def admin_pack_render(pack_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    session_id = str(pack.get("session_id") or "")
+    docs_all = _load_documents_registry(request_id=request_id)
+    doc_ids = [str(d.get("doc_id") or "").strip() for d in docs_all if str(d.get("doc_id") or "").strip()]
+    access_map = get_document_access_map(doc_ids, request_id=request_id)
+    meta_map = get_document_metadata_map(doc_ids, request_id=request_id)
+    docs = []
+    for d in docs_all:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        if _effective_doc_enabled(d, access_map.get(doc_id)):
+            docs.append(d)
+    if not docs:
+        raise HTTPException(status_code=500, detail="Documents registry is empty")
+
+    log_event(
+        "admin_render_pack_requested",
+        request_id=request_id,
+        pack_id=pack_id,
+        docs_total=len(docs),
+    )
+
+    existing = list_latest_render_jobs_for_pack(pack_id, request_id=request_id)
+    existing_by_doc = {str(r.get("doc_id")): r for r in existing}
+
+    created = 0
+    skipped = 0
+    enqueued = 0
+    rcli = _redis_client()
+
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        if not doc_id:
+            continue
+        prev = existing_by_doc.get(doc_id)
+        if prev and str(prev.get("status")) in {"queued", "rendering", "ready"}:
+            skipped += 1
+            continue
+
+        job = create_render_job(
+            pack_id=pack_id,
+            session_id=session_id,
+            user_id=None,
+            doc_id=doc_id,
+            status="queued",
+            max_attempts=5,
+            request_id=request_id,
+        )
+        job_id = str(job.get("id") or "")
+        if not job_id:
+            continue
+        created += 1
+
+        _record_config_snapshot_artifact(
+            session_id=session_id,
+            pack_id=pack_id,
+            doc_id=doc_id,
+            render_job_id=job_id,
+            request_id=request_id,
+        )
+
+        render_request = _build_render_request(
+            doc_id=doc_id,
+            title=_effective_doc_title(d, meta_map.get(doc_id)),
+            pack_id=pack_id,
+            session_id=session_id,
+        )
+        msg = json.dumps(
+            {
+                "job_id": job_id,
+                "pack_id": pack_id,
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "render_request": render_request,
+            },
+            ensure_ascii=False,
+        )
+        rcli.rpush(RENDER_QUEUE_NAME, msg)
+        enqueued += 1
+
+    log_event(
+        "admin_render_jobs_enqueued",
+        request_id=request_id,
+        pack_id=pack_id,
+        jobs_created=created,
+        jobs_skipped=skipped,
+        jobs_enqueued=enqueued,
+    )
+
+    try:
+        sess = (auth.get("admin_session") or {})
+        user = (auth.get("admin_user") or {})
+        record_admin_audit(
+            request=request,
+            admin_user_id=str(user.get("id") or ""),
+            admin_session_id=str(sess.get("id") or ""),
+            action="pack_render",
+            target_type="pack",
+            target_id=pack_id,
+            before_obj=None,
+            after_obj={"jobs_created": created, "jobs_skipped": skipped, "jobs_enqueued": enqueued},
+            summary=None,
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "pack_id": pack_id, "jobs_created": created, "jobs_skipped": skipped}
+
+
+@app.post("/admin/packs/{pack_id}/render/{doc_id}")
+def admin_pack_render_doc(pack_id: str, doc_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+
+    pack = get_pack(pack_id, request_id=request_id)
+    if not pack:
+        raise HTTPException(status_code=404, detail="Pack not found")
+
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        raise HTTPException(status_code=400, detail="doc_id is required")
+
+    session_id = str(pack.get("session_id") or "")
+    log_event(
+        "admin_render_doc_regenerate_requested",
+        request_id=request_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+    )
+
+    docs = _load_documents_registry(request_id=request_id)
+    registry_doc = None
+    for d in docs:
+        if str(d.get("doc_id") or "").strip() == doc_id:
+            registry_doc = d
+            break
+    if not registry_doc:
+        raise HTTPException(status_code=404, detail="Doc not found")
+
+    access_row = get_document_access_map([doc_id], request_id=request_id).get(doc_id)
+    if not _effective_doc_enabled(registry_doc, access_row):
+        raise HTTPException(status_code=400, detail="DOCUMENT_DISABLED")
+
+    job = create_render_job(
+        pack_id=pack_id,
+        session_id=session_id,
+        user_id=None,
+        doc_id=doc_id,
+        status="queued",
+        max_attempts=5,
+        request_id=request_id,
+    )
+    job_id = str(job.get("id") or "")
+    if not job_id:
+        raise HTTPException(status_code=500, detail="Failed to create render job")
+
+    _record_config_snapshot_artifact(
+        session_id=session_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        render_job_id=job_id,
+        request_id=request_id,
+    )
+
+    meta_row = get_document_metadata_map([doc_id], request_id=request_id).get(doc_id)
+    title = _effective_doc_title(registry_doc, meta_row)
+
+    render_request = _build_render_request(
+        doc_id=doc_id,
+        title=title,
+        pack_id=pack_id,
+        session_id=session_id,
+    )
+    msg = json.dumps(
+        {
+            "job_id": job_id,
+            "pack_id": pack_id,
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "render_request": render_request,
+        },
+        ensure_ascii=False,
+    )
+    _redis_client().rpush(RENDER_QUEUE_NAME, msg)
+    log_event(
+        "admin_render_job_created",
+        request_id=request_id,
+        render_job_id=job_id,
+        pack_id=pack_id,
+        doc_id=doc_id,
+        session_id=session_id,
+    )
+
+    try:
+        sess = (auth.get("admin_session") or {})
+        user = (auth.get("admin_user") or {})
+        record_admin_audit(
+            request=request,
+            admin_user_id=str(user.get("id") or ""),
+            admin_session_id=str(sess.get("id") or ""),
+            action="pack_render_doc",
+            target_type="pack_doc",
+            target_id=f"{pack_id}:{doc_id}",
+            before_obj=None,
+            after_obj={"job_id": job_id},
+            summary=None,
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "pack_id": pack_id, "doc_id": doc_id, "job_id": job_id}
 
 
 @app.post("/packs/{pack_id}/render")

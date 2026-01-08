@@ -13,8 +13,6 @@ const NAV = [
   { title: "Packs", href: "/admin/packs", page: "packs" },
   { title: "Documents", href: "/admin/documents", page: "documents" },
   { title: "Configs", href: "/admin/configs", page: "configs" },
-  { title: "Pricing", href: "/admin/pricing", page: "pricing" },
-  { title: "Flags", href: "/admin/flags", page: "flags" },
   { title: "Alerts", href: "/admin/alerts", page: "alerts" },
   { title: "Logs", href: "/admin/logs", page: "logs" },
 ];

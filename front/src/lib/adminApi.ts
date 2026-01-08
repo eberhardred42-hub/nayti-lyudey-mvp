@@ -252,3 +252,26 @@ export async function adminLogs(params?: {
   if (params?.limit) url.searchParams.set("limit", String(params.limit));
   return adminFetch(url.pathname + url.search, { method: "GET" });
 }
+
+export async function adminPacksList(params?: { limit?: number; user_id?: string; phone?: string; session_id?: string }) {
+  const url = new URL("/api/admin/packs", window.location.origin);
+  if (params?.limit != null) url.searchParams.set("limit", String(params.limit));
+  if (params?.user_id) url.searchParams.set("user_id", params.user_id);
+  if (params?.phone) url.searchParams.set("phone", params.phone);
+  if (params?.session_id) url.searchParams.set("session_id", params.session_id);
+  return adminFetch(url.pathname + url.search, { method: "GET" });
+}
+
+export async function adminPackDocuments(packId: string) {
+  return adminFetch(`/api/admin/packs/${encodeURIComponent(packId)}/documents`, { method: "GET" });
+}
+
+export async function adminPackRender(packId: string) {
+  return adminFetch(`/api/admin/packs/${encodeURIComponent(packId)}/render`, { method: "POST" });
+}
+
+export async function adminPackRenderDoc(packId: string, docId: string) {
+  return adminFetch(`/api/admin/packs/${encodeURIComponent(packId)}/render/${encodeURIComponent(docId)}`, {
+    method: "POST",
+  });
+}
