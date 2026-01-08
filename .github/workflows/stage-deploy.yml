@@ -35,13 +35,19 @@ jobs:
           set -euo pipefail
           APP_DIR="$HOME/app"
 
-          if ! docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
-            docker run -d --name caddy --restart unless-stopped --network host \
-              -v "$APP_DIR/Caddyfile:/etc/caddy/Caddyfile" \
-              -v caddy_data:/data -v caddy_config:/config caddy:2
-          else
-            docker restart caddy
+          # Always take Caddyfile from the repo (avoid any heredoc leftovers on the VM)
+          cp -f "$APP_DIR/infra/Caddyfile" "$APP_DIR/Caddyfile"
+
+          # Recreate to ensure we always run with the correct mounted file (read-only)
+          if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
+            docker rm -f caddy
           fi
+
+          docker run -d --name caddy --restart unless-stopped --network host \
+            -v "$APP_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            -v caddy_data:/data -v caddy_config:/config caddy:2
+
+          docker exec caddy caddy validate --config /etc/caddy/Caddyfile
 
       - name: Smoke checks
         shell: bash
