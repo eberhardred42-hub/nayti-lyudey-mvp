@@ -70,6 +70,8 @@ bash tests/test-stage4.sh
 cd ~/app
 docker compose -f infra/docker-compose.yml ps
 
+```
+
 
 Внешний вход: Caddy (TLS + reverse proxy)
 
@@ -148,3 +150,122 @@ cd ~/app
 git pull
 docker compose -f infra/docker-compose.yml up -d --build
 docker restart caddy
+
+---
+
+# Система: полное описание (для чтения/ресёрча кода)
+
+## TL;DR
+
+Это full-stack MVP:
+
+- `front/` (Next.js) — одностраничник + прокси `/api/*`.
+- `api/` (FastAPI) — сессии, чат, документы, админка, storage.
+- `render/` — сервис рендера PDF из markdown.
+- `db`/`redis`/`minio` — Postgres + очередь + S3-совместимое хранилище.
+
+Ключевой E2E флоу: **ввод профессии → интро-диалог (бриф) → генерация PDF-документа → скачивание**.
+
+## Сервисы и роли
+
+См. `infra/docker-compose.yml`:
+
+- `front` — Next.js UI. Важно: браузер никогда не ходит напрямую в `api`; всё через `/api/*`.
+- `api` — FastAPI. Основные маршруты: сессии, чат, документы, health.
+- `render` — HTTP сервис `POST /render/pdf` (markdown → PDF).
+- `render-worker` — выполняет фоновые задачи, использует Redis.
+- `db` — Postgres.
+- `redis` — Redis.
+- `minio` — S3 API для файлов.
+
+## Границы и роутинг (Caddy + /api)
+
+Критичный инвариант:
+
+- UI обращается к API через `/api/*`.
+- FastAPI роуты определены **без префикса `/api`**.
+- Поэтому Caddy/Next proxy должны **срезать** `/api` (через `handle_path /api/*`).
+
+## Данные и хранение
+
+Две большие категории данных:
+
+1) **Состояние/метаданные** в Postgres (сессии, сообщения, документы, файлы, job’ы).
+2) **Файлы** (PDF) в S3/MinIO (bucket + key), с раздачей через download/presign/stream.
+
+## Чат: как устроен интро-диалог
+
+Точка входа: `POST /chat/message` (через фронтовый `/api/chat/message`).
+
+Основные типы сообщений:
+
+- `intro_start` — выдаёт стартовый вопрос и быстрые ответы.
+- `intro_message` — принимает текст пользователя, обновляет `brief_state`, выдаёт следующий вопрос.
+
+В ответе возвращаются поля:
+
+- `reply` / `assistant_text` — текст ассистента.
+- `quick_replies` — массив до 4 кнопок.
+- `brief_state` + `brief_patch` — текущее состояние брифа и патч.
+- `ready_to_search` — признак, что бриф заполнен достаточно.
+
+### Quick replies: динамика vs fallback
+
+- На старте (`intro_start`) кнопки генерируются из fallback-логики (по missing fields), чтобы работало даже без LLM.
+- На сообщениях (`intro_message`) кнопки может предложить LLM, но они нормализуются (строки, максимум 4) и всегда есть fallback.
+
+## Documents pipeline v1 (LLM → PDF → S3)
+
+Каталог документов лежит в `api/documents/catalog.json`.
+
+Промпты документов лежат в `api/prompts/docs/<doc_id>/`.
+
+Схема:
+
+1) `POST /documents/generate` — создаёт/обновляет запись документа, генерирует markdown (LLM или fallback).
+2) markdown отправляется в `render` → получаем PDF.
+3) PDF загружается в S3/MinIO и регистрируется в Postgres.
+4) UI видит PDF в `/me/documents` и даёт скачать через `/documents/{id}/download`.
+
+## LLM: как подключается
+
+LLM обёрнут в `api/llm_client.py` и использует OpenAI-compatible API.
+
+Ключевые env:
+
+- `LLM_PROVIDER` (`mock` или `openai_compat`)
+- `LLM_BASE_URL`, `LLM_API_KEY`
+- `OPENROUTER_API_KEY`, `OPENAI_API_KEY` (опционально)
+- `LLM_MODEL`
+
+Важно: большая часть флоу должна **деградировать**, но не падать при `LLM_PROVIDER=mock`.
+
+## Тестирование и смоки
+
+Локально:
+
+```bash
+bash tests/quick-test.sh
+```
+
+DEV e2e (не трогает контейнеры, только ходит в API):
+
+```bash
+BASE_URL="https://dev.naitilyudei.ru/api" bash scripts/smoke-documents-v1-dev.sh
+```
+
+## Последние изменения (кратко)
+
+См. историю `git log -n 10 --oneline`. В последних коммитах:
+
+- Документы pipeline v1 + smoke’и + подключение smoke к DEV deploy.
+- Устойчивость фронта: безопасный JSON парсинг, чтобы одностраничник не падал на пустом ответе.
+
+## Инструкция для ChatGPT-ресёрчера
+
+Если вы используете другой LLM/агент для анализа кода, держитесь этих правил:
+
+1) Всегда сохраняйте инвариант `/api`-префикса (UI) vs роутов FastAPI (без `/api`).
+2) Любой прокси-роут Next.js должен быть устойчив к пустому/не-JSON ответу.
+3) Любые изменения должны проверяться хотя бы `bash tests/quick-test.sh` и, по возможности, DEV smoke.
+4) Не “улучшайте” UX без запроса: это MVP, главное — воспроизводимый E2E.
