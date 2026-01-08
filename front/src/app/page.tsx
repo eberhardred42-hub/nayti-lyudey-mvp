@@ -68,6 +68,16 @@ export default function Page() {
   // Mode: "search" or "chat"
   const mode = stage === "start" ? "search" : "chat";
 
+  async function readJsonSafe(resp: Response): Promise<unknown | null> {
+    const raw = await resp.text();
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      return null;
+    }
+  }
+
   function authHeaders(): Record<string, string> {
     const token = getUserToken();
     if (token) return { Authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}` };
@@ -82,8 +92,10 @@ export default function Page() {
         headers: authHeaders(),
         cache: "no-store",
       });
-      const data = await r.json();
-      const docs: unknown[] = Array.isArray(data?.documents) ? (data.documents as unknown[]) : [];
+      const data = await readJsonSafe(r);
+      if (!data || typeof data !== "object") return;
+      const dataObj = data as Record<string, unknown>;
+      const docs: unknown[] = Array.isArray(dataObj.documents) ? (dataObj.documents as unknown[]) : [];
       const pdf = docs
         .map((v) => {
           if (!v || typeof v !== "object") return null;
@@ -122,8 +134,9 @@ export default function Page() {
         headers: authHeaders(),
         cache: "no-store",
       });
-      const cat = await catR.json();
-      const rawItems: unknown[] = Array.isArray(cat?.items) ? (cat.items as unknown[]) : [];
+      const cat = await readJsonSafe(catR);
+      const catObj = cat && typeof cat === "object" ? (cat as Record<string, unknown>) : null;
+      const rawItems: unknown[] = Array.isArray(catObj?.items) ? (catObj.items as unknown[]) : [];
       const items = rawItems.map(normalizeCatalogItem).filter(Boolean) as Array<{ id: string; title: string; sort_order: number }>;
       items.sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0));
       const first = items[0];
@@ -136,10 +149,11 @@ export default function Page() {
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ session_id: sid, doc_id: docId }),
       });
-      const gen = await genR.json();
-      const doc = gen?.document;
+      const gen = await readJsonSafe(genR);
+      const genObj = gen && typeof gen === "object" ? (gen as Record<string, unknown>) : null;
+      const doc = genObj?.document && typeof genObj.document === "object" ? (genObj.document as Record<string, unknown>) : null;
       const status = String(doc?.status || "");
-      if (doc?.id) {
+      if (doc && typeof doc.id === "string" && doc.id) {
         setAutoDoc({ id: String(doc.id), title: String(doc.title || title), status });
       }
 
@@ -147,9 +161,9 @@ export default function Page() {
         pushAssistantOnce(`Документ «${String(doc?.title || title)}» готов. Нажми «Скачать».`);
         await refreshMeDocuments();
       } else if (status === "needs_input") {
-        const missing = Array.isArray(doc?.missing_fields) ? doc.missing_fields : [];
+        const missing = Array.isArray(doc?.missing_fields) ? (doc.missing_fields as unknown[]) : [];
         pushAssistantOnce(
-          `Пока не могу собрать документ «${String(doc?.title || title)}». Не хватает: ${missing.join(", ") || "данных"}.`
+          `Пока не могу собрать документ «${String(doc?.title || title)}». Не хватает: ${missing.map(String).join(", ") || "данных"}.`
         );
       } else if (status === "error") {
         pushAssistantOnce(`Не получилось собрать документ «${String(doc?.title || title)}». Попробуй позже.`);
@@ -215,29 +229,46 @@ export default function Page() {
     if (!profession.trim()) return;
     setAutoDoc(null);
     setAutoGenStarted(false);
-    const r = await fetch("/api/sessions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ profession_query: profession.trim() }),
-    });
+    try {
+      const r = await fetch("/api/sessions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ profession_query: profession.trim() }),
+      });
 
-    const data = await r.json();
-    setSessionId(data.session_id);
+      const data = await readJsonSafe(r);
+      const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+      const sid = typeof dataObj?.session_id === "string" ? dataObj.session_id : "";
+      if (!sid) throw new Error("no_session_id");
+      setSessionId(sid);
 
-    // immediately call backend chat start
-    const resp = await fetch("/api/chat/message", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ session_id: data.session_id, type: "intro_start" }),
-    });
-    const body = await resp.json();
-    if (body.reply) setMessages([{ role: "assistant", text: body.reply }]);
-    setQuickReplies(body.quick_replies || []);
-    if (body.ready_to_search || body.documents_ready) {
-      await ensureAutoDocumentGenerated(String(data.session_id));
+      // immediately call backend chat start
+      const resp = await fetch("/api/chat/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ session_id: sid, type: "intro_start" }),
+      });
+      const body = await readJsonSafe(resp);
+      const bodyObj = body && typeof body === "object" ? (body as Record<string, unknown>) : null;
+      const reply = typeof bodyObj?.reply === "string" ? bodyObj.reply : "";
+      const qrs = Array.isArray(bodyObj?.quick_replies) ? (bodyObj?.quick_replies as unknown[]) : [];
+      const readyToSearch = Boolean(bodyObj?.ready_to_search);
+      const documentsReady = Boolean(bodyObj?.documents_ready);
+
+      if (reply) setMessages([{ role: "assistant", text: reply }]);
+      setQuickReplies(qrs.map(String).filter(Boolean));
+
+      if (readyToSearch || documentsReady) {
+        await ensureAutoDocumentGenerated(String(sid));
+        await refreshMeDocuments();
+      }
+      if (qrs.length) setStage("choose_flow");
+    } catch {
+      setMessages([{ role: "assistant", text: "Сервис временно недоступен. Попробуй ещё раз." }]);
+      setQuickReplies([]);
+      setStage("choose_flow");
       await refreshMeDocuments();
     }
-    if ((body.quick_replies || []).length) setStage("choose_flow");
   }
 
   function pushAssistantOnce(text: string) {
@@ -250,9 +281,10 @@ export default function Page() {
     setReportError(null);
     try {
       const r = await fetch(`/api/report/free?session_id=${sid}`);
-      const data = await r.json();
-      if (r.ok && data.free_report) {
-        setFreeReport(data.free_report);
+      const data = await readJsonSafe(r);
+      const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+      if (r.ok && dataObj?.free_report && typeof dataObj.free_report === "object") {
+        setFreeReport(dataObj.free_report as FreeReport);
       } else {
         setReportError("Не удалось загрузить отчёт, попробуй обновить");
       }
@@ -265,18 +297,28 @@ export default function Page() {
 
   async function sendToChat(text: string) {
     if (!sessionId) return;
-    const r = await fetch("/api/chat/message", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", ...authHeaders() },
-      body: JSON.stringify({ session_id: sessionId, type: "intro_message", text }),
-    });
-    const data = await r.json();
-    if (data.reply) setMessages((m) => [...m, { role: "assistant", text: data.reply }]);
-    setQuickReplies(data.quick_replies || []);
+    try {
+      const r = await fetch("/api/chat/message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ session_id: sessionId, type: "intro_message", text }),
+      });
+      const data = await readJsonSafe(r);
+      const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+      const reply = typeof dataObj?.reply === "string" ? dataObj.reply : "";
+      const qrs = Array.isArray(dataObj?.quick_replies) ? (dataObj.quick_replies as unknown[]) : [];
+      const readyToSearch = Boolean(dataObj?.ready_to_search);
+      const documentsReady = Boolean(dataObj?.documents_ready);
 
-    if ((data.ready_to_search || data.documents_ready) && sessionId) {
-      await ensureAutoDocumentGenerated(sessionId);
-      await refreshMeDocuments();
+      if (reply) setMessages((m) => [...m, { role: "assistant", text: reply }]);
+      setQuickReplies(qrs.map(String).filter(Boolean));
+
+      if ((readyToSearch || documentsReady) && sessionId) {
+        await ensureAutoDocumentGenerated(sessionId);
+        await refreshMeDocuments();
+      }
+    } catch {
+      pushAssistantOnce("Сервис временно недоступен. Попробуй ещё раз.");
     }
   }
 
