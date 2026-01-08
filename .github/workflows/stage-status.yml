@@ -1,0 +1,21 @@
+name: Stage Status
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Print status + last logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$HOME/app"
+          docker compose -f infra/docker-compose.yml ps
+          echo "---- CADDY LOGS ----"
+          docker logs --tail=100 caddy || true
+          echo "---- STACK LOGS ----"
+          docker compose -f infra/docker-compose.yml logs --no-color --tail=120 || true
+          echo "---- SMOKE ----"
+          curl -I https://naitilyudei.ru/api/docs | head -n 5 || true
