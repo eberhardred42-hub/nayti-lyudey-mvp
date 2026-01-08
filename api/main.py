@@ -249,6 +249,43 @@ def _mask_phone(phone_e164: str | None) -> str:
     return f"{s[:2]}****{s[-2:]}"
 
 
+# ==========================================================================
+# Static admin login (stage/tests only; feature-flagged)
+# ==========================================================================
+
+
+def _normalize_phone(phone: str) -> str:
+    """Normalize RU-like phone to canonical digits.
+
+    Rules:
+    - keep only digits
+    - if starts with 8 and length 11: replace leading 8 -> 7
+    - if starts with 7: keep as-is
+    Canonical output: 11 digits starting with '7' (e.g. 79061234567)
+    """
+    digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    if not digits:
+        return ""
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return digits
+    return ""
+
+
+def _static_admin_enabled() -> bool:
+    return _env_bool("STATIC_ADMIN_LOGIN_ENABLED", default=False)
+
+
+def _static_admin_phone_norm() -> str:
+    return _normalize_phone((os.environ.get("STATIC_ADMIN_PHONE") or "").strip())
+
+
+def _static_admin_code() -> str:
+    # Never log this value.
+    return (os.environ.get("STATIC_ADMIN_CODE") or "").strip()
+
+
 def _verify_admin_password(admin_password: str) -> bool:
     stored = _admin_password_hash_hex()
     salt = _admin_password_salt()
@@ -2106,7 +2143,11 @@ except Exception as e:
     )
 
 class SessionCreate(BaseModel):
-    profession_query: str
+    # Backward-compatible: existing callers send profession_query.
+    profession_query: str = ""
+    # Optional static admin login for stage/tests (feature-flagged).
+    phone: str | None = None
+    code: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -2598,7 +2639,12 @@ def chat_message(body: ChatMessage, request: Request):
             )
         
         log_reply(state=session["state"])
-        return {"reply": reply, "quick_replies": quick_replies, "should_show_free_result": False}
+        return {
+            "reply": reply,
+            "quick_replies": quick_replies,
+            "clarifying_questions": clarifying_questions,
+            "should_show_free_result": False,
+        }
 
     if state == "awaiting_tasks":
         session["tasks"] = text
@@ -3093,10 +3139,63 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     session_id = str(uuid.uuid4())
+
+    phone_raw = (body.phone or "").strip() if hasattr(body, "phone") else ""
+    code_raw = (body.code or "").strip() if hasattr(body, "code") else ""
+    want_static_login = bool(phone_raw) and bool(code_raw)
+
+    token: str | None = None
+    user_id: str | None = None
+    phone_norm: str | None = None
+
+    if want_static_login:
+        if not _static_admin_enabled():
+            raise HTTPException(status_code=403, detail="static_admin_login_disabled")
+
+        phone_norm = _normalize_phone(phone_raw)
+        expected_phone = _static_admin_phone_norm()
+        expected_code = _static_admin_code()
+
+        # Never log the code.
+        if not phone_norm or not expected_phone or not expected_code:
+            log_event(
+                "static_admin_login_misconfigured",
+                level="warning",
+                request_id=request_id,
+            )
+            raise HTTPException(status_code=503, detail="static_admin_login_misconfigured")
+
+        if phone_norm != expected_phone or not hmac.compare_digest(code_raw, expected_code):
+            time.sleep(0.3 + random.random() * 0.2)
+            log_event(
+                "static_admin_login_fail",
+                level="warning",
+                request_id=request_id,
+                phone=_mask_phone(phone_norm),
+            )
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        # Deterministic user_id for this phone.
+        user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_norm))
+        token = str(uuid.uuid4())
+        TOKENS[token] = {"user_id": user_id, "phone_e164": phone_norm, "role": "admin"}
+        try:
+            ensure_user(user_id=user_id, phone_e164=phone_norm, request_id=request_id)
+        except Exception:
+            pass
+        log_event(
+            "static_admin_login_ok",
+            request_id=request_id,
+            phone=_mask_phone(phone_norm),
+        )
     
     # Create in-memory session for backward compatibility
+    profession_query = (body.profession_query or "").strip()
+    if want_static_login and not profession_query:
+        profession_query = "stage admin"
+
     SESSIONS[session_id] = {
-        "profession_query": body.profession_query,
+        "profession_query": profession_query,
         "state": "awaiting_flow",
         "vacancy_text": None,
         "tasks": None,
@@ -3107,10 +3206,12 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     # Also save to database
     try:
         kb = make_empty_vacancy_kb()
-        db_create_session(session_id, body.profession_query, kb, request_id=request_id)
-        user_id = _get_user_id(request)
+        db_create_session(session_id, profession_query, kb, request_id=request_id)
+        req_user_id = _get_user_id(request)
         if user_id:
             set_session_user(session_id, user_id, request_id=request_id)
+        elif req_user_id:
+            set_session_user(session_id, req_user_id, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -3130,7 +3231,11 @@ def create_session_endpoint(body: SessionCreate, request: Request):
         method=request.method,
         duration_ms=compute_duration_ms(start_time),
     )
-    return {"session_id": session_id}
+    resp = {"session_id": session_id}
+    if want_static_login and token and user_id:
+        # Backward-compatible: keep returning session_id; add auth fields for stage/tests.
+        resp.update({"ok": True, "token": token, "user_id": user_id, "role": "admin"})
+    return resp
 
 
 @app.post("/debug/s3/put-test-pdf")

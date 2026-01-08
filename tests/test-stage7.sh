@@ -47,19 +47,31 @@ wait_url "$ML_URL/health" "ml"
 wait_url "$BASE_URL/health/llm" "llm"
 
 step "Create session"
+STATIC_ADMIN_PHONE=${STATIC_ADMIN_PHONE:-89062592834}
+STATIC_ADMIN_CODE=${STATIC_ADMIN_CODE:-1573}
 HDR="$(mktemp -p "$TMPDIR" stage7-hdr.XXXXXX)"
 BODY="$(mktemp -p "$TMPDIR" stage7-body.XXXXXX)"
 chmod 644 "$HDR" "$BODY" || true
 CODE="$(curl -sS -D "$HDR" -o "$BODY" -w '%{http_code}' \
   -X POST "$BASE_URL/sessions" \
   -H "Content-Type: application/json" \
-  -d '{"profession_query":"stage7 llm"}')"
+  -d "{\"phone\":\"$STATIC_ADMIN_PHONE\",\"code\":\"$STATIC_ADMIN_CODE\"}")"
 
 SESSION_ID=$(python3 - "$BODY" <<'PY'
 import json,sys
 try:
     data=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
     print(data.get("session_id",""))
+except Exception:
+    print("")
+PY
+)
+
+TOKEN=$(python3 - "$BODY" <<'PY'
+import json,sys
+try:
+    data=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
+    print(data.get("token",""))
 except Exception:
     print("")
 PY
@@ -75,9 +87,14 @@ if [[ "$CODE" != "200" || -z "$SESSION_ID" ]]; then
   exit 1
 fi
 step "Session: $SESSION_ID"
+AUTH_HEADER=()
+if [[ -n "$TOKEN" ]]; then
+  AUTH_HEADER=(-H "Authorization: Bearer $TOKEN")
+fi
 
 step "Send start message"
 curl -s -D "$HEADERS_FILE" -o /tmp/stage7_chat1.json -X POST \
+  "${AUTH_HEADER[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"session_id\":\"$SESSION_ID\",\"type\":\"start\"}" \
   "$BASE_URL/chat/message" >/dev/null
@@ -85,21 +102,31 @@ curl -s -D "$HEADERS_FILE" -o /tmp/stage7_chat1.json -X POST \
 step "Move to vacancy text branch"
 VAC_PROMPT="Есть текст вакансии"
 curl -s -o /tmp/stage7_chat2.json -X POST \
+  "${AUTH_HEADER[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"session_id\":\"$SESSION_ID\",\"type\":\"message\",\"text\":\"$VAC_PROMPT\"}" \
   "$BASE_URL/chat/message" >/dev/null
 
 step "Send long vacancy text to reach clarifications"
 VACANCY_TEXT="Ищем разработчика. Нужны Python, PostgreSQL, умение работать с API, опыт 5 лет. Москва или другой город, возможен гибрид. Вакансия включает задачи по бэкенду, интеграции, поддержке. Важны коммуникации, ответственность, соблюдение сроков. Предлагаем проектную работу с возможностью полного дня. Бюджет обсуждается, готовы рассмотреть разные варианты."
-CLAR_RESPONSE=$(curl -s -X POST \
+CLAR_BODY="$(mktemp -p "$TMPDIR" stage7-clar-body.XXXXXX)"
+CLAR_CODE=$(curl -sS -o "$CLAR_BODY" -w '%{http_code}' -X POST \
+  "${AUTH_HEADER[@]}" \
   -H "Content-Type: application/json" \
   -d "{\"session_id\":\"$SESSION_ID\",\"type\":\"message\",\"text\":\"$VACANCY_TEXT\"}" \
   "$BASE_URL/chat/message")
 
+if [[ "$CLAR_CODE" != "200" ]]; then
+  echo "[stage7][error] /chat/message HTTP_CODE=$CLAR_CODE"
+  echo "--- body ---"
+  cat "$CLAR_BODY" || true
+  exit 1
+fi
+
 step "Validate clarifications contain questions and quick replies"
-echo "$CLAR_RESPONSE" | python3 - <<'PY'
+python3 - "$CLAR_BODY" <<'PY'
 import json,sys
-payload=json.load(sys.stdin)
+payload=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
 qs=payload.get("clarifying_questions") or []
 qr=payload.get("quick_replies") or []
 if not qs:
