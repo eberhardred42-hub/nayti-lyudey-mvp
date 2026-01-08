@@ -31,7 +31,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _s3_settings() -> Dict[str, Any]:
-    endpoint = (os.environ.get("S3_ENDPOINT") or "").strip() or None
+    endpoint = (
+        (os.environ.get("S3_ENDPOINT") or "").strip()
+        or (os.environ.get("S3_ENDPOINT_URL") or "").strip()
+        or None
+    )
     presign_endpoint = (os.environ.get("S3_PRESIGN_ENDPOINT") or "").strip() or None
     region = (os.environ.get("S3_REGION") or "us-east-1").strip()
     access_key = (os.environ.get("S3_ACCESS_KEY") or "").strip() or None
@@ -97,6 +101,7 @@ def upload_bytes(
     key: str,
     data: bytes,
     content_type: str,
+    metadata: Optional[Dict[str, Any]] = None,
     request_id: str = "unknown",
 ) -> Dict[str, Any]:
     """Upload bytes to S3-compatible storage."""
@@ -113,12 +118,20 @@ def upload_bytes(
     )
 
     try:
-        resp = _client().put_object(
-            Bucket=bucket,
-            Key=key,
-            Body=data,
-            ContentType=content_type,
-        )
+        meta: Optional[Dict[str, str]]
+        if metadata:
+            meta = {str(k): str(v) for k, v in metadata.items() if v is not None}
+        else:
+            meta = None
+        kwargs: Dict[str, Any] = {
+            "Bucket": bucket,
+            "Key": key,
+            "Body": data,
+            "ContentType": content_type,
+        }
+        if meta is not None:
+            kwargs["Metadata"] = meta
+        resp = _client().put_object(**kwargs)
         etag = resp.get("ETag")
         log_event(
             "s3_upload_ok",
@@ -149,6 +162,65 @@ def upload_bytes(
                 "bucket": bucket,
                 "object_key": key,
                 "size_bytes": size_bytes,
+                "error": str(e),
+            },
+        )
+        raise
+
+
+def stream_get(
+    bucket: str,
+    key: str,
+    request_id: str = "unknown",
+    chunk_size: int = 64 * 1024,
+):
+    """Stream object bytes from S3-compatible storage (generator of bytes chunks)."""
+    start = time.perf_counter()
+    log_event(
+        "s3_get_start",
+        request_id=request_id,
+        bucket=bucket,
+        object_key=key,
+    )
+    try:
+        resp = _client().get_object(Bucket=bucket, Key=key)
+        body = resp.get("Body")
+        if body is None:
+            raise RuntimeError("s3_get_missing_body")
+
+        bytes_sent = 0
+        while True:
+            chunk = body.read(chunk_size)
+            if not chunk:
+                break
+            bytes_sent += len(chunk)
+            yield chunk
+
+        log_event(
+            "s3_get_ok",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            bytes_sent=bytes_sent,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+        )
+    except Exception as e:
+        log_event(
+            "s3_get_error",
+            level="error",
+            request_id=request_id,
+            bucket=bucket,
+            object_key=key,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
+            error=str(e),
+        )
+        send_alert(
+            severity="error",
+            event="s3_get_error",
+            request_id=request_id,
+            context={
+                "bucket": bucket,
+                "object_key": key,
                 "error": str(e),
             },
         )

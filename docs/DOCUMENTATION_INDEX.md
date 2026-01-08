@@ -12,6 +12,8 @@
 
 **DEV/PROD на одном сервере?** → Read [ENVIRONMENTS.md](ENVIRONMENTS.md)
 
+**Documents pipeline v1 (LLM → PDF → S3)?** → Read [DOCUMENTS_PIPELINE_V1.md](DOCUMENTS_PIPELINE_V1.md)
+
 **Stage 9.3 (Storage / MinIO / S3)?** → Read:
 - [STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)
 - [STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)
@@ -37,6 +39,7 @@
 | **[STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)** | NEW | Storage (MinIO/S3) overview + what shipped | 5 min |
 | **[STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)** | NEW | Storage implementation + runbook | 15 min |
 | **[RUNBOOK.md](RUNBOOK.md)** | 13K | Setup, testing, deployment, and troubleshooting guide | Reference |
+| **[DOCUMENTS_PIPELINE_V1.md](DOCUMENTS_PIPELINE_V1.md)** | NEW | LLM→PDF→S3 pipeline overview + manual verification | 8 min |
 
 ### Status & Navigation Files
 

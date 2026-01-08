@@ -1,0 +1,26 @@
+[
+  {
+    "id": "search_brief",
+    "title": "Бриф поиска (PDF)",
+    "description": "Короткий PDF-бриф: кого ищем, зачем и ограничения.",
+    "required_fields": ["role", "goal", "constraints"],
+    "sort_order": 10,
+    "is_free": true
+  },
+  {
+    "id": "vacancy_draft",
+    "title": "Черновик вакансии (PDF)",
+    "description": "Простой черновик текста вакансии на основе вводных.",
+    "required_fields": ["role", "goal", "constraints"],
+    "sort_order": 20,
+    "is_free": true
+  },
+  {
+    "id": "interview_plan",
+    "title": "План интервью (PDF)",
+    "description": "Список тем и вопросов для интервью под роль.",
+    "required_fields": ["role", "goal"],
+    "sort_order": 30,
+    "is_free": true
+  }
+]

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import styles from "./page.module.css";
-import { clearUserSession, getUserToken } from "@/lib/userSession";
+import { clearUserSession, getOrCreateUserId, getUserToken } from "@/lib/userSession";
 import { UserLoginModal } from "@/components/UserLoginModal";
 
 type Msg = { role: "user" | "assistant"; text: string };
@@ -47,6 +47,9 @@ export default function Page() {
   const [reportError, setReportError] = useState<string | null>(null);
   const [loginOpen, setLoginOpen] = useState(false);
   const [userToken, setUserTokenState] = useState<string | null>(null);
+  const [autoDoc, setAutoDoc] = useState<{ id: string; title: string; status: string } | null>(null);
+  const [autoGenStarted, setAutoGenStarted] = useState(false);
+  const [pdfDocs, setPdfDocs] = useState<Array<{ id: string; title: string; status: string }>>([]);
 
   const boxRef = useRef<HTMLDivElement | null>(null);
 
@@ -65,6 +68,119 @@ export default function Page() {
   // Mode: "search" or "chat"
   const mode = stage === "start" ? "search" : "chat";
 
+  function authHeaders(): Record<string, string> {
+    const token = getUserToken();
+    if (token) return { Authorization: token.startsWith("Bearer ") ? token : `Bearer ${token}` };
+    const userId = getOrCreateUserId();
+    return userId ? { "X-User-Id": userId } : {};
+  }
+
+  async function refreshMeDocuments() {
+    try {
+      const r = await fetch("/api/me/documents", {
+        method: "GET",
+        headers: authHeaders(),
+        cache: "no-store",
+      });
+      const data = await r.json();
+      const docs: unknown[] = Array.isArray(data?.documents) ? (data.documents as unknown[]) : [];
+      const pdf = docs
+        .map((v) => {
+          if (!v || typeof v !== "object") return null;
+          const o = v as Record<string, unknown>;
+          if (o.type !== "pdf") return null;
+          const id = typeof o.id === "string" ? o.id : "";
+          if (!id) return null;
+          const title = typeof o.title === "string" ? o.title : "Документ";
+          const status = typeof o.status === "string" ? o.status : "";
+          return { id, title, status };
+        })
+        .filter(Boolean) as Array<{ id: string; title: string; status: string }>;
+      setPdfDocs(pdf);
+    } catch {
+      // ignore
+    }
+  }
+
+  async function ensureAutoDocumentGenerated(sid: string) {
+    if (!sid) return;
+    if (autoGenStarted) return;
+    setAutoGenStarted(true);
+    try {
+      function normalizeCatalogItem(v: unknown): { id: string; title: string; sort_order: number } | null {
+        if (!v || typeof v !== "object") return null;
+        const o = v as Record<string, unknown>;
+        const id = typeof o.id === "string" ? o.id : "";
+        if (!id) return null;
+        const title = typeof o.title === "string" ? o.title : id;
+        const sort_order = typeof o.sort_order === "number" ? o.sort_order : Number(o.sort_order || 0);
+        return { id, title, sort_order: Number.isFinite(sort_order) ? sort_order : 0 };
+      }
+
+      const catR = await fetch("/api/documents/catalog", {
+        method: "GET",
+        headers: authHeaders(),
+        cache: "no-store",
+      });
+      const cat = await catR.json();
+      const rawItems: unknown[] = Array.isArray(cat?.items) ? (cat.items as unknown[]) : [];
+      const items = rawItems.map(normalizeCatalogItem).filter(Boolean) as Array<{ id: string; title: string; sort_order: number }>;
+      items.sort((a, b) => Number(a.sort_order || 0) - Number(b.sort_order || 0));
+      const first = items[0];
+      const docId = String(first?.id || "");
+      const title = String(first?.title || docId || "Документ");
+      if (!docId) return;
+
+      const genR = await fetch("/api/documents/generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders() },
+        body: JSON.stringify({ session_id: sid, doc_id: docId }),
+      });
+      const gen = await genR.json();
+      const doc = gen?.document;
+      const status = String(doc?.status || "");
+      if (doc?.id) {
+        setAutoDoc({ id: String(doc.id), title: String(doc.title || title), status });
+      }
+
+      if (status === "ready") {
+        pushAssistantOnce(`Документ «${String(doc?.title || title)}» готов. Нажми «Скачать».`);
+        await refreshMeDocuments();
+      } else if (status === "needs_input") {
+        const missing = Array.isArray(doc?.missing_fields) ? doc.missing_fields : [];
+        pushAssistantOnce(
+          `Пока не могу собрать документ «${String(doc?.title || title)}». Не хватает: ${missing.join(", ") || "данных"}.`
+        );
+      } else if (status === "error") {
+        pushAssistantOnce(`Не получилось собрать документ «${String(doc?.title || title)}». Попробуй позже.`);
+        await refreshMeDocuments();
+      }
+    } catch {
+      pushAssistantOnce("Не удалось запустить генерацию документа. Попробуй позже.");
+    }
+  }
+
+  async function downloadDocument(documentId: string, title: string) {
+    if (!documentId) return;
+    const r = await fetch(`/api/documents/${documentId}/download`, {
+      method: "GET",
+      headers: authHeaders(),
+    });
+    if (!r.ok) {
+      pushAssistantOnce("Не удалось скачать документ. Попробуй ещё раз.");
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${title || "document"}.pdf`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
   // Автоскролл вниз при новых сообщениях
   useEffect(() => {
     const el = boxRef.current;
@@ -72,11 +188,36 @@ export default function Page() {
     el.scrollTop = el.scrollHeight;
   }, [messages.length, stage, freeReport]);
 
+  // Периодически подтягиваем список документов, чтобы PDF появлялись без перезагрузки
+  useEffect(() => {
+    if (!sessionId) return;
+    if (mode !== "chat") return;
+
+    let alive = true;
+    const tick = async () => {
+      if (!alive) return;
+      await refreshMeDocuments();
+    };
+
+    // сразу и затем по таймеру
+    void tick();
+    const t = window.setInterval(() => {
+      void tick();
+    }, 15000);
+
+    return () => {
+      alive = false;
+      window.clearInterval(t);
+    };
+  }, [sessionId, mode, userToken]);
+
   async function start() {
     if (!profession.trim()) return;
+    setAutoDoc(null);
+    setAutoGenStarted(false);
     const r = await fetch("/api/sessions", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...authHeaders() },
       body: JSON.stringify({ profession_query: profession.trim() }),
     });
 
@@ -86,14 +227,17 @@ export default function Page() {
     // immediately call backend chat start
     const resp = await fetch("/api/chat/message", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: data.session_id, type: "start" }),
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ session_id: data.session_id, type: "intro_start" }),
     });
     const body = await resp.json();
     if (body.reply) setMessages([{ role: "assistant", text: body.reply }]);
     setQuickReplies(body.quick_replies || []);
-    if (body.should_show_free_result) setStage("free_result");
-    else if ((body.quick_replies || []).length) setStage("choose_flow");
+    if (body.ready_to_search || body.documents_ready) {
+      await ensureAutoDocumentGenerated(String(data.session_id));
+      await refreshMeDocuments();
+    }
+    if ((body.quick_replies || []).length) setStage("choose_flow");
   }
 
   function pushAssistantOnce(text: string) {
@@ -123,22 +267,17 @@ export default function Page() {
     if (!sessionId) return;
     const r = await fetch("/api/chat/message", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ session_id: sessionId, type: "user", text }),
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ session_id: sessionId, type: "intro_message", text }),
     });
     const data = await r.json();
     if (data.reply) setMessages((m) => [...m, { role: "assistant", text: data.reply }]);
     setQuickReplies(data.quick_replies || []);
-    if (data.should_show_free_result) {
-      setStage("free_result");
-      // Fetch the free report
-      await fetchFreeReport(sessionId);
+
+    if ((data.ready_to_search || data.documents_ready) && sessionId) {
+      await ensureAutoDocumentGenerated(sessionId);
+      await refreshMeDocuments();
     }
-    // try to infer stage from reply text
-    const low = (data.reply || "").toLowerCase();
-    if (low.includes("вставь") && low.includes("ваканс")) setStage("vacancy_text");
-    else if (low.includes("опиши") || low.includes("задач")) setStage("tasks");
-    else if (low.includes("уточн")) setStage("clarifications");
   }
 
   function handleChoose(hasVacancy: boolean) {
@@ -312,6 +451,40 @@ export default function Page() {
                     </button>
                   </>
                 )}
+              </div>
+            )}
+
+            {/* Auto-generated first document */}
+            {autoDoc?.status === "ready" && (
+              <div className={styles.freeReportBox}>
+                <h4>Документ готов</h4>
+                <div>{autoDoc.title}</div>
+                <button
+                  className={styles.fullPackageBtn}
+                  onClick={() => downloadDocument(autoDoc.id, autoDoc.title)}
+                >
+                  Скачать
+                </button>
+              </div>
+            )}
+
+            {/* List of PDF documents */}
+            {pdfDocs.length > 0 && (
+              <div className={styles.freeReportBox}>
+                <h4>Твои документы</h4>
+                {pdfDocs.map((d) => (
+                  <div key={d.id} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+                    <div style={{ flex: 1 }}>
+                      {d.title}
+                      {d.status && d.status !== "ready" ? ` (${d.status})` : ""}
+                    </div>
+                    {d.status === "ready" && (
+                      <button className={styles.fullPackageBtn} onClick={() => downloadDocument(d.id, d.title)}>
+                        Скачать
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             )}
           </div>

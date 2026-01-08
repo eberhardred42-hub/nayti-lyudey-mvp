@@ -365,6 +365,128 @@ def init_db():
             ON document_access(updated_at)
             """
         )
+
+        # ------------------------------------------------------------------
+        # Documents pipeline v1: templates + generated documents
+        # ------------------------------------------------------------------
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS document_templates (
+                id UUID PRIMARY KEY,
+                doc_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version INT NOT NULL,
+                body TEXT NOT NULL,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                UNIQUE (doc_id, version)
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_templates_doc
+            ON document_templates(doc_id)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_document_templates_doc_active
+            ON document_templates(doc_id, is_active)
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id UUID PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                template_id UUID NOT NULL REFERENCES document_templates(id) ON DELETE RESTRICT,
+                template_version INT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'ready', 'error', 'needs_input')),
+                s3_bucket TEXT NULL,
+                s3_key TEXT NULL,
+                sha256 TEXT NULL,
+                error_code TEXT NULL,
+                error_message TEXT NULL,
+                source_hash TEXT NOT NULL,
+                meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ DEFAULT now(),
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_user_created
+            ON documents(user_id, created_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_user_session_doc
+            ON documents(user_id, session_id, doc_id, created_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_status_updated
+            ON documents(status, updated_at)
+            """
+        )
+        cur.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_documents_doc_template
+            ON documents(doc_id, template_id, template_version)
+            """
+        )
+
+        # Seed default active templates (version=1) per doc in catalog.
+        # Safe to run multiple times.
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            catalog_path = os.path.join(here, "documents", "catalog.json")
+            if os.path.exists(catalog_path):
+                with open(catalog_path, "r", encoding="utf-8") as f:
+                    catalog = json.load(f)
+            else:
+                catalog = []
+        except Exception:
+            catalog = []
+
+        default_body = (
+            "# {{title}}\n\n"
+            "Сгенерировано: {{generated_at}}\n\n"
+            "---\n\n"
+            "{{doc_markdown}}\n"
+        )
+
+        for item in (catalog or []):
+            doc_id = str((item or {}).get("id") or "").strip()
+            title = str((item or {}).get("title") or doc_id).strip() or doc_id
+            if not doc_id:
+                continue
+            # If no templates exist for doc_id, create v1 active.
+            cur.execute(
+                "SELECT COUNT(1) FROM document_templates WHERE doc_id = %s",
+                (doc_id,),
+            )
+            cnt = int((cur.fetchone() or [0])[0] or 0)
+            if cnt > 0:
+                continue
+            template_id = uuid.uuid4()
+            cur.execute(
+                """
+                INSERT INTO document_templates (id, doc_id, name, version, body, is_active)
+                VALUES (%s, %s, %s, %s, %s, TRUE)
+                """,
+                (str(template_id), doc_id, f"default:{title}", 1, default_body),
+            )
         
         conn.commit()
 
@@ -1031,6 +1153,568 @@ def create_artifact(
                 query_name="create_artifact",
                 request_id=request_id,
                 artifact_id=artifact_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Documents pipeline v1: templates + generated documents
+# ==========================================================================
+
+
+def list_document_templates(
+    *,
+    request_id: str = "unknown",
+    doc_id: Optional[str] = None,
+    limit: int = 200,
+) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_document_templates",
+        request_id=request_id,
+        doc_id=doc_id,
+        limit=limit,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            if doc_id:
+                cur.execute(
+                    """
+                    SELECT id, doc_id, name, version, body, is_active, created_at
+                    FROM document_templates
+                    WHERE doc_id = %s
+                    ORDER BY doc_id ASC, version DESC
+                    LIMIT %s
+                    """,
+                    (doc_id, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT id, doc_id, name, version, body, is_active, created_at
+                    FROM document_templates
+                    ORDER BY doc_id ASC, version DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_document_templates",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_document_templates",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_active_document_template(*, doc_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_active_document_template",
+        request_id=request_id,
+        doc_id=doc_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, doc_id, name, version, body, is_active, created_at
+                FROM document_templates
+                WHERE doc_id = %s AND is_active = TRUE
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (doc_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_active_document_template",
+                request_id=request_id,
+                doc_id=doc_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_active_document_template",
+                request_id=request_id,
+                doc_id=doc_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_document_template_by_id(*, template_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_template_by_id",
+        request_id=request_id,
+        template_id=template_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, doc_id, name, version, body, is_active, created_at
+                FROM document_templates
+                WHERE id = %s
+                """,
+                (template_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_template_by_id",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_template_by_id",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_document_template_version(
+    *,
+    doc_id: str,
+    name: str,
+    body: str,
+    request_id: str = "unknown",
+    make_active: bool = True,
+) -> Dict[str, Any]:
+    template_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_document_template_version",
+        request_id=request_id,
+        template_id=template_id,
+        doc_id=doc_id,
+        make_active=make_active,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT COALESCE(MAX(version), 0) AS v FROM document_templates WHERE doc_id = %s", (doc_id,))
+            v = int((cur.fetchone() or {}).get("v") or 0)
+            next_version = v + 1
+
+            if make_active:
+                cur.execute("UPDATE document_templates SET is_active = FALSE WHERE doc_id = %s", (doc_id,))
+
+            cur.execute(
+                """
+                INSERT INTO document_templates (id, doc_id, name, version, body, is_active)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id, doc_id, name, version, body, is_active, created_at
+                """,
+                (template_id, doc_id, name, next_version, body, bool(make_active)),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_document_template_version",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_document_template_version",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def activate_document_template(*, template_id: str, request_id: str = "unknown") -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="activate_document_template",
+        request_id=request_id,
+        template_id=template_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT id, doc_id FROM document_templates WHERE id = %s", (template_id,))
+            row0 = cur.fetchone()
+            if not row0:
+                return None
+            doc_id = str(row0.get("doc_id"))
+
+            cur.execute("UPDATE document_templates SET is_active = FALSE WHERE doc_id = %s", (doc_id,))
+            cur.execute("UPDATE document_templates SET is_active = TRUE WHERE id = %s", (template_id,))
+
+            cur.execute(
+                """
+                SELECT id, doc_id, name, version, body, is_active, created_at
+                FROM document_templates
+                WHERE id = %s
+                """,
+                (template_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="activate_document_template",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="activate_document_template",
+                request_id=request_id,
+                template_id=template_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def create_document_record(
+    *,
+    user_id: str,
+    session_id: str,
+    doc_id: str,
+    template_id: str,
+    template_version: int,
+    status: str,
+    source_hash: str,
+    meta: Optional[Dict[str, Any]] = None,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    document_id = str(uuid.uuid4())
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="create_document_record",
+        request_id=request_id,
+        document_id=document_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        template_id=template_id,
+        status=status,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO documents (
+                    id, user_id, session_id, doc_id, template_id, template_version,
+                    status, source_hash, meta
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    document_id,
+                    user_id,
+                    session_id,
+                    doc_id,
+                    template_id,
+                    int(template_version),
+                    status,
+                    source_hash,
+                    psycopg2.extras.Json(meta or {}),
+                ),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="create_document_record",
+                request_id=request_id,
+                document_id=document_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="create_document_record",
+                request_id=request_id,
+                document_id=document_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def find_document_for_idempotency(
+    *,
+    user_id: str,
+    session_id: str,
+    doc_id: str,
+    template_id: str,
+    source_hash: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    """Return latest document row for the same (user, session, doc, template, source_hash)."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="find_document_for_idempotency",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        template_id=template_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT *
+                FROM documents
+                WHERE user_id = %s
+                  AND session_id = %s
+                  AND doc_id = %s
+                  AND template_id = %s
+                  AND source_hash = %s
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (user_id, session_id, doc_id, template_id, source_hash),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="find_document_for_idempotency",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="find_document_for_idempotency",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def update_document_record(
+    *,
+    document_id: str,
+    status: Optional[str] = None,
+    s3_bucket: Optional[str] = None,
+    s3_key: Optional[str] = None,
+    sha256: Optional[str] = None,
+    error_code: Optional[str] = None,
+    error_message: Optional[str] = None,
+    meta: Optional[Dict[str, Any]] = None,
+    clear_error: bool = False,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="update_document_record",
+        request_id=request_id,
+        document_id=document_id,
+        status=status,
+    )
+    updates: List[str] = []
+    params: List[Any] = []
+    if status is not None:
+        updates.append("status = %s")
+        params.append(status)
+    if s3_bucket is not None:
+        updates.append("s3_bucket = %s")
+        params.append(s3_bucket)
+    if s3_key is not None:
+        updates.append("s3_key = %s")
+        params.append(s3_key)
+    if sha256 is not None:
+        updates.append("sha256 = %s")
+        params.append(sha256)
+    if error_code is not None:
+        updates.append("error_code = %s")
+        params.append(error_code)
+    if error_message is not None:
+        updates.append("error_message = %s")
+        params.append(error_message)
+    if clear_error:
+        updates.append("error_code = NULL")
+        updates.append("error_message = NULL")
+    if meta is not None:
+        updates.append("meta = %s")
+        params.append(psycopg2.extras.Json(meta or {}))
+
+    if not updates:
+        return get_document_for_user(document_id=document_id, user_id=None, request_id=request_id)
+
+    updates.append("updated_at = now()")
+    params.append(document_id)
+
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                f"UPDATE documents SET {', '.join(updates)} WHERE id = %s RETURNING *",
+                tuple(params),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="update_document_record",
+                request_id=request_id,
+                document_id=document_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="update_document_record",
+                request_id=request_id,
+                document_id=document_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def list_documents_for_user(*, user_id: str, request_id: str = "unknown", limit: int = 100) -> List[Dict[str, Any]]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_documents_for_user",
+        request_id=request_id,
+        user_id=user_id,
+        limit=limit,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT *
+                FROM documents
+                WHERE user_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_documents_for_user",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            return [dict(r) for r in rows]
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_documents_for_user",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_document_for_user(
+    *,
+    document_id: str,
+    user_id: Optional[str],
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    """If user_id is None, does not check ownership (admin/internal)."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_document_for_user",
+        request_id=request_id,
+        document_id=document_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            if user_id is None:
+                cur.execute("SELECT * FROM documents WHERE id = %s", (document_id,))
+            else:
+                cur.execute("SELECT * FROM documents WHERE id = %s AND user_id = %s", (document_id, user_id))
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_document_for_user",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else None
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_document_for_user",
+                request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),
             )

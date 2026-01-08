@@ -1,5 +1,3 @@
-import { NextResponse } from "next/server";
-
 export async function POST(req: Request) {
   const body = await req.json();
   const backendUrl = process.env.BACKEND_URL || "http://api:8000";
@@ -10,12 +8,15 @@ export async function POST(req: Request) {
   if (auth) headers["Authorization"] = auth;
   else if (userId) headers["X-User-Id"] = userId;
 
-  const r = await fetch(`${backendUrl}/chat/message`, {
+  const r = await fetch(`${backendUrl}/documents/generate`, {
     method: "POST",
     headers,
     body: JSON.stringify(body),
   });
 
-  const data = await r.json();
-  return NextResponse.json(data, { status: r.status });
+  const text = await r.text();
+  return new Response(text, {
+    status: r.status,
+    headers: { "Content-Type": r.headers.get("content-type") || "application/json" },
+  });
 }

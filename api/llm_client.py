@@ -4,11 +4,6 @@ import time
 import urllib.request
 import urllib.error
 
-LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "mock").strip().lower() or "mock"
-LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "").strip()
-LLM_API_KEY = (os.environ.get("LLM_API_KEY", "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip())
-LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
-
 
 def _log_event(event: str, level: str = "info", **fields):
     try:
@@ -37,7 +32,6 @@ def _template_from_missing(missing_fields):
     if any("compensation" in f for f in missing_fields):
         questions.append("Какой бюджет или вилка по оплате?")
         quick_replies.append("Есть бюджет")
-    # Deduplicate while preserving order
     seen = set()
     quick_replies_unique = []
     for qr in quick_replies:
@@ -45,6 +39,41 @@ def _template_from_missing(missing_fields):
             quick_replies_unique.append(qr)
             seen.add(qr)
     return questions, quick_replies_unique[:6]
+
+
+def _llm_settings() -> dict:
+    provider_raw = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+
+    api_key = (
+        (os.environ.get("LLM_API_KEY") or "").strip()
+        or (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+        or (os.environ.get("OPENAI_API_KEY") or "").strip()
+    )
+
+    base_url = (
+        (os.environ.get("LLM_BASE_URL") or "").strip()
+        or (os.environ.get("OPENROUTER_BASE_URL") or "").strip()
+        or (os.environ.get("OPENAI_BASE_URL") or "").strip()
+    )
+
+    if not base_url:
+        if (os.environ.get("OPENROUTER_API_KEY") or "").strip():
+            base_url = "https://openrouter.ai/api/v1"
+        elif (os.environ.get("OPENAI_API_KEY") or "").strip():
+            base_url = "https://api.openai.com/v1"
+
+    model = (os.environ.get("LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
+
+    if provider_raw in {"mock", "openai_compat"}:
+        provider = provider_raw
+    else:
+        provider = "openai_compat" if (api_key and base_url) else "mock"
+
+    return {"provider": provider, "base_url": base_url, "api_key": api_key, "model": model}
+
+
+def current_llm_provider() -> str:
+    return str(_llm_settings().get("provider") or "mock")
 
 
 def generate_json_mock(prompt: str, schema_hint: dict, request_id: str, session_id: str):
@@ -58,11 +87,12 @@ def generate_json_mock(prompt: str, schema_hint: dict, request_id: str, session_
 
 
 def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str, session_id: str):
-    if not LLM_BASE_URL or not LLM_API_KEY:
-        raise RuntimeError("missing LLM_BASE_URL or LLM_API_KEY")
-    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    s = _llm_settings()
+    if not s["base_url"] or not s["api_key"]:
+        raise RuntimeError("missing api_key or base_url")
+    url = str(s["base_url"]).rstrip("/") + "/chat/completions"
     body = {
-        "model": LLM_MODEL,
+        "model": s["model"],
         "messages": [
             {"role": "system", "content": "You are a concise assistant that returns JSON only."},
             {"role": "user", "content": prompt},
@@ -73,7 +103,7 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {LLM_API_KEY}")
+    req.add_header("Authorization", f"Bearer {s['api_key']}")
     start = time.perf_counter()
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -86,7 +116,7 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
     _log_event(
         "llm_response",
         provider="openai_compat",
-        model=LLM_MODEL,
+        model=s["model"],
         request_id=request_id,
         session_id=session_id,
         duration_ms=duration_ms,
@@ -110,7 +140,7 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
             "llm_invalid_output",
             level="error",
             provider="openai_compat",
-            model=LLM_MODEL,
+            model=s["model"],
             request_id=request_id,
             session_id=session_id,
             error=f"invalid_content_json {e}",
@@ -123,11 +153,12 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
 
     Must return a JSON object (via response_format).
     """
-    if not LLM_BASE_URL or not LLM_API_KEY:
-        raise RuntimeError("missing LLM_BASE_URL or LLM_API_KEY")
-    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    s = _llm_settings()
+    if not s["base_url"] or not s["api_key"]:
+        raise RuntimeError("missing api_key or base_url")
+    url = str(s["base_url"]).rstrip("/") + "/chat/completions"
     body = {
-        "model": LLM_MODEL,
+        "model": s["model"],
         "messages": messages,
         "response_format": {"type": "json_object"},
         "temperature": 0.2,
@@ -135,7 +166,7 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
-    req.add_header("Authorization", f"Bearer {LLM_API_KEY}")
+    req.add_header("Authorization", f"Bearer {s['api_key']}")
 
     start = time.perf_counter()
     try:
@@ -147,7 +178,6 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
         raise RuntimeError(str(e))
 
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
-    # Do NOT log prompt contents.
     prompt_chars = 0
     try:
         prompt_chars = sum(len(str(m.get("content") or "")) for m in (messages or []))
@@ -156,7 +186,7 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
     _log_event(
         "llm_response",
         provider="openai_compat",
-        model=LLM_MODEL,
+        model=s["model"],
         request_id=request_id,
         session_id=session_id,
         duration_ms=duration_ms,
@@ -182,7 +212,7 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
             "llm_invalid_output",
             level="error",
             provider="openai_compat",
-            model=LLM_MODEL,
+            model=s["model"],
             request_id=request_id,
             session_id=session_id,
             error=f"invalid_content_json {e}",
@@ -195,18 +225,18 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
 
 def generate_json_messages(messages: list[dict], request_id: str, session_id: str, fallback: dict) -> dict:
     """Provider wrapper returning JSON dict; never raises."""
-    provider = LLM_PROVIDER
+    s = _llm_settings()
+    provider = s["provider"]
     try:
         if provider == "openai_compat":
             return generate_json_openai_compat_messages(messages, request_id=request_id, session_id=session_id)
-        # default mock
         return fallback
     except Exception as e:
         _log_event(
             "llm_error",
             level="error",
             provider=provider,
-            model=LLM_MODEL,
+            model=s["model"],
             request_id=request_id,
             session_id=session_id,
             error=str(e),
@@ -218,7 +248,9 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     request_id = context.get("request_id", "unknown")
     session_id = context.get("session_id", "unknown")
     missing_fields = context.get("missing_fields") or []
-    provider = LLM_PROVIDER
+
+    s = _llm_settings()
+    provider = s["provider"]
 
     prompt_parts = [
         "Ты помогаешь рекрутеру уточнить вводные. Верни JSON с ключами questions и quick_replies.",
@@ -231,7 +263,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     _log_event(
         "llm_request",
         provider=provider,
-        model=LLM_MODEL,
+        model=s["model"],
         request_id=request_id,
         session_id=session_id,
         prompt_chars=len(prompt),
@@ -249,18 +281,19 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
             "llm_error",
             level="error",
             provider=provider,
-            model=LLM_MODEL,
+            model=s["model"],
             request_id=request_id,
             session_id=session_id,
             error=str(e),
         )
         questions, quick_replies = _template_from_missing(missing_fields)
         return {"questions": questions[:3], "quick_replies": quick_replies[:6]}
+
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
     _log_event(
         "llm_response",
         provider=provider,
-        model=LLM_MODEL,
+        model=s["model"],
         request_id=request_id,
         session_id=session_id,
         duration_ms=duration_ms,
@@ -268,15 +301,6 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     )
 
     if not isinstance(result, dict):
-        _log_event(
-            "llm_invalid_output",
-            level="error",
-            provider=provider,
-            model=LLM_MODEL,
-            request_id=request_id,
-            session_id=session_id,
-            error="result_not_dict",
-        )
         questions, quick_replies = _template_from_missing(missing_fields)
         return {"questions": questions[:3], "quick_replies": quick_replies[:6]}
 
@@ -294,11 +318,12 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
 
 
 def health_llm() -> dict:
-    provider = LLM_PROVIDER
+    s = _llm_settings()
+    provider = s["provider"]
     if provider == "mock":
         return {"ok": True, "provider": "mock"}
     if provider == "openai_compat":
-        if not LLM_BASE_URL or not LLM_API_KEY:
-            return {"ok": False, "provider": "openai_compat", "reason": "missing LLM_API_KEY or LLM_BASE_URL"}
+        if not s["base_url"] or not s["api_key"]:
+            return {"ok": False, "provider": "openai_compat", "reason": "missing api_key or base_url"}
         return {"ok": True, "provider": "openai_compat"}
     return {"ok": False, "provider": provider, "reason": "unsupported provider"}

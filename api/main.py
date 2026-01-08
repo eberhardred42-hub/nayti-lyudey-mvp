@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import urllib.request
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uuid
 import redis
@@ -18,6 +19,18 @@ from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
 from db import list_user_files, list_user_intro_documents
+from db import (
+    activate_document_template,
+    create_document_record,
+    create_document_template_version,
+    find_document_for_idempotency,
+    get_active_document_template,
+    get_document_for_user,
+    get_document_template_by_id,
+    list_document_templates,
+    list_documents_for_user,
+    update_document_record,
+)
 from db import (
     create_pack,
     create_render_job,
@@ -66,9 +79,9 @@ from db import (
     upsert_document_access,
     upsert_document_metadata,
 )
-from llm_client import generate_questions_and_quick_replies, health_llm, generate_json_messages
+from llm_client import current_llm_provider, generate_questions_and_quick_replies, generate_json_messages, health_llm
 from storage.s3_client import health_s3_env, head_bucket_if_debug
-from storage.s3_client import upload_bytes, presign_get
+from storage.s3_client import upload_bytes, presign_get, stream_get
 
 app = FastAPI()
 SESSIONS = {}
@@ -1312,6 +1325,116 @@ def admin_logs(
     return {"ok": True, "items": items}
 
 
+class AdminTemplateCreateBody(BaseModel):
+    doc_id: str
+    name: str
+    body: str
+
+
+@app.get("/admin/templates")
+def admin_templates_list(doc_id: str = "", limit: int = 200, request: Request = None):
+    request_id = get_request_id_from_request(request) if request else "unknown"
+    _ = _require_admin(request)
+
+    did = (doc_id or "").strip() or None
+    safe_limit = int(limit or 200)
+    if safe_limit <= 0:
+        safe_limit = 200
+    if safe_limit > 1000:
+        safe_limit = 1000
+
+    rows = list_document_templates(request_id=request_id, doc_id=did, limit=safe_limit)
+    items: list[dict] = []
+    for r in rows:
+        items.append(
+            {
+                "id": str(r.get("id")),
+                "doc_id": r.get("doc_id"),
+                "name": r.get("name"),
+                "version": int(r.get("version") or 0),
+                "is_active": bool(r.get("is_active")),
+                "created_at": to_iso(r.get("created_at")),
+                "body": r.get("body"),
+            }
+        )
+    return {"ok": True, "items": items}
+
+
+@app.post("/admin/templates")
+def admin_templates_create(body: AdminTemplateCreateBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+
+    doc_id = (body.doc_id or "").strip()
+    name = (body.name or "").strip()
+    template_body = body.body or ""
+    if not doc_id or not name or not template_body.strip():
+        _admin_error("BAD_REQUEST", "doc_id, name, body are required", 400)
+
+    if not _catalog_item(doc_id):
+        _admin_error("DOC_NOT_FOUND", "doc_id not found in catalog", 404)
+
+    row = create_document_template_version(
+        doc_id=doc_id,
+        name=name,
+        body=template_body,
+        make_active=True,
+        request_id=request_id,
+    )
+
+    try:
+        admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+        admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="template_create",
+            target_type="document_template",
+            target_id=str(row.get("id")),
+            before_obj=None,
+            after_obj={"doc_id": doc_id, "name": name, "version": row.get("version"), "is_active": True},
+            summary=None,
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "template": row}
+
+
+@app.post("/admin/templates/{template_id}/activate")
+def admin_templates_activate(template_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    auth = _require_admin(request)
+
+    tid = (template_id or "").strip()
+    if not tid:
+        _admin_error("BAD_REQUEST", "template_id is required", 400)
+
+    row = activate_document_template(template_id=tid, request_id=request_id)
+    if not row:
+        _admin_error("NOT_FOUND", "Template not found", 404)
+
+    try:
+        admin_user_id = str((auth.get("admin_user") or {}).get("id") or "")
+        admin_session_id = str((auth.get("admin_session") or {}).get("id") or "")
+        record_admin_audit(
+            request=request,
+            admin_user_id=admin_user_id,
+            admin_session_id=admin_session_id,
+            action="template_activate",
+            target_type="document_template",
+            target_id=str(row.get("id")),
+            before_obj=None,
+            after_obj={"doc_id": row.get("doc_id"), "version": row.get("version"), "is_active": True},
+            summary=None,
+        )
+    except Exception:
+        pass
+
+    return {"ok": True, "template": row}
+
+
 class AdminDocumentMetadataBody(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
@@ -2231,6 +2354,46 @@ def _intro_fallback_question(missing_fields: list[str]) -> tuple[str, list[str]]
     return "Есть ли ограничения: город/удалёнка, сроки или бюджет?", ["Город", "Сроки", "Бюджет", "Без ограничений"]
 
 
+def _intro_heuristic_patch(text: str, missing_fields: list[str]) -> dict:
+    """Best-effort parser to progress intro when LLM is unavailable.
+
+    We deliberately keep it minimal: interpret the user's message as the value
+    of the currently-missing top-level field.
+    """
+    t = (text or "").strip()
+    if not t:
+        return {}
+
+    if "role" in (missing_fields or []):
+        return {"role": t}
+    if "goal" in (missing_fields or []):
+        return {"goal": t}
+    if "constraints" in (missing_fields or []):
+        low = t.lower()
+        constraints: dict = {}
+
+        # Extremely lightweight signal extraction.
+        if any(k in low for k in ["удал", "remote", "онлайн"]):
+            constraints["location"] = "удалённо"
+        elif any(k in low for k in ["офис", "очно"]):
+            constraints["location"] = "офис"
+        elif any(k in low for k in ["гибрид"]):
+            constraints["location"] = "гибрид"
+
+        # Budget/timeline hints.
+        if any(k in low for k in ["руб", "₽", "к", "тыс", "млн", "budget", "бюджет"]):
+            constraints["budget"] = t
+        if any(k in low for k in ["недел", "месяц", "дн", "срок", "до "]):
+            constraints["timeline"] = t
+
+        # If nothing detected, store as location note to satisfy constraints.
+        if not constraints:
+            constraints["location"] = t
+
+        return {"constraints": constraints}
+    return {}
+
+
 def _build_intro_messages(
     profession_query: str,
     brief_state: dict,
@@ -2250,6 +2413,204 @@ def _build_intro_messages(
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ]
+
+
+# ----------------------------------------------------------------------
+# Documents pipeline v1 helpers
+# ----------------------------------------------------------------------
+
+
+class DocContentResponse(BaseModel):
+    doc_markdown: str = ""
+    missing_fields: list[str] = []
+    quality_notes: str | None = None
+
+
+_DOC_CATALOG_CACHE: dict[str, object] = {"expires_at": 0.0, "items": []}
+
+
+def _load_documents_catalog() -> list[dict]:
+    now = time.time()
+    try:
+        if now < float(_DOC_CATALOG_CACHE.get("expires_at") or 0):
+            cached = _DOC_CATALOG_CACHE.get("items")
+            if isinstance(cached, list):
+                return cached
+    except Exception:
+        pass
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "documents", "catalog.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            items = json.load(f)
+        if not isinstance(items, list):
+            items = []
+    except Exception:
+        items = []
+
+    _DOC_CATALOG_CACHE["items"] = items
+    _DOC_CATALOG_CACHE["expires_at"] = now + 30.0
+    return items
+
+
+def _catalog_item(doc_id: str) -> Optional[dict]:
+    did = (doc_id or "").strip()
+    for item in _load_documents_catalog():
+        if str((item or {}).get("id") or "").strip() == did:
+            return item
+    return None
+
+
+def _get_by_path(obj: object, path: str) -> object:
+    if not path:
+        return None
+    cur: object = obj
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur.get(part)
+        else:
+            return None
+    return cur
+
+
+def _required_fields_missing(brief_state: dict, required_fields: list[str]) -> list[str]:
+    missing: list[str] = []
+    bs = brief_state if isinstance(brief_state, dict) else {}
+
+    for field in (required_fields or []):
+        f = str(field or "").strip()
+        if not f:
+            continue
+
+        if f == "constraints":
+            c = bs.get("constraints") if isinstance(bs.get("constraints"), dict) else {}
+            location = (c.get("location") or "").strip() if isinstance(c.get("location"), str) else ""
+            timeline = (c.get("timeline") or "").strip() if isinstance(c.get("timeline"), str) else ""
+            budget = (c.get("budget") or "").strip() if isinstance(c.get("budget"), str) else ""
+            if not (location or timeline or budget):
+                missing.append("constraints")
+            continue
+
+        value = _get_by_path(bs, f)
+        ok = False
+        if isinstance(value, str):
+            ok = bool(value.strip())
+        elif isinstance(value, (list, dict)):
+            ok = len(value) > 0
+        else:
+            ok = value is not None
+        if not ok:
+            missing.append(f)
+    return missing
+
+
+def _build_doc_messages(doc_id: str, profession_query: str, brief_state: dict) -> list[dict]:
+    system = _read_prompt_file(f"prompts/docs/{doc_id}/system.md")
+    tmpl = _read_prompt_file(f"prompts/docs/{doc_id}/user_template.md")
+    user = tmpl
+    user = user.replace("{{profession_query}}", profession_query or "")
+    user = user.replace("{{brief_state_json}}", json.dumps(brief_state or {}, ensure_ascii=False))
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+
+def _heuristic_doc_markdown(doc_id: str, title: str, profession_query: str, brief_state: dict) -> str:
+    bs = brief_state if isinstance(brief_state, dict) else {}
+    role = str(bs.get("role") or profession_query or "").strip()
+    goal = str(bs.get("goal") or "").strip()
+    c = bs.get("constraints") if isinstance(bs.get("constraints"), dict) else {}
+    location = str(c.get("location") or "").strip()
+    timeline = str(c.get("timeline") or "").strip()
+    budget = str(c.get("budget") or "").strip()
+
+    lines: list[str] = [f"# {title}", ""]
+    lines.append("## Вводные")
+    if role:
+        lines.append(f"- Роль: {role}")
+    if goal:
+        lines.append(f"- Цель: {goal}")
+    if location or timeline or budget:
+        lines.append("- Ограничения:")
+        if location:
+            lines.append(f"  - Локация/формат: {location}")
+        if timeline:
+            lines.append(f"  - Сроки: {timeline}")
+        if budget:
+            lines.append(f"  - Бюджет: {budget}")
+
+    lines.append("")
+    if doc_id == "vacancy_draft":
+        lines += [
+            "## Черновик вакансии",
+            f"**Должность:** {role or profession_query or 'Специалист'}",
+            "",
+            "### Задачи",
+            "- (заполнить)",
+            "",
+            "### Требования",
+            "- (заполнить)",
+            "",
+            "### Условия",
+            f"- {location or 'Формат: (уточнить)'}",
+            f"- {budget or 'Оплата: (уточнить)'}",
+        ]
+    elif doc_id == "interview_plan":
+        lines += [
+            "## План интервью",
+            "### Структура (30–45 минут)",
+            "- 5 мин — вводные и контекст",
+            "- 15 мин — опыт по релевантным кейсам",
+            "- 10 мин — разбор задачи/ситуации",
+            "- 5 мин — условия и ожидания",
+            "- 5 мин — вопросы кандидата",
+            "",
+            "### Вопросы",
+            "- Расскажи о самом похожем проекте",
+            "- Как принимаешь решения и оцениваешь риски?",
+            "- Что для тебя важно в работе/команде?",
+        ]
+    else:
+        # search_brief and other docs
+        lines += [
+            "## Критерии кандидата",
+            "- Опыт: (уточнить)",
+            "- Навыки: (уточнить)",
+            "- Софт-скилы: (уточнить)",
+            "",
+            "## Каналы поиска",
+            "- Рекомендации",
+            "- Площадки вакансий",
+            "- Сообщества",
+        ]
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _apply_template_body(
+    *,
+    template_body: str,
+    title: str,
+    doc_markdown: str,
+    generated_at: str,
+) -> str:
+    body = template_body or "{{doc_markdown}}"
+    body = body.replace("{{title}}", title or "")
+    body = body.replace("{{generated_at}}", generated_at)
+    body = body.replace("{{doc_markdown}}", doc_markdown or "")
+    return body
+
+
+def _sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _render_pdf_bytes(*, title: str, markdown: str, meta: dict) -> tuple[bool, bytes | None, str | None]:
+    render_url = (os.environ.get("RENDER_URL") or "").strip() or "http://localhost:8002"
+    payload = {"title": title, "markdown": markdown, "meta": meta or {}}
+    return _http_post_json_bytes(f"{render_url.rstrip('/')}/render/pdf", payload, timeout_sec=60.0)
 
 
 def make_empty_vacancy_kb():
@@ -2680,6 +3041,11 @@ def chat_message(body: ChatMessage, request: Request):
         assistant_text = (model.assistant_text or "").strip() or fallback_q
         quick = [q for q in (model.quick_replies or []) if isinstance(q, str) and q.strip()][:4]
         patch = model.brief_patch if isinstance(model.brief_patch, dict) else {}
+        if (not patch) and text:
+            try:
+                patch = _intro_heuristic_patch(text=text, missing_fields=missing)
+            except Exception:
+                patch = {}
         next_brief = _deep_merge_dict(brief_state, patch)
 
         server_missing = _intro_missing_fields(next_brief)
@@ -3658,15 +4024,21 @@ def me_files(request: Request):
 
 @app.get("/me/documents")
 def me_documents(request: Request):
-    """Auth-required: list intro dialogue documents for current user."""
+    """Auth-required: list intro artifacts + generated PDF documents for current user."""
     request_id = get_request_id_from_request(request)
     user_id = _require_user_id(request)
+    catalog = _load_documents_catalog()
+    title_map = {str((it or {}).get("id") or "").strip(): (it or {}).get("title") for it in (catalog or [])}
+
+    normalized: list[dict] = []
+
+    # 1) Intro artifacts
     rows = list_user_intro_documents(user_id=user_id, request_id=request_id, limit=50)
-    normalized = []
     for r in rows:
         meta = r.get("meta") if isinstance(r.get("meta"), dict) else {}
         normalized.append(
             {
+                "type": "artifact",
                 "id": str(r.get("id")),
                 "session_id": str(r.get("session_id") or ""),
                 "kind": r.get("kind"),
@@ -3676,6 +4048,32 @@ def me_documents(request: Request):
                 "created_at": to_iso(r.get("created_at")),
             }
         )
+
+    # 2) PDF documents
+    docs = list_documents_for_user(user_id=user_id, request_id=request_id, limit=100)
+    for d in docs:
+        doc_id = str(d.get("doc_id") or "").strip()
+        status = str(d.get("status") or "")
+        normalized.append(
+            {
+                "type": "pdf",
+                "id": str(d.get("id")),
+                "session_id": str(d.get("session_id") or ""),
+                "doc_id": doc_id,
+                "title": (title_map.get(doc_id) or doc_id),
+                "status": status,
+                "template_id": str(d.get("template_id") or ""),
+                "template_version": int(d.get("template_version") or 0),
+                "created_at": to_iso(d.get("created_at")),
+                "download_url": (f"/api/documents/{str(d.get('id'))}/download" if status == "ready" else None),
+            }
+        )
+
+    # Newest first (best-effort)
+    def _ts_key(it: dict) -> str:
+        return str(it.get("created_at") or "")
+
+    normalized.sort(key=_ts_key, reverse=True)
     log_event(
         "me_documents_listed",
         request_id=request_id,
@@ -3683,6 +4081,592 @@ def me_documents(request: Request):
         documents_count=len(normalized),
     )
     return {"ok": True, "documents": normalized}
+
+
+@app.get("/documents/catalog")
+def documents_catalog(request: Request):
+    request_id = get_request_id_from_request(request)
+    items = []
+    for it in _load_documents_catalog():
+        items.append(
+            {
+                "id": (it or {}).get("id"),
+                "title": (it or {}).get("title"),
+                "description": (it or {}).get("description"),
+                "required_fields": (it or {}).get("required_fields") or [],
+                "sort_order": int((it or {}).get("sort_order") or 0),
+                "is_free": bool((it or {}).get("is_free")) if (it or {}).get("is_free") is not None else True,
+                "available": True,
+            }
+        )
+    items.sort(key=lambda x: int(x.get("sort_order") or 0))
+    log_event("documents_catalog_ok", request_id=request_id, items_count=len(items))
+    return {"ok": True, "items": items}
+
+
+class DocumentGenerateBody(BaseModel):
+    session_id: str
+    doc_id: str
+
+
+@app.post("/documents/generate")
+def documents_generate(body: DocumentGenerateBody, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+
+    session_id = (body.session_id or "").strip()
+    doc_id = (body.doc_id or "").strip()
+    if not session_id or not doc_id:
+        raise HTTPException(status_code=400, detail="session_id and doc_id are required")
+
+    cat = _catalog_item(doc_id)
+    if not cat:
+        raise HTTPException(status_code=404, detail="Document not found in catalog")
+
+    sess = get_session(session_id, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    owner = sess.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    try:
+        set_session_user(session_id, user_id, request_id=request_id)
+    except Exception:
+        pass
+
+    brief_state = sess.get("brief_state") if isinstance(sess.get("brief_state"), dict) else {}
+    profession_query = str(sess.get("profession_query") or "")
+
+    active_tpl = get_active_document_template(doc_id=doc_id, request_id=request_id)
+    if not active_tpl:
+        # Should not happen if seeding worked.
+        log_event("doc_generate_error", level="error", request_id=request_id, user_id=user_id, session_id=session_id, doc_id=doc_id, error="missing_active_template")
+        return {"ok": True, "status": "error", "error_code": "missing_template", "error_message": "No active template"}
+
+    template_id = str(active_tpl.get("id"))
+    template_version = int(active_tpl.get("version") or 0)
+
+    source_hash = _stable_hash({"profession_query": profession_query, "brief_state": brief_state})
+    existing = find_document_for_idempotency(
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        template_id=template_id,
+        source_hash=source_hash,
+        request_id=request_id,
+    )
+    if existing and str(existing.get("status") or "") in {"ready", "pending", "error", "needs_input"}:
+        status = str(existing.get("status") or "")
+        return {
+            "ok": True,
+            "document": {
+                "id": str(existing.get("id")),
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "title": str(cat.get("title") or doc_id),
+                "status": status,
+                "created_at": to_iso(existing.get("created_at")),
+                "download_url": (f"/api/documents/{str(existing.get('id'))}/download" if status == "ready" else None),
+                "missing_fields": (existing.get("meta") or {}).get("missing_fields") if isinstance(existing.get("meta"), dict) else None,
+            },
+        }
+
+    required_fields = cat.get("required_fields") or []
+    missing_req = _required_fields_missing(brief_state, required_fields)
+
+    log_event(
+        "doc_generate_start",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        template_id=template_id,
+        template_version=template_version,
+        required_missing_count=len(missing_req),
+    )
+
+    if missing_req:
+        row = create_document_record(
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            template_id=template_id,
+            template_version=template_version,
+            status="needs_input",
+            source_hash=source_hash,
+            meta={"missing_fields": missing_req, "required_fields": required_fields},
+            request_id=request_id,
+        )
+        return {
+            "ok": True,
+            "document": {
+                "id": str(row.get("id")),
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "title": str(cat.get("title") or doc_id),
+                "status": "needs_input",
+                "missing_fields": missing_req,
+                "created_at": to_iso(row.get("created_at")),
+            },
+        }
+
+    # Create pending doc row
+    row = create_document_record(
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        template_id=template_id,
+        template_version=template_version,
+        status="pending",
+        source_hash=source_hash,
+        meta={"required_fields": required_fields},
+        request_id=request_id,
+    )
+    document_id = str(row.get("id") or "")
+
+    # LLM content generation (1-2 attempts)
+    llm_ok = False
+    llm_model: DocContentResponse | None = None
+    for attempt in [1, 2]:
+        try:
+            messages = _build_doc_messages(doc_id=doc_id, profession_query=profession_query, brief_state=brief_state)
+            fallback = {"doc_markdown": "", "missing_fields": [], "quality_notes": "fallback"}
+            raw = generate_json_messages(messages=messages, request_id=request_id, session_id=session_id, fallback=fallback)
+            m = DocContentResponse.model_validate(raw)
+            # Consider empty doc_markdown with empty missing_fields as invalid.
+            if (not (m.doc_markdown or "").strip()) and not (m.missing_fields or []):
+                raise RuntimeError("empty_doc_markdown")
+            llm_ok = True
+            llm_model = m
+            log_event(
+                "llm_ok",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                artifact_id=document_id,
+                template_id=template_id,
+                attempt=attempt,
+                doc_markdown_chars=len(m.doc_markdown or ""),
+                missing_fields_count=len(m.missing_fields or []),
+            )
+            break
+        except Exception as e:
+            log_event(
+                "llm_fail",
+                level="warning",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                artifact_id=document_id,
+                template_id=template_id,
+                attempt=attempt,
+                error=str(e),
+            )
+
+    if (not llm_ok) or (llm_model is None):
+        # Dev-friendly fallback: allow end-to-end pipeline without external LLM keys.
+        if current_llm_provider() == "mock":
+            try:
+                llm_model = DocContentResponse(
+                    doc_markdown=_heuristic_doc_markdown(
+                        doc_id=doc_id,
+                        title=str(cat.get("title") or doc_id),
+                        profession_query=profession_query,
+                        brief_state=brief_state,
+                    ),
+                    missing_fields=[],
+                    quality_notes="heuristic_mock",
+                )
+                llm_ok = True
+                log_event(
+                    "llm_mock_fallback",
+                    level="warning",
+                    request_id=request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    doc_id=doc_id,
+                    artifact_id=document_id,
+                    template_id=template_id,
+                )
+            except Exception as e:
+                log_event(
+                    "llm_mock_fallback_failed",
+                    level="error",
+                    request_id=request_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    doc_id=doc_id,
+                    artifact_id=document_id,
+                    template_id=template_id,
+                    error=str(e),
+                )
+
+    if (not llm_ok) or (llm_model is None):
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="llm_invalid",
+            error_message="LLM did not return valid JSON",
+            request_id=request_id,
+        )
+        return {
+            "ok": True,
+            "document": {
+                "id": document_id,
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "title": str(cat.get("title") or doc_id),
+                "status": "error",
+                "error_code": "llm_invalid",
+                "error_message": "LLM did not return valid JSON",
+            },
+        }
+
+    if llm_model.missing_fields:
+        update_document_record(
+            document_id=document_id,
+            status="needs_input",
+            meta={"missing_fields": llm_model.missing_fields, "required_fields": required_fields, "quality_notes": llm_model.quality_notes},
+            request_id=request_id,
+        )
+        return {
+            "ok": True,
+            "document": {
+                "id": document_id,
+                "session_id": session_id,
+                "doc_id": doc_id,
+                "title": str(cat.get("title") or doc_id),
+                "status": "needs_input",
+                "missing_fields": llm_model.missing_fields,
+            },
+        }
+
+    generated_at = datetime.utcnow().isoformat() + "Z"
+    final_markdown = _apply_template_body(
+        template_body=str(active_tpl.get("body") or ""),
+        title=str(cat.get("title") or doc_id),
+        doc_markdown=llm_model.doc_markdown,
+        generated_at=generated_at,
+    )
+
+    ok_pdf, pdf_bytes, render_err = _render_pdf_bytes(
+        title=str(cat.get("title") or doc_id),
+        markdown=final_markdown,
+        meta={"doc_id": doc_id, "session_id": session_id, "user_id": user_id, "template_id": template_id},
+    )
+    if (not ok_pdf) or (not pdf_bytes) or (not pdf_bytes.startswith(b"%PDF")):
+        log_event(
+            "render_fail",
+            level="error",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            artifact_id=document_id,
+            template_id=template_id,
+            error=str(render_err or "invalid_pdf"),
+        )
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="render_failed",
+            error_message=str(render_err or "render_failed"),
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "render_failed"}}
+    log_event(
+        "render_ok",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        artifact_id=document_id,
+        template_id=template_id,
+        bytes_size=len(pdf_bytes),
+    )
+
+    bucket = (os.environ.get("S3_BUCKET") or "").strip()
+    if not bucket:
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="s3_not_configured",
+            error_message="S3_BUCKET not configured",
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_not_configured"}}
+
+    sha256 = _sha256_hex(pdf_bytes)
+    object_key = f"documents/{user_id}/{session_id}/{doc_id}/{template_version}-{document_id}.pdf"
+    try:
+        upload_bytes(
+            bucket=bucket,
+            key=object_key,
+            data=pdf_bytes,
+            content_type="application/pdf",
+            metadata={
+                "doc_id": doc_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "template_id": template_id,
+                "sha256": sha256,
+            },
+            request_id=request_id,
+        )
+        log_event(
+            "s3_ok",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            artifact_id=document_id,
+            template_id=template_id,
+            bucket=bucket,
+            object_key=object_key,
+        )
+    except Exception as e:
+        log_event(
+            "s3_fail",
+            level="error",
+            request_id=request_id,
+            user_id=user_id,
+            session_id=session_id,
+            doc_id=doc_id,
+            artifact_id=document_id,
+            template_id=template_id,
+            error=str(e),
+        )
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="s3_failed",
+            error_message=str(e),
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "doc_id": doc_id, "status": "error", "error_code": "s3_failed"}}
+
+    update_document_record(
+        document_id=document_id,
+        status="ready",
+        s3_bucket=bucket,
+        s3_key=object_key,
+        sha256=sha256,
+        meta={"required_fields": required_fields, "quality_notes": llm_model.quality_notes},
+        request_id=request_id,
+    )
+    log_event(
+        "doc_ready",
+        request_id=request_id,
+        user_id=user_id,
+        session_id=session_id,
+        doc_id=doc_id,
+        artifact_id=document_id,
+        template_id=template_id,
+    )
+    return {
+        "ok": True,
+        "document": {
+            "id": document_id,
+            "session_id": session_id,
+            "doc_id": doc_id,
+            "title": str(cat.get("title") or doc_id),
+            "status": "ready",
+            "download_url": f"/api/documents/{document_id}/download",
+            "created_at": to_iso(row.get("created_at")),
+        },
+    }
+
+
+@app.get("/documents/{document_id}/download")
+def documents_download(document_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    doc = get_document_for_user(document_id=document_id, user_id=user_id, request_id=request_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if str(doc.get("status") or "") != "ready":
+        raise HTTPException(status_code=409, detail="Document not ready")
+    bucket = str(doc.get("s3_bucket") or "").strip()
+    key = str(doc.get("s3_key") or "").strip()
+    if not bucket or not key:
+        raise HTTPException(status_code=409, detail="Missing S3 pointer")
+
+    filename = f"{str(doc.get('doc_id') or 'document')}.pdf"
+    headers = {"Content-Disposition": f"attachment; filename=\"{filename}\""}
+    return StreamingResponse(stream_get(bucket=bucket, key=key, request_id=request_id), media_type="application/pdf", headers=headers)
+
+
+@app.post("/documents/{document_id}/retry")
+def documents_retry(document_id: str, request: Request):
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    doc = get_document_for_user(document_id=document_id, user_id=user_id, request_id=request_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    status = str(doc.get("status") or "")
+    if status != "error":
+        return {"ok": True, "document": {"id": str(doc.get("id")), "status": status}}
+
+    session_id = str(doc.get("session_id") or "").strip()
+    sess = get_session(session_id, request_id=request_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="Session not found")
+    owner = sess.get("user_id")
+    if owner and owner != user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Prevent retry on stale data: user should call /documents/generate again.
+    brief_state = sess.get("brief_state") if isinstance(sess.get("brief_state"), dict) else {}
+    profession_query = str(sess.get("profession_query") or "")
+    computed_hash = _stable_hash({"profession_query": profession_query, "brief_state": brief_state})
+    stored_hash = str(doc.get("source_hash") or "")
+    if stored_hash and computed_hash != stored_hash:
+        raise HTTPException(status_code=409, detail="Source data changed; call /documents/generate")
+
+    doc_id = str(doc.get("doc_id") or "").strip()
+    cat = _catalog_item(doc_id) or {"title": doc_id, "required_fields": []}
+    template_id = str(doc.get("template_id") or "")
+    template_version = int(doc.get("template_version") or 0)
+    tpl = get_document_template_by_id(template_id=template_id, request_id=request_id)
+    if not tpl:
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="missing_template",
+            error_message="Template not found",
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "error", "error_code": "missing_template"}}
+
+    update_document_record(
+        document_id=document_id,
+        status="pending",
+        clear_error=True,
+        request_id=request_id,
+    )
+
+    # Re-run generation once (with up to 2 LLM attempts)
+    required_fields = cat.get("required_fields") or []
+    missing_req = _required_fields_missing(brief_state, required_fields)
+    if missing_req:
+        update_document_record(
+            document_id=document_id,
+            status="needs_input",
+            meta={"missing_fields": missing_req, "required_fields": required_fields},
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "needs_input", "missing_fields": missing_req}}
+
+    llm_ok = False
+    llm_model: DocContentResponse | None = None
+    for attempt in [1, 2]:
+        try:
+            messages = _build_doc_messages(doc_id=doc_id, profession_query=profession_query, brief_state=brief_state)
+            fallback = {"doc_markdown": "", "missing_fields": [], "quality_notes": "fallback"}
+            raw = generate_json_messages(messages=messages, request_id=request_id, session_id=session_id, fallback=fallback)
+            m = DocContentResponse.model_validate(raw)
+            if (not (m.doc_markdown or "").strip()) and not (m.missing_fields or []):
+                raise RuntimeError("empty_doc_markdown")
+            llm_ok = True
+            llm_model = m
+            break
+        except Exception:
+            pass
+
+    if (not llm_ok) or (llm_model is None):
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="llm_invalid",
+            error_message="LLM did not return valid JSON",
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "error", "error_code": "llm_invalid"}}
+
+    if llm_model.missing_fields:
+        update_document_record(
+            document_id=document_id,
+            status="needs_input",
+            meta={"missing_fields": llm_model.missing_fields, "required_fields": required_fields},
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "needs_input", "missing_fields": llm_model.missing_fields}}
+
+    generated_at = datetime.utcnow().isoformat() + "Z"
+    final_markdown = _apply_template_body(
+        template_body=str(tpl.get("body") or ""),
+        title=str(cat.get("title") or doc_id),
+        doc_markdown=llm_model.doc_markdown,
+        generated_at=generated_at,
+    )
+
+    ok_pdf, pdf_bytes, render_err = _render_pdf_bytes(
+        title=str(cat.get("title") or doc_id),
+        markdown=final_markdown,
+        meta={"doc_id": doc_id, "session_id": session_id, "user_id": user_id, "template_id": template_id},
+    )
+    if (not ok_pdf) or (not pdf_bytes) or (not pdf_bytes.startswith(b"%PDF")):
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="render_failed",
+            error_message=str(render_err or "render_failed"),
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "error", "error_code": "render_failed"}}
+
+    bucket = (os.environ.get("S3_BUCKET") or "").strip()
+    if not bucket:
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="s3_not_configured",
+            error_message="S3_BUCKET not configured",
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "error", "error_code": "s3_not_configured"}}
+
+    sha256 = _sha256_hex(pdf_bytes)
+    object_key = f"documents/{user_id}/{session_id}/{doc_id}/{template_version}-{document_id}.pdf"
+    try:
+        upload_bytes(
+            bucket=bucket,
+            key=object_key,
+            data=pdf_bytes,
+            content_type="application/pdf",
+            metadata={
+                "doc_id": doc_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "template_id": template_id,
+                "sha256": sha256,
+            },
+            request_id=request_id,
+        )
+    except Exception as e:
+        update_document_record(
+            document_id=document_id,
+            status="error",
+            error_code="s3_failed",
+            error_message=str(e),
+            request_id=request_id,
+        )
+        return {"ok": True, "document": {"id": document_id, "status": "error", "error_code": "s3_failed"}}
+
+    update_document_record(
+        document_id=document_id,
+        status="ready",
+        s3_bucket=bucket,
+        s3_key=object_key,
+        sha256=sha256,
+        request_id=request_id,
+    )
+    return {"ok": True, "document": {"id": document_id, "status": "ready", "download_url": f"/api/documents/{document_id}/download"}}
 
 
 @app.post("/ml/job", response_model=MlJobCreateResponse)

@@ -39,10 +39,19 @@ jobs:
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
           # LLM/OpenRouter passthrough (optional; empty values are OK)
-          export LLM_PROVIDER=${LLM_PROVIDER:-mock}
+          if [ -z "${LLM_PROVIDER:-}" ]; then
+            if [ -n "${OPENROUTER_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
+              export LLM_PROVIDER=openai_compat
+            else
+              export LLM_PROVIDER=mock
+            fi
+          else
+            export LLM_PROVIDER="$LLM_PROVIDER"
+          fi
           export LLM_BASE_URL=${LLM_BASE_URL:-}
           export LLM_API_KEY=${LLM_API_KEY:-}
           export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+          export OPENAI_API_KEY=${OPENAI_API_KEY:-}
           export LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
 
           docker compose -p dev -f infra/docker-compose.yml up -d --build
@@ -69,6 +78,13 @@ jobs:
           curl -fsS https://dev.naitilyudei.ru/api/docs >/dev/null
           cd "$HOME/app"
           docker compose -p dev -f infra/docker-compose.yml ps
+
+      - name: Smoke documents v1 (DEV)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$HOME/app"
+          BASE_URL="https://dev.naitilyudei.ru/api" scripts/smoke-documents-v1-dev.sh
 
       - name: Logs (only if failed)
         if: failure()
