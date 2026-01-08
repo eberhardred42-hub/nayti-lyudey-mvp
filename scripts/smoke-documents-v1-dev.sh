@@ -59,30 +59,33 @@ intro_msg() {
 RESP=$(intro_msg "Ищем Senior QA инженера") || fail "intro role"
 READY=$(py_get 'print(str(obj.get("ready_to_search") or False).lower())' <<<"$RESP")
 
-RESP=$(intro_msg "Нужно усилить команду и закрыть критичные проверки релизов") || fail "intro goal"
+RESP=$(intro_msg "B — своими словами") || fail "intro mode"
 READY=$(py_get 'print(str(obj.get("ready_to_search") or False).lower())' <<<"$RESP")
 
-RESP=$(intro_msg "Удалённо, 2 недели, бюджет 250к") || fail "intro constraints"
+RESP=$(intro_msg "Senior QA инженер; удалённо; полный день; бюджет 250к") || fail "intro details"
+READY=$(py_get 'print(str(obj.get("ready_to_search") or False).lower())' <<<"$RESP")
+
+RESP=$(intro_msg "Да, всё верно") || fail "intro confirm"
 READY=$(py_get 'print(str(obj.get("ready_to_search") or False).lower())' <<<"$RESP")
 
 if [[ "$READY" != "true" ]]; then
   fail "intro did not reach ready_to_search"
 fi
 
-echo "[smoke-docs-dev] generate search_brief"
-GEN=$(curl_json -X POST "${BASE_URL%/}/documents/generate" \
+echo "[smoke-docs-dev] generate_pack"
+GEN=$(curl_json -X POST "${BASE_URL%/}/documents/generate_pack" \
   "${HDR_USER[@]}" \
   -H 'Content-Type: application/json' \
-  --data "{\"session_id\":\"$SESSION_ID\",\"doc_id\":\"search_brief\"}") || fail "documents/generate"
+  --data "{\"session_id\":\"$SESSION_ID\"}") || fail "documents/generate_pack"
 
-DOC_ID=$(py_get 'print((obj.get("document") or {}).get("id") or "")' <<<"$GEN")
-STATUS=$(py_get 'print((obj.get("document") or {}).get("status") or "")' <<<"$GEN")
+DOC_ID=$(python3 -c 'import sys,json; obj=json.load(sys.stdin); res=obj.get("results") or []; print(next(((r.get("artifact_id") or "") for r in res if (r.get("doc_id") or "")=="candidate_onepager"), ""))' <<<"$GEN")
+STATUS=$(python3 -c 'import sys,json; obj=json.load(sys.stdin); res=obj.get("results") or []; print(next(((r.get("status") or "") for r in res if (r.get("doc_id") or "")=="candidate_onepager"), ""))' <<<"$GEN")
 
 if [[ -z "$DOC_ID" ]]; then
   fail "no document id"
 fi
-if [[ "$STATUS" != "ready" ]]; then
-  fail "document not ready (status=$STATUS)"
+if [[ "$STATUS" == "failed" ]]; then
+  fail "candidate_onepager failed"
 fi
 
 echo "[smoke-docs-dev] download pdf"

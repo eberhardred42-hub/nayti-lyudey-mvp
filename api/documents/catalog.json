@@ -1,26 +1,191 @@
 [
   {
-    "id": "search_brief",
-    "title": "Бриф поиска (PDF)",
-    "description": "Короткий PDF-бриф: кого ищем, зачем и ограничения.",
-    "required_fields": ["role", "goal", "constraints"],
+    "id": "candidate_onepager",
+    "title": "Candidate onepager",
+    "description": "Короткая выжимка профиля кандидата и критериев оценки.",
+    "required_fields": [],
     "sort_order": 10,
-    "is_free": true
+    "is_free": true,
+    "auto_generate": true
   },
   {
-    "id": "vacancy_draft",
-    "title": "Черновик вакансии (PDF)",
-    "description": "Простой черновик текста вакансии на основе вводных.",
-    "required_fields": ["role", "goal", "constraints"],
+    "id": "vacancy_publish_dual",
+    "title": "Vacancy publish (dual)",
+    "description": "Пара вариантов публикации вакансии (кратко/развёрнуто).",
+    "required_fields": [],
     "sort_order": 20,
-    "is_free": true
+    "is_free": true,
+    "auto_generate": true
   },
   {
-    "id": "interview_plan",
-    "title": "План интервью (PDF)",
-    "description": "Список тем и вопросов для интервью под роль.",
-    "required_fields": ["role", "goal"],
+    "id": "sourcing_channels_map",
+    "title": "Sourcing channels map",
+    "description": "Карта каналов поиска и гипотезы по каждому каналу.",
+    "required_fields": [],
     "sort_order": 30,
-    "is_free": true
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "donor_companies_portrait",
+    "title": "Donor companies portrait",
+    "description": "Портрет донорских компаний/сегментов и как в них искать.",
+    "required_fields": [],
+    "sort_order": 40,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "screening_scorecard",
+    "title": "Screening scorecard",
+    "description": "Скоркард для скрининга: критерии и шкалы.",
+    "required_fields": [],
+    "sort_order": 50,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "first_call_script",
+    "title": "First call script",
+    "description": "Скрипт первого звонка/первичного контакта.",
+    "required_fields": [],
+    "sort_order": 60,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "interview_plan_structured",
+    "title": "Interview plan (structured)",
+    "description": "Структурированный план интервью с блоками и временем.",
+    "required_fields": [],
+    "sort_order": 70,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "mini_test_task",
+    "title": "Mini test task",
+    "description": "Мини-тестовое задание/кейс для оценки.",
+    "required_fields": [],
+    "sort_order": 80,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "outreach_templates",
+    "title": "Outreach templates",
+    "description": "Шаблоны сообщений для аутрича (варианты).",
+    "required_fields": [],
+    "sort_order": 90,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "hiring_funnel_math",
+    "title": "Hiring funnel math",
+    "description": "Математика воронки найма (конверсии/объёмы).",
+    "required_fields": [],
+    "sort_order": 100,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "hiring_risks_wao",
+    "title": "Hiring risks (WAO)",
+    "description": "Риски найма и превентивные меры (WAO-подход).",
+    "required_fields": [],
+    "sort_order": 110,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "salary_reality_check",
+    "title": "Salary reality check",
+    "description": "Проверка реалистичности зарплатных ожиданий и рынка.",
+    "required_fields": [],
+    "sort_order": 120,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "shortlist_comparison",
+    "title": "Shortlist comparison",
+    "description": "Сравнение кандидатов в шортлисте по критериям.",
+    "required_fields": [],
+    "sort_order": 130,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "anti_fake_redflags",
+    "title": "Anti-fake redflags",
+    "description": "Красные флаги: фейки/накрутки/несостыковки.",
+    "required_fields": [],
+    "sort_order": 140,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "reference_check_script",
+    "title": "Reference check script",
+    "description": "Скрипт референс-чека: вопросы и структура.",
+    "required_fields": [],
+    "sort_order": 150,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "offer_template",
+    "title": "Offer template",
+    "description": "Шаблон оффера (структура и поля).",
+    "required_fields": [],
+    "sort_order": 160,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "salary_negotiation_script",
+    "title": "Salary negotiation script",
+    "description": "Скрипт переговоров по зарплате.",
+    "required_fields": [],
+    "sort_order": 170,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "onboarding_30_60_90",
+    "title": "Onboarding 30/60/90",
+    "description": "План онбординга 30/60/90 дней.",
+    "required_fields": [],
+    "sort_order": 180,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "hiring_risk_readiness",
+    "title": "Hiring risk readiness",
+    "description": "Чек готовности к рискам найма: сигналы и действия.",
+    "required_fields": [],
+    "sort_order": 190,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "comms_templates_pack",
+    "title": "Comms templates pack",
+    "description": "Пак шаблонов коммуникаций (кандидат/нанимающий/команда).",
+    "required_fields": [],
+    "sort_order": 200,
+    "is_free": true,
+    "auto_generate": true
+  },
+  {
+    "id": "vacancy_passport_internal",
+    "title": "Vacancy passport (internal)",
+    "description": "Внутренний паспорт вакансии (структурные вводные).",
+    "required_fields": [],
+    "sort_order": 210,
+    "is_free": true,
+    "auto_generate": true
   }
 ]

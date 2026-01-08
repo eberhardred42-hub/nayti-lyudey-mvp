@@ -14,6 +14,7 @@ Pipeline генерирует пользовательские PDF-докуме�
   - `type=intro_message` → шаг интро
 - `GET /documents/catalog` → список доступных документов (с `sort_order` и `required_fields`)
 - `POST /documents/generate` → синхронная генерация: LLM → render → S3
+- `POST /documents/generate_pack` → последовательная генерация всего бесплатного auto_generate-пака
 - `GET /me/documents` → объединённый список (intro artifacts + pdf)
 - `GET /documents/{id}/download` → скачивание PDF (stream)
 - `POST /documents/{id}/retry` → повтор только для `status=error`
@@ -47,13 +48,19 @@ Pipeline генерирует пользовательские PDF-докуме�
 - `curl -s http://localhost:8000/documents/catalog | jq`
 
 5) Сгенерировать документ:
-- `curl -s -H "X-User-Id: $UID" -H "Content-Type: application/json" \
-  -d '{"session_id":"<SESSION>","doc_id":"search_brief"}' \
-  http://localhost:8000/documents/generate | jq`
+- одиночный документ:
+  - `curl -s -H "X-User-Id: $UID" -H "Content-Type: application/json" \
+    -d '{"session_id":"<SESSION>","doc_id":"candidate_onepager"}' \
+    http://localhost:8000/documents/generate | jq`
+- автогенерация пакета:
+  - `curl -s -H "X-User-Id: $UID" -H "Content-Type: application/json" \
+    -d '{"session_id":"<SESSION>"}' \
+    http://localhost:8000/documents/generate_pack | jq`
 
 Ожидаемо:
 - `status=ready` и `download_url` заполнен
-- при недостающих данных: `status=needs_input` и `missing_fields`
+- при недостающих обязательных полях из `required_fields`: `status=needs_input` и `missing_fields`
+- если LLM вернул `missing_fields`, документ всё равно рендерится в PDF, а в markdown добавляется секция `TODO` (список недостающих данных сохраняется в `meta.missing_fields`)
 - при сбоях LLM/render/S3: `status=error` и `error_code`
 
 6) Скачать PDF:
@@ -73,7 +80,7 @@ Pipeline генерирует пользовательские PDF-докуме�
 
 ## DoD (Definition of Done)
 - Генерация по `/documents/generate` не отдаёт наружу 500 при сбоях LLM/render/S3 (возвращает `ok=true` + `status=error|needs_input`)
-- Идемпотентность: повторный `generate` с теми же входными данными возвращает существующую запись
+- Идемпотентность: повторный `generate` с тем же `(user_id, session_id, doc_id)` возвращает существующую запись (без новых DB rows / S3 objects), если не указан `force=true`
 - `download` стримит PDF из S3 и требует ownership (user_id)
 - `retry` работает только для `status=error` и запрещён, если `source_hash` устарел
 - Минимальная интеграция UI: после интро-готовности запускается генерация первого документа и доступна кнопка «Скачать»
