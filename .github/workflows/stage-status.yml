@@ -2,6 +2,11 @@ name: Stage Status
 
 on:
   workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment (dev|prod)"
+        required: true
+        default: "prod"
 
 jobs:
   status:
@@ -11,11 +16,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ENV="${{ inputs.env }}"
+          case "$ENV" in
+            prod) PROJECT=prod; BASE_URL=https://naitilyudei.ru ;;
+            dev) PROJECT=dev; BASE_URL=https://dev.naitilyudei.ru ;;
+            *) echo "Invalid env: $ENV (expected dev|prod)"; exit 1 ;;
+          esac
+
           cd "$HOME/app"
-          docker compose -f infra/docker-compose.yml ps
+          docker compose -p "$PROJECT" -f infra/docker-compose.yml ps
           echo "---- CADDY LOGS ----"
           docker logs --tail=100 caddy || true
           echo "---- STACK LOGS ----"
-          docker compose -f infra/docker-compose.yml logs --no-color --tail=120 || true
+          docker compose -p "$PROJECT" -f infra/docker-compose.yml logs --no-color --tail=120 || true
           echo "---- SMOKE ----"
-          curl -I https://naitilyudei.ru/api/docs | head -n 5 || true
+          curl -I "$BASE_URL/api/docs" | head -n 5 || true

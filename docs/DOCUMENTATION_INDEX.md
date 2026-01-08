@@ -10,6 +10,8 @@
 
 **Want to test it?** → Follow [RUNBOOK.md](RUNBOOK.md) (setup + testing)
 
+**DEV/PROD на одном сервере?** → Read [ENVIRONMENTS.md](ENVIRONMENTS.md)
+
 **Stage 9.3 (Storage / MinIO / S3)?** → Read:
 - [STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)
 - [STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)

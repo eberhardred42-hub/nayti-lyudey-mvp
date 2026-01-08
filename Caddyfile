@@ -1,0 +1,31 @@
+{
+  # базовые настройки (минимально)
+}
+
+# PROD
+naitilyudei.ru {
+  handle_path /api/* {
+    reverse_proxy localhost:8000
+  }
+
+  handle /health* {
+    reverse_proxy localhost:8000
+  }
+
+  reverse_proxy localhost:3000
+}
+
+# DEV
+# Важно: dev стек слушает другие host-порты (см. docs/ENVIRONMENTS.md)
+
+dev.naitilyudei.ru {
+  handle_path /api/* {
+    reverse_proxy localhost:8100
+  }
+
+  handle /health* {
+    reverse_proxy localhost:8100
+  }
+
+  reverse_proxy localhost:3100
+}

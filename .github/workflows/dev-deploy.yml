@@ -1,0 +1,72 @@
+name: DEV Deploy
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, stage]
+
+    steps:
+      - name: Deploy DEV from ~/app (git pull + compose up)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_DIR="$HOME/app"
+          REPO_URL="https://github.com/eberhardred42-hub/nayti-lyudey-mvp.git"
+
+          if [ ! -d "$APP_DIR/.git" ]; then
+            mkdir -p "$APP_DIR"
+            git clone "$REPO_URL" "$APP_DIR"
+          fi
+
+          cd "$APP_DIR"
+          git fetch --all
+          git reset --hard origin/main
+
+          # DEV ports (must not conflict with PROD)
+          export FRONT_HOST_PORT=3100
+          export API_HOST_PORT=8100
+          export ML_HOST_PORT=8101
+          export RENDER_HOST_PORT=8102
+          export MINIO_HOST_PORT=9100
+          export MINIO_CONSOLE_HOST_PORT=9101
+          export DB_HOST_PORT=15432
+          export REDIS_HOST_PORT=16379
+          export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
+
+          docker compose -p dev -f infra/docker-compose.yml up -d --build
+
+      - name: Ensure caddy is running (host network)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="$HOME/app"
+
+          if ! docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
+            docker run -d --name caddy --restart unless-stopped --network host \
+              -v "$APP_DIR/Caddyfile:/etc/caddy/Caddyfile" \
+              -v caddy_data:/data -v caddy_config:/config caddy:2
+          else
+            docker restart caddy
+          fi
+
+      - name: Smoke checks (DEV)
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS https://dev.naitilyudei.ru/ >/dev/null
+          curl -fsS https://dev.naitilyudei.ru/api/docs >/dev/null
+          cd "$HOME/app"
+          docker compose -p dev -f infra/docker-compose.yml ps
+
+      - name: Logs (only if failed)
+        if: failure()
+        shell: bash
+        run: |
+          cd "$HOME/app"
+          docker logs --tail=200 caddy || true
+          docker compose -p dev -f infra/docker-compose.yml logs --no-color --tail=200 || true

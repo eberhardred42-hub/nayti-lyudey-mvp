@@ -3,6 +3,10 @@ name: Stage Logs
 on:
   workflow_dispatch:
     inputs:
+      env:
+        description: "Environment (dev|prod)"
+        required: true
+        default: "prod"
       service:
         description: "Service name (front/api/ml/render/render-worker/db/redis/minio)"
         required: true
@@ -20,9 +24,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ENV="${{ inputs.env }}"
+          case "$ENV" in
+            prod) PROJECT=prod ;;
+            dev) PROJECT=dev ;;
+            *) echo "Invalid env: $ENV (expected dev|prod)"; exit 1 ;;
+          esac
+
           cd "$HOME/app"
           echo "== compose ps =="
-          docker compose -f infra/docker-compose.yml ps
+          docker compose -p "$PROJECT" -f infra/docker-compose.yml ps
           echo
           echo "== logs: ${{ inputs.service }} (last ${{ inputs.lines }}) =="
-          docker compose -f infra/docker-compose.yml logs --no-color --tail="${{ inputs.lines }}" "${{ inputs.service }}"
+          docker compose -p "$PROJECT" -f infra/docker-compose.yml logs --no-color --tail="${{ inputs.lines }}" "${{ inputs.service }}"
