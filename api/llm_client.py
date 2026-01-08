@@ -13,7 +13,7 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip() or "https://openrouter.ai/api/v1"
-OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "xiaomi/mimo-v2-flash:free").strip() or "xiaomi/mimo-v2-flash:free"
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "z-ai/glm-4.5-air:free").strip() or "z-ai/glm-4.5-air:free"
 OPENROUTER_FALLBACK_MODELS = os.environ.get("OPENROUTER_FALLBACK_MODELS", "").strip()
 OPENROUTER_HTTP_REFERER = os.environ.get("OPENROUTER_HTTP_REFERER", "https://naitilyudei.ru").strip() or "https://naitilyudei.ru"
 OPENROUTER_APP_TITLE = os.environ.get("OPENROUTER_APP_TITLE", "nayti-lyudey").strip() or "nayti-lyudey"

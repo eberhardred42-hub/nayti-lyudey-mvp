@@ -12,7 +12,7 @@
 
 - `OPENROUTER_API_KEY` (секрет)
 - `OPENROUTER_BASE_URL` (default `https://openrouter.ai/api/v1`)
-- `OPENROUTER_MODEL` (default `xiaomi/mimo-v2-flash:free`)
+- `OPENROUTER_MODEL` (default `z-ai/glm-4.5-air:free`)
 - `OPENROUTER_FALLBACK_MODELS` (csv, опционально; default `nvidia/nemotron-3-nano-30b-a3b:free`)
 - `OPENROUTER_HTTP_REFERER` (default `https://naitilyudei.ru`)
 - `OPENROUTER_APP_TITLE` (default `nayti-lyudey`)
@@ -44,7 +44,7 @@
 Ожидаемо (пример):
 
 ```json
-{"ok": true, "provider": "openrouter", "model": "xiaomi/mimo-v2-flash:free", "base_url": "https://openrouter.ai/api/v1"}
+{"ok": true, "provider": "openrouter", "model": "z-ai/glm-4.5-air:free", "base_url": "https://openrouter.ai/api/v1"}
 ```
 
 Если ключ не задан/недоступен, сервис не падает: `health/llm` вернёт `ok:false`, а UI будет деградировать до шаблонных вопросов.
