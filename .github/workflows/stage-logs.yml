@@ -15,6 +15,7 @@ on:
 jobs:
   logs:
     runs-on: [self-hosted, stage]
+    timeout-minutes: 5
     steps:
       - name: Tail logs
         shell: bash
