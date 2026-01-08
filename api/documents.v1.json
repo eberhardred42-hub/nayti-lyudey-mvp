@@ -1,17 +1,39 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "documents": [
     {"doc_id": "free_report", "title": "Бесплатный отчёт", "is_enabled": true, "tier": "free"},
+    {"doc_id": "budget_reality_check", "title": "Budget reality check", "is_enabled": true, "tier": "free"},
+
+    {"doc_id": "candidate_onepager", "title": "Candidate onepager", "is_enabled": true, "tier": "free"},
+    {"doc_id": "vacancy_publish_dual", "title": "Vacancy publish (dual)", "is_enabled": true, "tier": "free"},
+    {"doc_id": "sourcing_channels_map", "title": "Sourcing channels map", "is_enabled": true, "tier": "free"},
+    {"doc_id": "donor_companies_portrait", "title": "Donor companies portrait", "is_enabled": true, "tier": "free"},
+    {"doc_id": "screening_scorecard", "title": "Screening scorecard", "is_enabled": true, "tier": "free"},
+    {"doc_id": "first_call_script", "title": "First call script", "is_enabled": true, "tier": "free"},
+    {"doc_id": "interview_plan_structured", "title": "Interview plan (structured)", "is_enabled": true, "tier": "free"},
+    {"doc_id": "mini_test_task", "title": "Mini test task", "is_enabled": true, "tier": "free"},
+    {"doc_id": "outreach_templates", "title": "Outreach templates", "is_enabled": true, "tier": "free"},
+    {"doc_id": "hiring_funnel_math", "title": "Hiring funnel math", "is_enabled": true, "tier": "free"},
+    {"doc_id": "hiring_risks_wao", "title": "Hiring risks (WAO)", "is_enabled": true, "tier": "free"},
+    {"doc_id": "salary_reality_check", "title": "Salary reality check", "is_enabled": true, "tier": "free"},
+    {"doc_id": "shortlist_comparison", "title": "Shortlist comparison", "is_enabled": true, "tier": "free"},
+    {"doc_id": "anti_fake_redflags", "title": "Anti-fake redflags", "is_enabled": true, "tier": "free"},
+    {"doc_id": "reference_check_script", "title": "Reference check script", "is_enabled": true, "tier": "free"},
+    {"doc_id": "offer_template", "title": "Offer template", "is_enabled": true, "tier": "free"},
+    {"doc_id": "salary_negotiation_script", "title": "Salary negotiation script", "is_enabled": true, "tier": "free"},
+    {"doc_id": "onboarding_30_60_90", "title": "Onboarding 30/60/90", "is_enabled": true, "tier": "free"},
+    {"doc_id": "hiring_risk_readiness", "title": "Hiring risk readiness", "is_enabled": true, "tier": "free"},
+    {"doc_id": "comms_templates_pack", "title": "Comms templates pack", "is_enabled": true, "tier": "free"},
+    {"doc_id": "vacancy_passport_internal", "title": "Vacancy passport (internal)", "is_enabled": true, "tier": "free"},
+
     {"doc_id": "vacancy_profile", "title": "Профиль вакансии", "is_enabled": true, "tier": "paid"},
     {"doc_id": "scorecard", "title": "Scorecard", "is_enabled": true, "tier": "paid"},
     {"doc_id": "screening_script", "title": "Скрипт скрининга", "is_enabled": true, "tier": "paid"},
     {"doc_id": "sourcing_pack", "title": "Sourcing pack", "is_enabled": true, "tier": "paid"},
     {"doc_id": "hiring_pack", "title": "Hiring pack", "is_enabled": true, "tier": "paid"},
     {"doc_id": "role_snapshot", "title": "Role snapshot", "is_enabled": true, "tier": "paid"},
-    {"doc_id": "budget_reality_check", "title": "Budget reality check", "is_enabled": true, "tier": "free"},
     {"doc_id": "quality_report", "title": "Quality report", "is_enabled": true, "tier": "paid"},
     {"doc_id": "manifest", "title": "Manifest", "is_enabled": true, "tier": "paid"},
-    {"doc_id": "interview_guide", "title": "Interview guide", "is_enabled": true, "tier": "paid"},
-    {"doc_id": "offer_template", "title": "Offer template", "is_enabled": true, "tier": "paid"}
+    {"doc_id": "interview_guide", "title": "Interview guide", "is_enabled": true, "tier": "paid"}
   ]
 }

@@ -12,7 +12,9 @@ sleep 3
 
 echo "Запускаю frontend..."
 cd /workspaces/nayti-lyudey-mvp/front
-npm run dev &
+# В локальном dev backend слушает localhost:8000 (см. выше),
+# поэтому прокси-роуты Next.js должны ходить именно туда.
+BACKEND_URL=http://localhost:8000 npm run dev &
 FRONT_PID=$!
 echo "Frontend PID: $FRONT_PID"
 
