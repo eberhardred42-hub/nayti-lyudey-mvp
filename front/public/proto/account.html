@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Личный кабинет — proto</title>
+  <link rel="stylesheet" href="/proto/styles.css"/>
+</head>
+<body data-page="account">
+  <div class="container">
+    <div class="pageHead">
+      <a class="back" href="/proto/index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M15 18 9 12l6-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Назад
+      </a>
+      <div class="iconButtons">
+        <a class="pill" href="/proto/chat.html">Чат</a>
+        <a class="pill" href="/proto/docs.html">Документы</a>
+        <a class="pill" href="/proto/admin.html" data-admin-link style="display:none;">Админка</a>
+        <button class="pill" data-logout style="display:none; cursor:pointer;">Выйти</button>
+      </div>
+    </div>
+
+    <div class="grid2">
+      <div class="card section">
+        <div class="sectionTitle">
+          <h3>Профиль</h3>
+          <span class="badge">Статус: <span data-auth-badge>Гость</span></span>
+        </div>
+
+        <div class="list">
+          <div class="item">
+            <div class="meta">
+              <div class="title">Телефон</div>
+              <div class="desc" id="mePhone">—</div>
+            </div>
+          </div>
+          <div class="item">
+            <div class="meta">
+              <div class="title">Роль</div>
+              <div class="desc" id="meRole">user</div>
+            </div>
+          </div>
+          <div class="item">
+            <div class="meta">
+              <div class="title">Документов сохранено</div>
+              <div class="desc"><span id="docsCount">0</span></div>
+            </div>
+            <a class="btn btnPrimary" href="/proto/docs.html">Открыть</a>
+          </div>
+        </div>
+      </div>
+
+      <div class="card section">
+        <div class="sectionTitle">
+          <h3>Что будет тут позже</h3>
+          <span class="small">но UI уже можно пилить</span>
+        </div>
+        <div class="list">
+          <div class="item">
+            <div class="meta">
+              <div class="title">История запросов</div>
+              <div class="desc">Поиск → документы → повторное использование</div>
+            </div>
+            <span class="badge">скоро</span>
+          </div>
+          <div class="item">
+            <div class="meta">
+              <div class="title">Реальные документы из backend</div>
+              <div class="desc">Не localStorage, а хранение в БД/MinIO</div>
+            </div>
+            <span class="badge">скоро</span>
+          </div>
+          <div class="item">
+            <div class="meta">
+              <div class="title">Настройки</div>
+              <div class="desc">Уведомления, приватность, интеграции</div>
+            </div>
+            <span class="badge">потом</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite">
+    <span class="dot"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <script src="/proto/app.js"></script>
+</body>
+</html>

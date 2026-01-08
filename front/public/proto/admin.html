@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Админка — proto</title>
+  <link rel="stylesheet" href="/proto/styles.css"/>
+</head>
+<body data-page="admin">
+  <div class="container">
+    <div class="pageHead">
+      <a class="back" href="/proto/index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M15 18 9 12l6-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Назад
+      </a>
+      <div class="iconButtons">
+        <a class="pill" href="/proto/docs.html">Документы</a>
+        <a class="pill" href="/proto/account.html">ЛК</a>
+        <span class="pill">Статус: <span data-auth-badge>Гость</span></span>
+      </div>
+    </div>
+
+    <div class="card section">
+      <div class="sectionTitle">
+        <h3>Админка</h3>
+        <span class="badge">UI proto</span>
+      </div>
+      <p class="hint">Тут мы позже подключим реальные админ-эндпоинты. Сейчас — визуальная структура и навигация.</p>
+
+      <div class="list">
+        <div class="item">
+          <div class="meta">
+            <div class="title">Пользователи</div>
+            <div class="desc">Список, роли, доступы</div>
+          </div>
+          <span class="badge">скоро</span>
+        </div>
+
+        <div class="item">
+          <div class="meta">
+            <div class="title">Сессии / авторизация</div>
+            <div class="desc">Состояния, проблемные попытки входа</div>
+          </div>
+          <span class="badge">скоро</span>
+        </div>
+
+        <div class="item">
+          <div class="meta">
+            <div class="title">Документы и генерации</div>
+            <div class="desc">Очереди, ошибки, повторные генерации</div>
+          </div>
+          <span class="badge">скоро</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite">
+    <span class="dot"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <script src="/proto/app.js"></script>
+</body>
+</html>

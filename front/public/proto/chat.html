@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Чат — proto</title>
+  <link rel="stylesheet" href="/proto/styles.css"/>
+</head>
+<body data-page="chat">
+  <div class="container">
+    <div class="pageHead">
+      <a class="back" href="/proto/index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M15 18 9 12l6-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Назад
+      </a>
+
+      <div class="iconButtons">
+        <a class="pill" href="/proto/docs.html">Документы</a>
+        <a class="pill" href="/proto/account.html">ЛК</a>
+        <a class="pill" href="/proto/admin.html" data-admin-link style="display:none;">Админка</a>
+        <button class="iconBtn" data-open-login title="Войти">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z" stroke="currentColor" stroke-width="1.7"/>
+            <path d="M4 21a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button class="iconBtn" data-open-help title="Помощь">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 18h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            <path d="M9.5 9.5a2.7 2.7 0 1 1 4.2 2.2c-.9.6-1.7 1.1-1.7 2.3v.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M12 22a10 10 0 1 0-10-10 10 10 0 0 0 10 10Z" stroke="currentColor" stroke-width="1.7"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="card section">
+      <div class="sectionTitle">
+        <h3>Тема: <span id="chatTopic" class="small"></span></h3>
+        <span class="badge">Статус: <span data-auth-badge>Гость</span></span>
+      </div>
+
+      <div class="chatWrap">
+        <div id="chatLog" class="chatLog"></div>
+
+        <div class="chatInput">
+          <textarea id="chatText" placeholder="Напиши запрос… (Ctrl+Enter чтобы отправить)"></textarea>
+          <button id="btnSendMsg" class="btn btnPrimary">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M4 12 20 4 13 20 11 13 4 12Z" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/>
+            </svg>
+            Отправить
+          </button>
+        </div>
+        <p class="hint" style="margin:0;">Сейчас это UI. На следующем этапе подключим реальный LLM (OpenRouter) и генерацию документов.</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Login modal (reuse same markup) -->
+  <div id="modalLogin" class="modalOverlay" role="dialog" aria-modal="true" aria-label="Вход">
+    <div class="modal">
+      <div class="modalHead">
+        <h4>Вход</h4>
+        <button class="iconBtn" data-close="#modalLogin" aria-label="Закрыть">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M6 6 18 18M18 6 6 18" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modalBody">
+        <div id="loginStepPhone" style="display:grid; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Телефон</div>
+            <input id="loginPhone" class="input" placeholder="+7 900 000-00-00"/>
+          </div>
+          <p class="hint">Мы отправим SMS с кодом подтверждения.</p>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnSendCode" class="btn btnPrimary">Получить код</button>
+          </div>
+        </div>
+
+        <div id="loginStepCode" style="display:none; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Телефон</div>
+            <div class="input" style="display:flex; align-items:center; background:rgba(248,250,252,.8)">
+              <span id="loginPhoneEcho">—</span>
+            </div>
+          </div>
+          <div class="modalRow">
+            <div class="label">Введите код из SMS</div>
+            <input id="loginCode" class="input" inputmode="numeric" placeholder="Введите код из SMS"/>
+          </div>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:space-between;">
+            <button class="linkBtn" type="button" onclick="location.reload()">Начать заново</button>
+            <button id="btnLogin" class="btn btnPrimary">Войти</button>
+          </div>
+        </div>
+
+        <div id="loginStepAdminAsk" style="display:none; gap:12px;">
+          <p class="hint" style="margin:0;">Этот номер имеет доступ администратора. Войти как администратор?</p>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnAdminNo" class="btn">Нет</button>
+            <button id="btnAdminYes" class="btn btnPrimary">Да</button>
+          </div>
+        </div>
+
+        <div id="loginStepAdminCode" style="display:none; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Введите админ-код</div>
+            <input id="adminCode" class="input" inputmode="numeric" placeholder="Введите админ-код"/>
+          </div>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnAdminLogin" class="btn btnPrimary">Войти как админ</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modalActions">
+        <button class="linkBtn" data-close="#modalLogin">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite">
+    <span class="dot"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <script src="/proto/app.js"></script>
+</body>
+</html>

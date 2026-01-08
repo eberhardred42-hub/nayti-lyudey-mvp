@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Документы — proto</title>
+  <link rel="stylesheet" href="/proto/styles.css"/>
+</head>
+<body data-page="docs">
+  <div class="container">
+    <div class="pageHead">
+      <a class="back" href="/proto/index.html">
+        <svg viewBox="0 0 24 24" fill="none">
+          <path d="M15 18 9 12l6-6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        Назад
+      </a>
+      <div class="iconButtons">
+        <a class="pill" href="/proto/chat.html">Чат</a>
+        <a class="pill" href="/proto/account.html">ЛК</a>
+        <a class="pill" href="/proto/admin.html" data-admin-link style="display:none;">Админка</a>
+        <span class="pill">Статус: <span data-auth-badge>Гость</span></span>
+      </div>
+    </div>
+
+    <div class="card section">
+      <div class="sectionTitle">
+        <h3>Документы</h3>
+        <span class="small">Пока: localStorage (позже: реальные документы из API)</span>
+      </div>
+      <div id="docsList" class="list"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite">
+    <span class="dot"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <script src="/proto/app.js"></script>
+</body>
+</html>

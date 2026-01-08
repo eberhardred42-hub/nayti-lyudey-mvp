@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Найти людей — proto</title>
+  <link rel="stylesheet" href="/proto/styles.css"/>
+</head>
+<body data-page="home">
+  <div class="container">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M10.5 18.5c4.4 0 8-3.6 8-8s-3.6-8-8-8-8 3.6-8 8 3.6 8 8 8Z" stroke="currentColor" stroke-width="1.7"/>
+            <path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </div>
+        <div>
+          <h1>Найти людей</h1>
+          <p>Прототип UI • быстро двигаем дизайн</p>
+        </div>
+      </div>
+
+      <div class="iconButtons">
+        <button class="iconBtn" data-open-login title="Войти" aria-label="Войти">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 12a4 4 0 1 0-4-4 4 4 0 0 0 4 4Z" stroke="currentColor" stroke-width="1.7"/>
+            <path d="M4 21a8 8 0 0 1 16 0" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <button class="iconBtn" data-open-help title="Помощь" aria-label="Помощь">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 18h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            <path d="M9.5 9.5a2.7 2.7 0 1 1 4.2 2.2c-.9.6-1.7 1.1-1.7 2.3v.3" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            <path d="M12 22a10 10 0 1 0-10-10 10 10 0 0 0 10 10Z" stroke="currentColor" stroke-width="1.7"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
+    <div class="hero">
+      <div class="card heroLeft">
+        <h2>Найти людей</h2>
+        <p class="sub">Опиши кого ты ищешь — система соберёт документы, вопросы и черновики для дальнейших шагов.</p>
+
+        <div class="inputRow">
+          <input id="q" class="input" placeholder="Например: аналитик 1С, удалёнка, бюджет 180к, опыт 3+ года"/>
+          <button id="btnFind" class="btn btnPrimary">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M10.5 18.5c4.4 0 8-3.6 8-8s-3.6-8-8-8-8 3.6-8 8 3.6 8 8 8Z" stroke="currentColor" stroke-width="1.7"/>
+              <path d="M16.5 16.5 21 21" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+            </svg>
+            Найти людей
+          </button>
+        </div>
+
+        <div class="navRow">
+          <a class="pill" href="/proto/chat.html">Чат</a>
+          <a class="pill" href="/proto/docs.html">Документы</a>
+          <a class="pill" href="/proto/account.html">Личный кабинет</a>
+          <a class="pill" href="/proto/admin.html" data-admin-link style="display:none;">Админка</a>
+          <span class="pill">Статус: <span data-auth-badge>Гость</span></span>
+          <button class="pill" data-logout style="display:none; cursor:pointer;">Выйти</button>
+        </div>
+      </div>
+
+      <div class="card heroRight">
+        <div class="kpi">
+          <p class="t">Режим</p>
+          <p class="v">Минимализм • outline UI • быстрые правки</p>
+        </div>
+        <div class="kpi">
+          <p class="t">Что проверяем сейчас</p>
+          <p class="v">UX входа → поиск → генерация документов → сохранение в ЛК</p>
+        </div>
+        <div class="kpi">
+          <p class="t">Заметка</p>
+          <p class="v">Эта папка живёт отдельно от Next-страниц и удобна для UI-итераций.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card section">
+      <div class="sectionTitle">
+        <h3>Быстрые ссылки прототипа</h3>
+        <span class="small">/proto/*.html</span>
+      </div>
+      <div class="list">
+        <div class="item">
+          <div class="meta">
+            <div class="title">Чат</div>
+            <div class="desc">Формирование запроса и документов (пока с graceful fallback)</div>
+          </div>
+          <a class="btn btnPrimary" href="/proto/chat.html">Открыть</a>
+        </div>
+        <div class="item">
+          <div class="meta">
+            <div class="title">Документы</div>
+            <div class="desc">Список документов (пока хранение в localStorage)</div>
+          </div>
+          <a class="btn btnPrimary" href="/proto/docs.html">Открыть</a>
+        </div>
+        <div class="item">
+          <div class="meta">
+            <div class="title">Личный кабинет</div>
+            <div class="desc">Профиль, роль, сохранённые документы</div>
+          </div>
+          <a class="btn btnPrimary" href="/proto/account.html">Открыть</a>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <div>Proto UI sandbox</div>
+      <div>Ctrl+Enter в чате — отправка</div>
+    </div>
+  </div>
+
+  <!-- Login modal -->
+  <div id="modalLogin" class="modalOverlay" role="dialog" aria-modal="true" aria-label="Вход">
+    <div class="modal">
+      <div class="modalHead">
+        <h4>Вход</h4>
+        <button class="iconBtn" data-close="#modalLogin" aria-label="Закрыть">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M6 6 18 18M18 6 6 18" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="modalBody">
+        <div id="loginStepPhone" style="display:grid; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Телефон</div>
+            <input id="loginPhone" class="input" placeholder="+7 900 000-00-00"/>
+          </div>
+          <p class="hint">Мы отправим SMS с кодом подтверждения.</p>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnSendCode" class="btn btnPrimary">Получить код</button>
+          </div>
+        </div>
+
+        <div id="loginStepCode" style="display:none; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Телефон</div>
+            <div class="input" style="display:flex; align-items:center; background:rgba(248,250,252,.8)">
+              <span id="loginPhoneEcho">—</span>
+            </div>
+          </div>
+          <div class="modalRow">
+            <div class="label">Введите код из SMS</div>
+            <input id="loginCode" class="input" inputmode="numeric" placeholder="Введите код из SMS"/>
+          </div>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:space-between;">
+            <button class="linkBtn" type="button" onclick="location.reload()">Начать заново</button>
+            <button id="btnLogin" class="btn btnPrimary">Войти</button>
+          </div>
+        </div>
+
+        <div id="loginStepAdminAsk" style="display:none; gap:12px;">
+          <p class="hint" style="margin:0;">Этот номер имеет доступ администратора. Войти как администратор?</p>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnAdminNo" class="btn">Нет</button>
+            <button id="btnAdminYes" class="btn btnPrimary">Да</button>
+          </div>
+        </div>
+
+        <div id="loginStepAdminCode" style="display:none; gap:12px;">
+          <div class="modalRow">
+            <div class="label">Введите админ-код</div>
+            <input id="adminCode" class="input" inputmode="numeric" placeholder="Введите админ-код"/>
+          </div>
+          <div class="modalActions" style="border-top:none; padding:0; background:none; justify-content:flex-end;">
+            <button id="btnAdminLogin" class="btn btnPrimary">Войти как админ</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="modalActions">
+        <button class="linkBtn" data-close="#modalLogin">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite">
+    <span class="dot"></span>
+    <span id="toastText"></span>
+  </div>
+
+  <script src="/proto/app.js"></script>
+</body>
+</html>
