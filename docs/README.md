@@ -29,6 +29,18 @@ See the **Complete Documentation Index** for full navigation:
 - [STAGE4_COMPLETE.md](stages/stage4/STAGE4_COMPLETE.md) — Completion status
 - [STAGE4_DOCS_COMPLETE.md](stages/stage4/STAGE4_DOCS_COMPLETE.md) — Executive summary
 
+### Stage 5-7: Persistence / Observability / LLM (Completed)
+- Stage 5: Postgres persistence — [docs/stages/stage5/](stages/stage5/)
+- Stage 6/6.2: Observability — [docs/stages/stage6/](stages/stage6/), [docs/stages/stage6.2/](stages/stage6.2/)
+- Stage 7: LLM clarifications — [docs/stages/stage7/](stages/stage7/)
+
+### Stage 9: Storage (Completed)
+- Stage 9.3: MinIO/S3 storage — [docs/stages/stage9/](stages/stage9/)
+- Stage 9.4: (summary) — [docs/stages/stage9.4/](stages/stage9.4/)
+
+### Documents Pipeline v1 (LLM → PDF → S3)
+- Overview + manual checks: [DOCUMENTS_PIPELINE_V1.md](DOCUMENTS_PIPELINE_V1.md)
+
 ## 🛠️ Operations & Setup
 
 → **[RUNBOOK.md](RUNBOOK.md)** — Complete setup, testing, and deployment guide
@@ -70,6 +82,6 @@ See the **Complete Documentation Index** for full navigation:
 
 ---
 
-**Project Status**: ✅ Stages 1-4 complete
+**Project Status**: ✅ MVP stages complete (см. индекс)
 **Quality**: Professional
-**Last Updated**: 2026-01-05
+**Last Updated**: 2026-01-08

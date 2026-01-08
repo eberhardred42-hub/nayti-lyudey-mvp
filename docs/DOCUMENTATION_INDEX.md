@@ -1,4 +1,6 @@
-# 📑 Stage 4.1 & Stage 5 — Complete Documentation Index
+# 📑 Documentation Index
+
+Актуальная версия релиза: см. `VERSION` в корне репозитория.
 
 ## 🎯 Start Here
 
@@ -14,9 +16,14 @@
 
 **Documents pipeline v1 (LLM → PDF → S3)?** → Read [DOCUMENTS_PIPELINE_V1.md](DOCUMENTS_PIPELINE_V1.md)
 
+**Documents pack (auto_generate) + generate_pack?** → Read [DOCUMENTS_PIPELINE_V1.md](DOCUMENTS_PIPELINE_V1.md)
+
 **Stage 9.3 (Storage / MinIO / S3)?** → Read:
 - [STAGE9_3_SUMMARY.md](stages/stage9/STAGE9_3_SUMMARY.md)
 - [STAGE9_3_IMPLEMENTATION.md](stages/stage9/STAGE9_3_IMPLEMENTATION.md)
+
+**Stage 9.4 (Summary)?** → Read:
+- [STAGE9.4_SUMMARY.md](stages/stage9.4/STAGE9.4_SUMMARY.md)
 
 ---
 
