@@ -12,6 +12,11 @@ jobs:
     steps:
       - name: Deploy from ~/app (git pull + compose up)
         shell: bash
+        env:
+          LLM_PROVIDER: openrouter
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          OPENROUTER_FALLBACK_MODELS: ${{ vars.OPENROUTER_FALLBACK_MODELS }}
         run: |
           set -euo pipefail
 
