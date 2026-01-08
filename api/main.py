@@ -1823,6 +1823,22 @@ def auth_otp_request(body: OtpRequest, request: Request):
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
 
+    def _digits(s: str) -> str:
+        return "".join(ch for ch in s if ch.isdigit())
+
+    # Stage-only convenience: when SMS_PROVIDER=mock, allow a fixed code for a fixed phone.
+    # This is used by front login UX and avoids external SMS wiring.
+    static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
+    static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
+    if provider == "mock" and static_code and _digits(phone) == _digits(static_phone):
+        OTP_LATEST[phone] = static_code
+        log_event(
+            "auth_otp_requested",
+            request_id=request_id,
+            provider=provider,
+        )
+        return {"ok": True}
+
     # Minimal mock: always generate a code; in real mode we would send SMS.
     code = str(int(time.time()))[-6:].rjust(6, "0")
     OTP_LATEST[phone] = code
@@ -1849,11 +1865,24 @@ def debug_otp_latest(phone: str, request: Request):
 @app.post("/auth/otp/verify")
 def auth_otp_verify(body: OtpVerify, request: Request):
     request_id = get_request_id_from_request(request)
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
     phone = (body.phone or "").strip()
     code = (body.code or "").strip()
     expected = OTP_LATEST.get(phone)
+
+    def _digits(s: str) -> str:
+        return "".join(ch for ch in s if ch.isdigit())
+
+    static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
+    static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
+
     if not expected or code != expected:
-        raise HTTPException(status_code=401, detail="Invalid code")
+        if provider == "mock" and static_code and _digits(phone) == _digits(static_phone):
+            import hmac
+            if not hmac.compare_digest(code, static_code):
+                raise HTTPException(status_code=401, detail="Invalid code")
+        else:
+            raise HTTPException(status_code=401, detail="Invalid code")
     # Stable UUID for this phone (server-side; no PII in user_id).
     user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone))
     token = str(uuid.uuid4())
