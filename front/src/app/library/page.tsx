@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { UserAuthHeader } from "@/components/UserAuthHeader";
+import { getUserToken } from "@/lib/userSession";
 
 type FileItem = {
   file_id: string;
@@ -34,15 +36,6 @@ type PackDocumentItem = {
   };
 };
 
-function getOrCreateUserId(): string {
-  const key = "nly_user_id";
-  const existing = typeof window !== "undefined" ? window.localStorage.getItem(key) : null;
-  if (existing) return existing;
-  const id = crypto.randomUUID();
-  window.localStorage.setItem(key, id);
-  return id;
-}
-
 async function sendClientEvent(event: string, props?: Record<string, unknown>) {
   try {
     await fetch("/api/events/client", {
@@ -65,7 +58,25 @@ export default function LibraryPage() {
   const [packLoading, setPackLoading] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
 
-  const userId = useMemo(() => (typeof window !== "undefined" ? getOrCreateUserId() : ""), []);
+  const [token, setToken] = useState<string | null>(
+    useMemo(() => (typeof window !== "undefined" ? getUserToken() : null), [])
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sync = () => setToken(getUserToken());
+    window.addEventListener("storage", sync);
+    window.addEventListener("nly-auth-changed", sync as any);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("nly-auth-changed", sync as any);
+    };
+  }, []);
+
+  const authHeaders = useMemo(() => {
+    if (!token) return null;
+    return { Authorization: token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}` };
+  }, [token]);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,7 +85,7 @@ export default function LibraryPage() {
       setError(null);
       try {
         const r = await fetch("/api/me/files", {
-          headers: { "X-User-Id": userId },
+          headers: authHeaders || undefined,
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки");
@@ -88,11 +99,15 @@ export default function LibraryPage() {
         if (!cancelled) setLoading(false);
       }
     }
-    if (userId) load();
+    if (!authHeaders) {
+      setFiles([]);
+      return;
+    }
+    load();
     return () => {
       cancelled = true;
     };
-  }, [userId]);
+  }, [authHeaders]);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,7 +116,7 @@ export default function LibraryPage() {
       setPackError(null);
       try {
         const r = await fetch("/api/me/packs", {
-          headers: { "X-User-Id": userId },
+          headers: authHeaders || undefined,
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки паков");
@@ -116,20 +131,27 @@ export default function LibraryPage() {
         if (!cancelled) setPackLoading(false);
       }
     }
-    if (userId) loadPacks();
+    if (!authHeaders) {
+      setPacks([]);
+      setSelectedPackId("");
+      setPackDocs([]);
+      return;
+    }
+    loadPacks();
     return () => {
       cancelled = true;
     };
-  }, [userId, selectedPackId]);
+  }, [authHeaders, selectedPackId]);
 
   async function refreshPackDocuments(packId: string) {
     if (!packId) return;
+    if (!authHeaders) return;
     sendClientEvent("ui_render_status_refresh_clicked", { pack_id: packId });
     setPackLoading(true);
     setPackError(null);
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/documents`, {
-        headers: { "X-User-Id": userId },
+        headers: authHeaders,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки статусов");
@@ -153,13 +175,14 @@ export default function LibraryPage() {
 
   async function renderPack(packId: string) {
     if (!packId) return;
+    if (!authHeaders) return;
     sendClientEvent("ui_render_pack_clicked", { pack_id: packId });
     setPackLoading(true);
     setPackError(null);
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render`, {
         method: "POST",
-        headers: { "X-User-Id": userId },
+        headers: authHeaders,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка запуска рендера");
@@ -180,7 +203,7 @@ export default function LibraryPage() {
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render/${encodeURIComponent(docId)}`, {
         method: "POST",
-        headers: { "X-User-Id": userId },
+        headers: authHeaders || undefined,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка регенерации документа");
@@ -198,7 +221,7 @@ export default function LibraryPage() {
     sendClientEvent("ui_file_download_clicked", { file_id: fileId });
     try {
       const r = await fetch(`/api/files/${fileId}/download`, {
-        headers: { "X-User-Id": userId },
+        headers: authHeaders || undefined,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка скачивания");
@@ -213,10 +236,16 @@ export default function LibraryPage() {
   }
 
   return (
-    <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
-      <h1>Библиотека</h1>
+    <main style={{ padding: 0, maxWidth: 960, margin: "0 auto" }}>
+      <UserAuthHeader title="Библиотека" />
 
-      <section style={{ marginTop: 24 }}>
+      {!authHeaders ? (
+        <section style={{ padding: 24 }}>
+          <div>Чтобы открыть библиотеку, нужно войти.</div>
+        </section>
+      ) : (
+        <section style={{ padding: 24 }}>
+          <section style={{ marginTop: 24 }}>
         <h2>Пак документов</h2>
 
         {packLoading && <div>Загрузка…</div>}
@@ -299,9 +328,9 @@ export default function LibraryPage() {
             </table>
           </div>
         )}
-      </section>
+          </section>
 
-      <section style={{ marginTop: 24 }}>
+          <section style={{ marginTop: 24 }}>
         <h2>Файлы</h2>
 
         {loading && <div>Загрузка…</div>}
@@ -337,7 +366,9 @@ export default function LibraryPage() {
             </table>
           </div>
         )}
-      </section>
+          </section>
+        </section>
+      )}
     </main>
   );
 }

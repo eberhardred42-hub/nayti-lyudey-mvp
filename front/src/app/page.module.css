@@ -8,6 +8,10 @@
   color: #000;
 }
 
+.headerWrap {
+  /* header draws its own border */
+}
+
 /* Стартовый экран */
 .searchMode {
   flex: 1;

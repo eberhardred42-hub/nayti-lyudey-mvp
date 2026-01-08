@@ -2,14 +2,17 @@ import { NextResponse } from "next/server";
 
 export async function GET(req: Request, ctx: { params: Promise<{ packId: string }> }) {
   const backendUrl = process.env.BACKEND_URL || "http://api:8000";
+  const auth = req.headers.get("Authorization") || "";
   const userId = req.headers.get("X-User-Id") || "";
   const { packId } = await ctx.params;
 
+  const headers: Record<string, string> = {};
+  if (auth) headers["Authorization"] = auth;
+  else if (userId) headers["X-User-Id"] = userId;
+
   const r = await fetch(`${backendUrl}/packs/${encodeURIComponent(packId)}/documents`, {
     method: "GET",
-    headers: {
-      "X-User-Id": userId,
-    },
+    headers,
   });
 
   const data = await r.json();

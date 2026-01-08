@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import styles from "./page.module.css";
+import { UserAuthHeader } from "@/components/UserAuthHeader";
 
 type Msg = { role: "user" | "assistant"; text: string };
 
@@ -148,6 +149,9 @@ export default function Page() {
 
   return (
     <div className={styles.container}>
+      <div className={styles.headerWrap}>
+        <UserAuthHeader />
+      </div>
       {mode === "search" ? (
         // Стартовый экран: пустая страница, только строка ввода
         <div className={styles.searchMode}>
