@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import styles from "./page.module.css";
-import { UserAuthHeader } from "@/components/UserAuthHeader";
+import { clearUserSession, getUserToken } from "@/lib/userSession";
+import { UserLoginModal } from "@/components/UserLoginModal";
 
 type Msg = { role: "user" | "assistant"; text: string };
 
@@ -44,8 +45,22 @@ export default function Page() {
   const [freeReport, setFreeReport] = useState<FreeReport | null>(null);
   const [reportLoading, setReportLoading] = useState(false);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [userToken, setUserTokenState] = useState<string | null>(null);
 
   const boxRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sync = () => setUserTokenState(getUserToken());
+    sync();
+    window.addEventListener("storage", sync);
+    window.addEventListener("nly-auth-changed", sync);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("nly-auth-changed", sync);
+    };
+  }, []);
   
   // Mode: "search" or "chat"
   const mode = stage === "start" ? "search" : "chat";
@@ -149,9 +164,40 @@ export default function Page() {
 
   return (
     <div className={styles.container}>
-      <div className={styles.headerWrap}>
-        <UserAuthHeader />
+      <div className={styles.topRightActions}>
+        <button
+          className={styles.iconCircleBtn}
+          aria-label={userToken ? "Выйти" : "Войти"}
+          onClick={() => {
+            if (userToken) {
+              clearUserSession();
+              setUserTokenState(null);
+              return;
+            }
+            setLoginOpen(true);
+          }}
+        >
+          {userToken ? "⎋" : "⎆"}
+        </button>
+        <button
+          className={styles.iconCircleBtn}
+          aria-label="Помощь"
+          onClick={() => {
+            if (typeof window === "undefined") return;
+            window.location.href = "/library";
+          }}
+        >
+          ?
+        </button>
       </div>
+
+      <UserLoginModal
+        open={loginOpen}
+        onClose={() => setLoginOpen(false)}
+        onLoggedIn={() => {
+          setUserTokenState(getUserToken());
+        }}
+      />
       {mode === "search" ? (
         // Стартовый экран: пустая страница, только строка ввода
         <div className={styles.searchMode}>
@@ -167,11 +213,9 @@ export default function Page() {
                 }
               }}
             />
-            {profession.trim() && (
-              <button className={styles.searchBtn} onClick={start}>
-                Найти людей
-              </button>
-            )}
+            <button className={styles.searchBtn} onClick={start} disabled={!profession.trim()}>
+              Найти людей
+            </button>
           </div>
         </div>
       ) : (

@@ -197,7 +197,10 @@ def _admin_phone_allowlist() -> set[str]:
     for part in raw.split(","):
         v = part.strip()
         if v:
-            out.add(v)
+            try:
+                out.add(_normalize_phone_e164(v))
+            except HTTPException:
+                continue
     return out
 
 
@@ -247,6 +250,24 @@ def _mask_phone(phone_e164: str | None) -> str:
     if len(s) <= 4:
         return "****"
     return f"{s[:2]}****{s[-2:]}"
+
+
+def _normalize_phone_e164(raw: str) -> str:
+    s = (raw or "").strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        raise HTTPException(status_code=400, detail="phone is required")
+    # Common RU formats:
+    # - 8XXXXXXXXXX (11 digits) -> +7XXXXXXXXXX
+    # - 7XXXXXXXXXX (11 digits) -> +7XXXXXXXXXX
+    # - XXXXXXXXXX  (10 digits) -> +7XXXXXXXXXX
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    elif len(digits) == 10:
+        digits = "7" + digits
+    if len(digits) != 11 or not digits.startswith("7"):
+        raise HTTPException(status_code=400, detail="invalid phone")
+    return "+" + digits
 
 
 def _verify_admin_password(admin_password: str) -> bool:
@@ -365,8 +386,9 @@ def _require_bearer_user(request: Request) -> dict:
         phone = token.split(":", 1)[1].strip()
         if not phone:
             raise HTTPException(status_code=401, detail="Unauthorized")
-        user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone))
-        return {"user_id": user_id, "phone_e164": phone}
+        phone_e164 = _normalize_phone_e164(phone)
+        user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
+        return {"user_id": user_id, "phone_e164": phone_e164}
 
     rec = TOKENS.get(token)
     if not rec:
@@ -1819,34 +1841,32 @@ class OtpVerify(BaseModel):
 def auth_otp_request(body: OtpRequest, request: Request):
     request_id = get_request_id_from_request(request)
     provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
-    phone = (body.phone or "").strip()
-    if not phone:
-        raise HTTPException(status_code=400, detail="phone is required")
+    phone_raw = (body.phone or "").strip()
+    phone_e164 = _normalize_phone_e164(phone_raw)
+
+    stage_static_code = (os.environ.get("STAGE_STATIC_OTP_CODE") or "").strip()
+    if provider == "mock" and stage_static_code:
+        # Stage-only convenience: when SMS_PROVIDER=mock and STAGE_STATIC_OTP_CODE is set,
+        # issue the same 6-digit code for everyone.
+        OTP_LATEST[phone_e164] = stage_static_code
+        log_event("auth_otp_requested", request_id=request_id, provider=provider)
+        return {"ok": True}
 
     def _digits(s: str) -> str:
         return "".join(ch for ch in s if ch.isdigit())
 
-    # Stage-only convenience: when SMS_PROVIDER=mock, allow a fixed code for a fixed phone.
-    # This is used by front login UX and avoids external SMS wiring.
+    # Backward-compatible convenience: fixed code for a fixed phone.
     static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
     static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
-    if provider == "mock" and static_code and _digits(phone) == _digits(static_phone):
-        OTP_LATEST[phone] = static_code
-        log_event(
-            "auth_otp_requested",
-            request_id=request_id,
-            provider=provider,
-        )
+    if provider == "mock" and static_code and _digits(phone_raw) == _digits(static_phone):
+        OTP_LATEST[phone_e164] = static_code
+        log_event("auth_otp_requested", request_id=request_id, provider=provider)
         return {"ok": True}
 
     # Minimal mock: always generate a code; in real mode we would send SMS.
     code = str(int(time.time()))[-6:].rjust(6, "0")
-    OTP_LATEST[phone] = code
-    log_event(
-        "auth_otp_requested",
-        request_id=request_id,
-        provider=provider,
-    )
+    OTP_LATEST[phone_e164] = code
+    log_event("auth_otp_requested", request_id=request_id, provider=provider)
     return {"ok": True}
 
 
@@ -1855,45 +1875,59 @@ def debug_otp_latest(phone: str, request: Request):
     if not _is_debug_enabled():
         raise HTTPException(status_code=404, detail="Not found")
     request_id = get_request_id_from_request(request)
-    code = OTP_LATEST.get(phone)
+    phone_e164 = _normalize_phone_e164(phone)
+    code = OTP_LATEST.get(phone_e164)
     if not code:
         raise HTTPException(status_code=404, detail="No OTP")
     log_event("debug_otp_latest", request_id=request_id)
-    return {"ok": True, "phone": phone, "code": code}
+    return {"ok": True, "phone": phone_e164, "code": code}
 
 
 @app.post("/auth/otp/verify")
 def auth_otp_verify(body: OtpVerify, request: Request):
     request_id = get_request_id_from_request(request)
     provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
-    phone = (body.phone or "").strip()
+    phone_raw = (body.phone or "").strip()
+    phone_e164 = _normalize_phone_e164(phone_raw)
     code = (body.code or "").strip()
-    expected = OTP_LATEST.get(phone)
 
-    def _digits(s: str) -> str:
-        return "".join(ch for ch in s if ch.isdigit())
-
-    static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
-    static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
-
-    if not expected or code != expected:
-        if provider == "mock" and static_code and _digits(phone) == _digits(static_phone):
-            import hmac
-            if not hmac.compare_digest(code, static_code):
-                raise HTTPException(status_code=401, detail="Invalid code")
-        else:
+    stage_static_code = (os.environ.get("STAGE_STATIC_OTP_CODE") or "").strip()
+    if provider == "mock" and stage_static_code:
+        if not hmac.compare_digest(code, stage_static_code):
             raise HTTPException(status_code=401, detail="Invalid code")
+    else:
+        expected = OTP_LATEST.get(phone_e164)
+
+        def _digits(s: str) -> str:
+            return "".join(ch for ch in s if ch.isdigit())
+
+        static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
+        static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
+
+        if not expected or code != expected:
+            if provider == "mock" and static_code and _digits(phone_raw) == _digits(static_phone):
+                if not hmac.compare_digest(code, static_code):
+                    raise HTTPException(status_code=401, detail="Invalid code")
+            else:
+                raise HTTPException(status_code=401, detail="Invalid code")
+
     # Stable UUID for this phone (server-side; no PII in user_id).
-    user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone))
+    user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
     token = str(uuid.uuid4())
-    TOKENS[token] = {"user_id": user_id, "phone_e164": phone}
+    TOKENS[token] = {"user_id": user_id, "phone_e164": phone_e164}
     try:
-        ensure_user(user_id=user_id, phone_e164=phone, request_id=request_id)
+        ensure_user(user_id=user_id, phone_e164=phone_e164, request_id=request_id)
     except Exception:
         # best-effort
         pass
     log_event("auth_otp_verified", request_id=request_id)
-    return {"ok": True, "token": token, "user_id": user_id}
+    allow = _admin_phone_allowlist()
+    return {
+        "ok": True,
+        "token": token,
+        "user_id": user_id,
+        "is_admin_candidate": (phone_e164 in allow),
+    }
 
 
 @app.post("/legal/offer/accept")
