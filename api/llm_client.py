@@ -6,7 +6,7 @@ import urllib.error
 
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "mock").strip().lower() or "mock"
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "").strip()
-LLM_API_KEY = os.environ.get("LLM_API_KEY", "").strip()
+LLM_API_KEY = (os.environ.get("LLM_API_KEY", "").strip() or os.environ.get("OPENROUTER_API_KEY", "").strip())
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
 
 
@@ -116,6 +116,102 @@ def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str,
             error=f"invalid_content_json {e}",
         )
         raise RuntimeError(f"invalid_content_json {e}")
+
+
+def generate_json_openai_compat_messages(messages: list[dict], request_id: str, session_id: str) -> dict:
+    """Call OpenAI-compatible /chat/completions with a full messages array.
+
+    Must return a JSON object (via response_format).
+    """
+    if not LLM_BASE_URL or not LLM_API_KEY:
+        raise RuntimeError("missing LLM_BASE_URL or LLM_API_KEY")
+    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+    body = {
+        "model": LLM_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.2,
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {LLM_API_KEY}")
+
+    start = time.perf_counter()
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"http_error {e.code} {e.reason}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # Do NOT log prompt contents.
+    prompt_chars = 0
+    try:
+        prompt_chars = sum(len(str(m.get("content") or "")) for m in (messages or []))
+    except Exception:
+        prompt_chars = 0
+    _log_event(
+        "llm_response",
+        provider="openai_compat",
+        model=LLM_MODEL,
+        request_id=request_id,
+        session_id=session_id,
+        duration_ms=duration_ms,
+        prompt_chars=prompt_chars,
+        llm_response_chars=len(raw),
+    )
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        raise RuntimeError(f"invalid_json {e}")
+    content = None
+    try:
+        content = parsed["choices"][0]["message"]["content"]
+    except Exception:
+        pass
+    if not content:
+        raise RuntimeError("empty_content")
+    try:
+        out = json.loads(content)
+    except Exception as e:
+        _log_event(
+            "llm_invalid_output",
+            level="error",
+            provider="openai_compat",
+            model=LLM_MODEL,
+            request_id=request_id,
+            session_id=session_id,
+            error=f"invalid_content_json {e}",
+        )
+        raise RuntimeError(f"invalid_content_json {e}")
+    if not isinstance(out, dict):
+        raise RuntimeError("result_not_dict")
+    return out
+
+
+def generate_json_messages(messages: list[dict], request_id: str, session_id: str, fallback: dict) -> dict:
+    """Provider wrapper returning JSON dict; never raises."""
+    provider = LLM_PROVIDER
+    try:
+        if provider == "openai_compat":
+            return generate_json_openai_compat_messages(messages, request_id=request_id, session_id=session_id)
+        # default mock
+        return fallback
+    except Exception as e:
+        _log_event(
+            "llm_error",
+            level="error",
+            provider=provider,
+            model=LLM_MODEL,
+            request_id=request_id,
+            session_id=session_id,
+            error=str(e),
+        )
+        return fallback
 
 
 def generate_questions_and_quick_replies(context: dict) -> dict:

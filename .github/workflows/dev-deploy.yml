@@ -38,6 +38,13 @@ jobs:
           export REDIS_HOST_PORT=16379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
+          # LLM/OpenRouter passthrough (optional; empty values are OK)
+          export LLM_PROVIDER=${LLM_PROVIDER:-mock}
+          export LLM_BASE_URL=${LLM_BASE_URL:-}
+          export LLM_API_KEY=${LLM_API_KEY:-}
+          export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+          export LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+
           docker compose -p dev -f infra/docker-compose.yml up -d --build
 
       - name: Ensure caddy is running (host network)

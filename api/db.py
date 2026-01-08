@@ -98,6 +98,17 @@ def init_db():
             ALTER TABLE sessions
             ADD COLUMN IF NOT EXISTS user_id TEXT
         """)
+
+        # PR-LLM-INTRO-DIALOGUE: intro dialogue persistence.
+        cur.execute("""
+            ALTER TABLE sessions
+            ADD COLUMN IF NOT EXISTS phase TEXT
+        """)
+
+        cur.execute("""
+            ALTER TABLE sessions
+            ADD COLUMN IF NOT EXISTS brief_state JSONB NOT NULL DEFAULT '{}'::jsonb
+        """)
         
         # Create messages table
         cur.execute("""
@@ -437,11 +448,24 @@ def get_session(session_id: str, request_id: str = "unknown") -> Optional[Dict[s
     with get_db_connection() as conn:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         try:
-            cur.execute("""
-                SELECT session_id, profession_query, chat_state, vacancy_kb, free_report, created_at, updated_at
+            cur.execute(
+                """
+                SELECT
+                    session_id,
+                    profession_query,
+                    chat_state,
+                    vacancy_kb,
+                    free_report,
+                    user_id,
+                    phase,
+                    brief_state,
+                    created_at,
+                    updated_at
                 FROM sessions
                 WHERE session_id = %s
-            """, (session_id,))
+                """,
+                (session_id,),
+            )
             session = cur.fetchone()
             _log_event(
                 "db_query_ok",
@@ -455,6 +479,7 @@ def get_session(session_id: str, request_id: str = "unknown") -> Optional[Dict[s
                 session = dict(session)
                 session["vacancy_kb"] = safe_json(session.get("vacancy_kb"), {})
                 session["free_report"] = safe_json(session.get("free_report"), {})
+                session["brief_state"] = safe_json(session.get("brief_state"), {})
                 return session
             return None
         except Exception as e:
@@ -475,6 +500,8 @@ def update_session(
     chat_state: Optional[str] = None,
     vacancy_kb: Optional[Dict[str, Any]] = None,
     free_report: Optional[Dict[str, Any]] = None,
+    phase: Optional[str] = None,
+    brief_state: Optional[Dict[str, Any]] = None,
     request_id: str = "unknown",
 ) -> None:
     """Update session fields."""
@@ -496,6 +523,14 @@ def update_session(
         if free_report is not None:
             updates.append("free_report = %s")
             params.append(psycopg2.extras.Json(free_report or {}))
+
+        if phase is not None:
+            updates.append("phase = %s")
+            params.append(phase)
+
+        if brief_state is not None:
+            updates.append("brief_state = %s")
+            params.append(psycopg2.extras.Json(brief_state or {}))
         
         if updates:
             updates.append("updated_at = now()")
@@ -527,6 +562,67 @@ def update_session(
                     error=str(e),
                 )
                 raise
+
+
+def list_user_intro_documents(user_id: str, request_id: str = "unknown", limit: int = 50) -> List[Dict[str, Any]]:
+    """List intro dialogue documents (artifact payloads) belonging to the given user."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="list_user_intro_documents",
+        request_id=request_id,
+        user_id=user_id,
+        limit=limit,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT
+                    a.id,
+                    a.session_id,
+                    a.kind,
+                    a.format,
+                    a.payload_json,
+                    a.meta,
+                    a.created_at
+                FROM artifacts a
+                JOIN sessions s ON s.session_id = a.session_id
+                WHERE s.user_id = %s
+                  AND a.kind IN ('intro_document', 'intro_brief')
+                ORDER BY a.created_at DESC
+                LIMIT %s
+                """,
+                (user_id, limit),
+            )
+            rows = cur.fetchall()
+            _log_event(
+                "db_query_ok",
+                query_name="list_user_intro_documents",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=len(rows),
+            )
+            out: List[Dict[str, Any]] = []
+            for r in rows:
+                row = dict(r)
+                row["payload_json"] = safe_json(row.get("payload_json"), {})
+                row["meta"] = safe_json(row.get("meta"), {})
+                out.append(row)
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="list_user_intro_documents",
+                request_id=request_id,
+                user_id=user_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
 
 
 # ============================================================================

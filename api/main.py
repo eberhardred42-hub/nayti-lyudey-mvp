@@ -17,7 +17,7 @@ from alerts import send_alert
 from db import init_db, health_check, create_session as db_create_session
 from db import get_session, update_session, add_message, get_session_messages
 from db import set_session_user, create_artifact, create_artifact_file, get_file_download_info_for_user
-from db import list_user_files
+from db import list_user_files, list_user_intro_documents
 from db import (
     create_pack,
     create_render_job,
@@ -66,7 +66,7 @@ from db import (
     upsert_document_access,
     upsert_document_metadata,
 )
-from llm_client import generate_questions_and_quick_replies, health_llm
+from llm_client import generate_questions_and_quick_replies, health_llm, generate_json_messages
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get
 
@@ -2170,12 +2170,86 @@ except Exception as e:
 
 class SessionCreate(BaseModel):
     profession_query: str
+    flow: str | None = None
 
 
 class ChatMessage(BaseModel):
     session_id: str
     type: str
     text: str | None = None
+
+
+class IntroDialogueResponse(BaseModel):
+    assistant_text: str
+    quick_replies: list[str] = []
+    brief_patch: dict = {}
+    ready_to_search: bool = False
+    missing_fields: list[str] = []
+
+
+def _read_prompt_file(rel_path: str) -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, rel_path)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _deep_merge_dict(base: dict, patch: dict) -> dict:
+    out = dict(base or {})
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out.get(k) or {}, v)
+        else:
+            out[k] = v
+    return out
+
+
+def _intro_missing_fields(brief_state: dict) -> list[str]:
+    role = (brief_state.get("role") or "").strip() if isinstance(brief_state.get("role"), str) else ""
+    goal = (brief_state.get("goal") or "").strip() if isinstance(brief_state.get("goal"), str) else ""
+    constraints = brief_state.get("constraints") if isinstance(brief_state.get("constraints"), dict) else {}
+
+    location = (constraints.get("location") or "").strip() if isinstance(constraints.get("location"), str) else ""
+    timeline = (constraints.get("timeline") or "").strip() if isinstance(constraints.get("timeline"), str) else ""
+    budget = (constraints.get("budget") or "").strip() if isinstance(constraints.get("budget"), str) else ""
+
+    missing: list[str] = []
+    if not role:
+        missing.append("role")
+    if not goal:
+        missing.append("goal")
+    if not (location or timeline or budget):
+        missing.append("constraints")
+    return missing
+
+
+def _intro_fallback_question(missing_fields: list[str]) -> tuple[str, list[str]]:
+    if "role" in missing_fields:
+        return "Кого ищем: какая роль и уровень?", ["Продакт", "Разработчик", "Маркетолог", "Другое"]
+    if "goal" in missing_fields:
+        return "Зачем нужен человек: какая цель/задача найма?", ["Усилить команду", "Срочно закрыть", "Проект", "Другое"]
+    return "Есть ли ограничения: город/удалёнка, сроки или бюджет?", ["Город", "Сроки", "Бюджет", "Без ограничений"]
+
+
+def _build_intro_messages(
+    profession_query: str,
+    brief_state: dict,
+    last_user_message: str,
+    missing_fields: list[str],
+) -> list[dict]:
+    system = _read_prompt_file("prompts/intro_system.md")
+    tmpl = _read_prompt_file("prompts/intro_user_template.md")
+
+    user = tmpl
+    user = user.replace("{{profession_query}}", profession_query or "")
+    user = user.replace("{{brief_state_json}}", json.dumps(brief_state or {}, ensure_ascii=False))
+    user = user.replace("{{last_user_message}}", last_user_message or "")
+    user = user.replace("{{missing_fields_csv}}", ", ".join(missing_fields or []) or "нет")
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
 
 
 def make_empty_vacancy_kb():
@@ -2472,6 +2546,8 @@ def chat_message(body: ChatMessage, request: Request):
                 "tasks": None,
                 "clarifications": [],
                 "vacancy_kb": db_session.get("vacancy_kb", make_empty_vacancy_kb()),
+                "phase": db_session.get("phase"),
+                "brief_state": db_session.get("brief_state") or {},
             }
             SESSIONS[sid] = session
     except Exception as e:
@@ -2522,6 +2598,139 @@ def chat_message(body: ChatMessage, request: Request):
     should_show_free_result = False
 
     state = session.get("state")
+
+    # ----------------------------------------------------------------------
+    # PR-LLM-INTRO-DIALOGUE: intro flow (opt-in via type or session state)
+    # ----------------------------------------------------------------------
+
+    is_intro_type = msg_type in {"intro_start", "intro_message", "intro"}
+    is_intro_session = str(state or "").strip().lower() == "intro" or str(session.get("phase") or "").strip().upper() in {
+        "INTRO",
+        "CLARIFY",
+        "SEARCH",
+        "DONE",
+    }
+
+    if is_intro_type or is_intro_session:
+        user_id = _get_user_id(request)
+        if user_id:
+            try:
+                set_session_user(sid, user_id, request_id=request_id)
+            except Exception:
+                pass
+
+        brief_state = session.get("brief_state") if isinstance(session.get("brief_state"), dict) else {}
+        missing = _intro_missing_fields(brief_state)
+
+        if msg_type in {"intro_start", "intro"}:
+            q, qrs = _intro_fallback_question(missing)
+            payload = {
+                "assistant_text": q,
+                "quick_replies": qrs[:4],
+                "brief_patch": {},
+                "brief_state": brief_state,
+                "ready_to_search": False,
+                "missing_fields": missing,
+                "documents_ready": False,
+                "documents": [],
+            }
+            try:
+                add_message(sid, "assistant", q, request_id=request_id)
+                update_session(sid, chat_state="intro", phase="INTRO", brief_state=brief_state, request_id=request_id)
+            except Exception:
+                pass
+            return {"ok": True, "reply": q, **payload}
+
+        # intro_message
+        if text:
+            try:
+                add_message(sid, "user", text, request_id=request_id)
+            except Exception:
+                pass
+
+        messages = _build_intro_messages(
+            profession_query=session.get("profession_query", ""),
+            brief_state=brief_state,
+            last_user_message=text,
+            missing_fields=missing,
+        )
+
+        fallback_q, fallback_qr = _intro_fallback_question(missing)
+        fallback = {
+            "assistant_text": fallback_q,
+            "quick_replies": fallback_qr[:4],
+            "brief_patch": {},
+            "ready_to_search": False,
+            "missing_fields": missing,
+        }
+
+        raw = generate_json_messages(messages=messages, request_id=request_id, session_id=sid, fallback=fallback)
+        try:
+            model = IntroDialogueResponse.model_validate(raw)
+        except Exception as e:
+            log_event(
+                "intro_llm_invalid",
+                level="warning",
+                request_id=request_id,
+                session_id=sid,
+                error=str(e),
+            )
+            model = IntroDialogueResponse.model_validate(fallback)
+
+        assistant_text = (model.assistant_text or "").strip() or fallback_q
+        quick = [q for q in (model.quick_replies or []) if isinstance(q, str) and q.strip()][:4]
+        patch = model.brief_patch if isinstance(model.brief_patch, dict) else {}
+        next_brief = _deep_merge_dict(brief_state, patch)
+
+        server_missing = _intro_missing_fields(next_brief)
+        server_ready = len(server_missing) == 0
+        next_phase = "DONE" if server_ready else "CLARIFY"
+
+        try:
+            update_session(sid, chat_state="intro", phase=next_phase, brief_state=next_brief, request_id=request_id)
+        except Exception:
+            pass
+        try:
+            add_message(sid, "assistant", assistant_text, request_id=request_id)
+        except Exception:
+            pass
+
+        documents = []
+        documents_ready = False
+        if server_ready:
+            try:
+                art = create_artifact(
+                    session_id=sid,
+                    kind="intro_brief",
+                    format="json",
+                    payload_json={"title": "Бриф поиска", "brief_state": next_brief},
+                    meta={"title": "Бриф поиска"},
+                    request_id=request_id,
+                )
+                documents_ready = True
+                documents = [
+                    {
+                        "id": str(art.get("id")),
+                        "kind": "intro_brief",
+                        "title": "Бриф поиска",
+                        "content": next_brief,
+                    }
+                ]
+            except Exception:
+                documents_ready = False
+
+        return {
+            "ok": True,
+            "reply": assistant_text,
+            "assistant_text": assistant_text,
+            "quick_replies": quick,
+            "brief_patch": patch,
+            "brief_state": next_brief,
+            "ready_to_search": server_ready,
+            "missing_fields": server_missing,
+            "documents_ready": documents_ready,
+            "documents": documents,
+        }
 
     if msg_type == "start":
         session["state"] = "awaiting_flow"
@@ -3156,11 +3365,13 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     session_id = str(uuid.uuid4())
+
+    flow = (body.flow or "").strip().lower()
     
     # Create in-memory session for backward compatibility
     SESSIONS[session_id] = {
         "profession_query": body.profession_query,
-        "state": "awaiting_flow",
+        "state": "intro" if flow == "intro" else "awaiting_flow",
         "vacancy_text": None,
         "tasks": None,
         "clarifications": [],
@@ -3174,6 +3385,8 @@ def create_session_endpoint(body: SessionCreate, request: Request):
         user_id = _get_user_id(request)
         if user_id:
             set_session_user(session_id, user_id, request_id=request_id)
+        if flow == "intro":
+            update_session(session_id, chat_state="intro", phase="INTRO", brief_state={}, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -3441,6 +3654,35 @@ def me_files(request: Request):
         files_count=len(normalized),
     )
     return {"ok": True, "files": normalized}
+
+
+@app.get("/me/documents")
+def me_documents(request: Request):
+    """Auth-required: list intro dialogue documents for current user."""
+    request_id = get_request_id_from_request(request)
+    user_id = _require_user_id(request)
+    rows = list_user_intro_documents(user_id=user_id, request_id=request_id, limit=50)
+    normalized = []
+    for r in rows:
+        meta = r.get("meta") if isinstance(r.get("meta"), dict) else {}
+        normalized.append(
+            {
+                "id": str(r.get("id")),
+                "session_id": str(r.get("session_id") or ""),
+                "kind": r.get("kind"),
+                "format": r.get("format"),
+                "title": (meta.get("title") if isinstance(meta, dict) else None) or r.get("kind"),
+                "payload": r.get("payload_json") or {},
+                "created_at": to_iso(r.get("created_at")),
+            }
+        )
+    log_event(
+        "me_documents_listed",
+        request_id=request_id,
+        user_id=user_id,
+        documents_count=len(normalized),
+    )
+    return {"ok": True, "documents": normalized}
 
 
 @app.post("/ml/job", response_model=MlJobCreateResponse)
