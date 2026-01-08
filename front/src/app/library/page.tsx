@@ -1,6 +1,13 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { UserAuthHeader } from "@/components/UserAuthHeader";
+import { getUserToken } from "@/lib/userSession";
+
+function getErrorMessage(e: unknown, fallback: string) {
+  if (e instanceof Error) return e.message || fallback;
+  return fallback;
+}
 
 type FileItem = {
   file_id: string;
@@ -34,15 +41,6 @@ type PackDocumentItem = {
   };
 };
 
-function getOrCreateUserId(): string {
-  const key = "nly_user_id";
-  const existing = typeof window !== "undefined" ? window.localStorage.getItem(key) : null;
-  if (existing) return existing;
-  const id = crypto.randomUUID();
-  window.localStorage.setItem(key, id);
-  return id;
-}
-
 async function sendClientEvent(event: string, props?: Record<string, unknown>) {
   try {
     await fetch("/api/events/client", {
@@ -65,7 +63,25 @@ export default function LibraryPage() {
   const [packLoading, setPackLoading] = useState(false);
   const [packError, setPackError] = useState<string | null>(null);
 
-  const userId = useMemo(() => (typeof window !== "undefined" ? getOrCreateUserId() : ""), []);
+  const [token, setToken] = useState<string | null>(
+    useMemo(() => (typeof window !== "undefined" ? getUserToken() : null), [])
+  );
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sync = () => setToken(getUserToken());
+    window.addEventListener("storage", sync);
+    window.addEventListener("nly-auth-changed", sync);
+    return () => {
+      window.removeEventListener("storage", sync);
+      window.removeEventListener("nly-auth-changed", sync);
+    };
+  }, []);
+
+  const authHeaders = useMemo(() => {
+    if (!token) return null;
+    return { Authorization: token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}` };
+  }, [token]);
 
   useEffect(() => {
     let cancelled = false;
@@ -74,7 +90,7 @@ export default function LibraryPage() {
       setError(null);
       try {
         const r = await fetch("/api/me/files", {
-          headers: { "X-User-Id": userId },
+          headers: authHeaders || undefined,
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки");
@@ -82,17 +98,21 @@ export default function LibraryPage() {
           setFiles(data.files || []);
           sendClientEvent("ui_library_files_opened", { files_count: (data.files || []).length });
         }
-      } catch (e: any) {
-        if (!cancelled) setError(e?.message || "Ошибка");
+      } catch (e: unknown) {
+        if (!cancelled) setError(getErrorMessage(e, "Ошибка"));
       } finally {
         if (!cancelled) setLoading(false);
       }
     }
-    if (userId) load();
+    if (!authHeaders) {
+      setFiles([]);
+      return;
+    }
+    load();
     return () => {
       cancelled = true;
     };
-  }, [userId]);
+  }, [authHeaders]);
 
   useEffect(() => {
     let cancelled = false;
@@ -101,7 +121,7 @@ export default function LibraryPage() {
       setPackError(null);
       try {
         const r = await fetch("/api/me/packs", {
-          headers: { "X-User-Id": userId },
+          headers: authHeaders || undefined,
         });
         const data = await r.json();
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки паков");
@@ -110,33 +130,40 @@ export default function LibraryPage() {
           setPacks(nextPacks);
           if (!selectedPackId && nextPacks.length) setSelectedPackId(nextPacks[0].pack_id);
         }
-      } catch (e: any) {
-        if (!cancelled) setPackError(e?.message || "Ошибка");
+      } catch (e: unknown) {
+        if (!cancelled) setPackError(getErrorMessage(e, "Ошибка"));
       } finally {
         if (!cancelled) setPackLoading(false);
       }
     }
-    if (userId) loadPacks();
+    if (!authHeaders) {
+      setPacks([]);
+      setSelectedPackId("");
+      setPackDocs([]);
+      return;
+    }
+    loadPacks();
     return () => {
       cancelled = true;
     };
-  }, [userId, selectedPackId]);
+  }, [authHeaders, selectedPackId]);
 
   async function refreshPackDocuments(packId: string) {
     if (!packId) return;
+    if (!authHeaders) return;
     sendClientEvent("ui_render_status_refresh_clicked", { pack_id: packId });
     setPackLoading(true);
     setPackError(null);
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/documents`, {
-        headers: { "X-User-Id": userId },
+        headers: authHeaders,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки статусов");
       setPackDocs(data.documents || []);
       sendClientEvent("ui_render_status_opened", { pack_id: packId, docs_count: (data.documents || []).length });
-    } catch (e: any) {
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -153,21 +180,22 @@ export default function LibraryPage() {
 
   async function renderPack(packId: string) {
     if (!packId) return;
+    if (!authHeaders) return;
     sendClientEvent("ui_render_pack_clicked", { pack_id: packId });
     setPackLoading(true);
     setPackError(null);
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render`, {
         method: "POST",
-        headers: { "X-User-Id": userId },
+        headers: authHeaders,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка запуска рендера");
       sendClientEvent("ui_render_pack_ok", { pack_id: packId, jobs_created: data.jobs_created, jobs_skipped: data.jobs_skipped });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: getErrorMessage(e, "error") });
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -180,15 +208,15 @@ export default function LibraryPage() {
     try {
       const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render/${encodeURIComponent(docId)}`, {
         method: "POST",
-        headers: { "X-User-Id": userId },
+        headers: authHeaders || undefined,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка регенерации документа");
       sendClientEvent("ui_render_doc_regenerate_ok", { pack_id: packId, doc_id: docId, job_id: data.job_id });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: getErrorMessage(e, "error") });
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -198,7 +226,7 @@ export default function LibraryPage() {
     sendClientEvent("ui_file_download_clicked", { file_id: fileId });
     try {
       const r = await fetch(`/api/files/${fileId}/download`, {
-        headers: { "X-User-Id": userId },
+        headers: authHeaders || undefined,
       });
       const data = await r.json();
       if (!r.ok) throw new Error(data?.detail || "Ошибка скачивания");
@@ -206,18 +234,33 @@ export default function LibraryPage() {
       if (data?.url) {
         window.location.href = data.url;
       }
-    } catch (e: any) {
-      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: e?.message || "error" });
-      setError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: getErrorMessage(e, "error") });
+      setError(getErrorMessage(e, "Ошибка"));
     }
   }
 
   return (
-    <main style={{ padding: 24, maxWidth: 960, margin: "0 auto" }}>
-      <h1>Библиотека</h1>
+    <main style={{ padding: 0, maxWidth: 960, margin: "0 auto" }}>
+      <UserAuthHeader title="Библиотека" />
 
-      <section style={{ marginTop: 24 }}>
-        <h2>Пак документов</h2>
+      {!authHeaders ? (
+        <section style={{ padding: 24 }}>
+          <div>Чтобы открыть библиотеку, нужно войти.</div>
+          <button
+            style={{ marginTop: 12 }}
+            onClick={() => {
+              if (typeof window === "undefined") return;
+              window.dispatchEvent(new Event("nly-open-login"));
+            }}
+          >
+            Войти
+          </button>
+        </section>
+      ) : (
+        <section style={{ padding: 24 }}>
+          <section style={{ marginTop: 24 }}>
+            <h2>Пак документов</h2>
 
         {packLoading && <div>Загрузка…</div>}
         {packError && <div style={{ color: "crimson" }}>{packError}</div>}
@@ -286,7 +329,7 @@ export default function LibraryPage() {
                             Пересобрать
                           </button>
                           {d.file_id && (
-                            <button disabled={packLoading} onClick={() => download(d.file_id as string)}>
+                            <button disabled={packLoading} onClick={() => download(String(d.file_id))}>
                               Скачать
                             </button>
                           )}
@@ -299,10 +342,10 @@ export default function LibraryPage() {
             </table>
           </div>
         )}
-      </section>
+          </section>
 
-      <section style={{ marginTop: 24 }}>
-        <h2>Файлы</h2>
+          <section style={{ marginTop: 24 }}>
+            <h2>Файлы</h2>
 
         {loading && <div>Загрузка…</div>}
         {error && <div style={{ color: "crimson" }}>{error}</div>}
@@ -337,7 +380,9 @@ export default function LibraryPage() {
             </table>
           </div>
         )}
-      </section>
+          </section>
+        </section>
+      )}
     </main>
   );
 }

@@ -8,6 +8,38 @@
   color: #000;
 }
 
+.headerWrap {
+  /* header draws its own border */
+}
+
+.topRightActions {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  display: flex;
+  gap: 10px;
+  z-index: 50;
+}
+
+.iconCircleBtn {
+  width: 44px;
+  height: 44px;
+  border-radius: 9999px;
+  border: 1px solid #000;
+  background: #fff;
+  color: #000;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+
+.iconCircleBtn:hover {
+  background: #000;
+  color: #fff;
+}
+
 /* Стартовый экран */
 .searchMode {
   flex: 1;
@@ -52,6 +84,11 @@
 .searchBtn:hover {
   background: #000;
   color: #fff;
+}
+
+.searchBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* Чат-экран */
