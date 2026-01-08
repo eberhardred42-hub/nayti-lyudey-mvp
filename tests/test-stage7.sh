@@ -6,36 +6,72 @@ cd "$PROJECT_DIR"
 
 # Stage 7: LLM-driven clarifications (mock/openai_compat) integration test
 
+COMPOSE="docker compose -f infra/docker-compose.yml"
 BASE_URL=${BASE_URL:-http://localhost:8000}
-HEADERS_FILE="/tmp/stage7_headers.txt"
+ML_URL=${ML_URL:-http://localhost:8001}
+TMPDIR="${RUNNER_TEMP:-/tmp}"
+HEADERS_FILE="$TMPDIR/stage7_headers.txt"
 
 step() {
   echo "[stage7] $1"
 }
 
+wait_url() {
+  local url="$1"
+  local name="$2"
+  for i in $(seq 1 90); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "[ok] $name ready: $url"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[error] $name not ready: $url"
+  return 1
+}
+
 step "Starting services (docker compose if available)"
 if command -v docker >/dev/null 2>&1; then
-  docker compose -f infra/docker-compose.yml up -d --build
-  sleep 3
+  if [[ "${CI:-}" == "true" ]]; then
+    echo "[stage7] CI=true: assuming services already started by workflow"
+  else
+    $COMPOSE up -d --build
+  fi
 else
   echo "docker not found, assuming services already running"
 fi
 
+wait_url "$BASE_URL/health" "api"
+wait_url "$BASE_URL/health/db" "db"
+wait_url "$ML_URL/health" "ml"
+wait_url "$BASE_URL/health/llm" "llm"
+
 step "Create session"
-SESSION_JSON=$(curl -s -X POST -H "Content-Type: application/json" \
-  -d '{"profession_query":"stage7 llm"}' \
-  "$BASE_URL/sessions")
-SESSION_ID=$(echo "$SESSION_JSON" | python3 - <<'PY'
+HDR="$(mktemp -p "$TMPDIR" stage7-hdr.XXXXXX)"
+BODY="$(mktemp -p "$TMPDIR" stage7-body.XXXXXX)"
+chmod 644 "$HDR" "$BODY" || true
+CODE="$(curl -sS -D "$HDR" -o "$BODY" -w '%{http_code}' \
+  -X POST "$BASE_URL/sessions" \
+  -H "Content-Type: application/json" \
+  -d '{"profession_query":"stage7 llm"}')"
+
+SESSION_ID=$(python3 - "$BODY" <<'PY'
 import json,sys
 try:
-    data=json.load(sys.stdin)
+    data=json.load(open(sys.argv[1], 'r', encoding='utf-8'))
     print(data.get("session_id",""))
 except Exception:
     print("")
 PY
 )
-if [ -z "$SESSION_ID" ]; then
-  echo "Session creation failed"
+
+echo "[stage7] /sessions HTTP_CODE=$CODE"
+if [[ "$CODE" != "200" || -z "$SESSION_ID" ]]; then
+  echo "[stage7][error] Session creation failed"
+  echo "--- headers ---"
+  cat "$HDR" || true
+  echo "--- body ---"
+  cat "$BODY" || true
   exit 1
 fi
 step "Session: $SESSION_ID"
