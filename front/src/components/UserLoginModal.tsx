@@ -17,6 +17,11 @@ type OtpVerifyResponse = {
   detail?: string;
 };
 
+function getErrorMessage(e: unknown, fallback: string) {
+  if (e instanceof Error) return e.message || fallback;
+  return fallback;
+}
+
 export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
@@ -47,12 +52,12 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: phone.trim() }),
       });
-      const data = await r.json();
+      const data = (await r.json()) as { detail?: string };
       if (!r.ok) throw new Error(data?.detail || "Не удалось запросить код");
       setOtpRequested(true);
       setInfo("Код отправлен. Введите его и нажмите «Войти». ");
-    } catch (e: any) {
-      setError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      setError(getErrorMessage(e, "Ошибка"));
     } finally {
       setLoading(false);
     }
@@ -69,7 +74,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
         body: JSON.stringify({ phone: phone.trim(), code: code.trim() }),
       });
       const data = (await r.json()) as OtpVerifyResponse;
-      if (!r.ok) throw new Error((data as any)?.detail || "Не удалось войти");
+      if (!r.ok) throw new Error(data?.detail || "Не удалось войти");
       if (!data?.token) throw new Error("Сервер не вернул token");
 
       setUserToken(String(data.token));
@@ -81,8 +86,8 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
       setInfo(null);
       onClose();
       onLoggedIn?.();
-    } catch (e: any) {
-      setError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      setError(getErrorMessage(e, "Ошибка"));
     } finally {
       setLoading(false);
     }

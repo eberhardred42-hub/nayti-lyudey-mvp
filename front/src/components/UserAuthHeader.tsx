@@ -20,12 +20,15 @@ export function UserAuthHeader({ title }: Props) {
       setToken(getUserToken());
       setRole(getUserRole());
     };
+    const openLogin: EventListener = () => setOpen(true);
     sync();
     window.addEventListener("storage", sync);
-    window.addEventListener("nly-auth-changed", sync as any);
+    window.addEventListener("nly-auth-changed", sync);
+    window.addEventListener("nly-open-login", openLogin);
     return () => {
       window.removeEventListener("storage", sync);
-      window.removeEventListener("nly-auth-changed", sync as any);
+      window.removeEventListener("nly-auth-changed", sync);
+      window.removeEventListener("nly-open-login", openLogin);
     };
   }, []);
 

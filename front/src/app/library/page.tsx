@@ -4,6 +4,11 @@ import { useEffect, useMemo, useState } from "react";
 import { UserAuthHeader } from "@/components/UserAuthHeader";
 import { getUserToken } from "@/lib/userSession";
 
+function getErrorMessage(e: unknown, fallback: string) {
+  if (e instanceof Error) return e.message || fallback;
+  return fallback;
+}
+
 type FileItem = {
   file_id: string;
   artifact_id: string;
@@ -66,10 +71,10 @@ export default function LibraryPage() {
     if (typeof window === "undefined") return;
     const sync = () => setToken(getUserToken());
     window.addEventListener("storage", sync);
-    window.addEventListener("nly-auth-changed", sync as any);
+    window.addEventListener("nly-auth-changed", sync);
     return () => {
       window.removeEventListener("storage", sync);
-      window.removeEventListener("nly-auth-changed", sync as any);
+      window.removeEventListener("nly-auth-changed", sync);
     };
   }, []);
 
@@ -93,8 +98,8 @@ export default function LibraryPage() {
           setFiles(data.files || []);
           sendClientEvent("ui_library_files_opened", { files_count: (data.files || []).length });
         }
-      } catch (e: any) {
-        if (!cancelled) setError(e?.message || "Ошибка");
+      } catch (e: unknown) {
+        if (!cancelled) setError(getErrorMessage(e, "Ошибка"));
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -125,8 +130,8 @@ export default function LibraryPage() {
           setPacks(nextPacks);
           if (!selectedPackId && nextPacks.length) setSelectedPackId(nextPacks[0].pack_id);
         }
-      } catch (e: any) {
-        if (!cancelled) setPackError(e?.message || "Ошибка");
+      } catch (e: unknown) {
+        if (!cancelled) setPackError(getErrorMessage(e, "Ошибка"));
       } finally {
         if (!cancelled) setPackLoading(false);
       }
@@ -157,8 +162,8 @@ export default function LibraryPage() {
       if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки статусов");
       setPackDocs(data.documents || []);
       sendClientEvent("ui_render_status_opened", { pack_id: packId, docs_count: (data.documents || []).length });
-    } catch (e: any) {
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -188,9 +193,9 @@ export default function LibraryPage() {
       if (!r.ok) throw new Error(data?.detail || "Ошибка запуска рендера");
       sendClientEvent("ui_render_pack_ok", { pack_id: packId, jobs_created: data.jobs_created, jobs_skipped: data.jobs_skipped });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_render_pack_fail", { pack_id: packId, error: getErrorMessage(e, "error") });
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -209,9 +214,9 @@ export default function LibraryPage() {
       if (!r.ok) throw new Error(data?.detail || "Ошибка регенерации документа");
       sendClientEvent("ui_render_doc_regenerate_ok", { pack_id: packId, doc_id: docId, job_id: data.job_id });
       await refreshPackDocuments(packId);
-    } catch (e: any) {
-      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: e?.message || "error" });
-      setPackError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_render_doc_regenerate_fail", { pack_id: packId, doc_id: docId, error: getErrorMessage(e, "error") });
+      setPackError(getErrorMessage(e, "Ошибка"));
     } finally {
       setPackLoading(false);
     }
@@ -229,9 +234,9 @@ export default function LibraryPage() {
       if (data?.url) {
         window.location.href = data.url;
       }
-    } catch (e: any) {
-      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: e?.message || "error" });
-      setError(e?.message || "Ошибка");
+    } catch (e: unknown) {
+      sendClientEvent("ui_file_download_fail", { file_id: fileId, error: getErrorMessage(e, "error") });
+      setError(getErrorMessage(e, "Ошибка"));
     }
   }
 
@@ -242,11 +247,20 @@ export default function LibraryPage() {
       {!authHeaders ? (
         <section style={{ padding: 24 }}>
           <div>Чтобы открыть библиотеку, нужно войти.</div>
+          <button
+            style={{ marginTop: 12 }}
+            onClick={() => {
+              if (typeof window === "undefined") return;
+              window.dispatchEvent(new Event("nly-open-login"));
+            }}
+          >
+            Войти
+          </button>
         </section>
       ) : (
         <section style={{ padding: 24 }}>
           <section style={{ marginTop: 24 }}>
-        <h2>Пак документов</h2>
+            <h2>Пак документов</h2>
 
         {packLoading && <div>Загрузка…</div>}
         {packError && <div style={{ color: "crimson" }}>{packError}</div>}
@@ -315,7 +329,7 @@ export default function LibraryPage() {
                             Пересобрать
                           </button>
                           {d.file_id && (
-                            <button disabled={packLoading} onClick={() => download(d.file_id as string)}>
+                            <button disabled={packLoading} onClick={() => download(String(d.file_id))}>
                               Скачать
                             </button>
                           )}
@@ -331,7 +345,7 @@ export default function LibraryPage() {
           </section>
 
           <section style={{ marginTop: 24 }}>
-        <h2>Файлы</h2>
+            <h2>Файлы</h2>
 
         {loading && <div>Загрузка…</div>}
         {error && <div style={{ color: "crimson" }}>{error}</div>}
