@@ -1,0 +1,28 @@
+name: Stage Logs
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service name (front/api/ml/render/render-worker/db/redis/minio)"
+        required: true
+        default: "api"
+      lines:
+        description: "How many lines"
+        required: true
+        default: "300"
+
+jobs:
+  logs:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Tail logs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$HOME/app"
+          echo "== compose ps =="
+          docker compose -f infra/docker-compose.yml ps
+          echo
+          echo "== logs: ${{ inputs.service }} (last ${{ inputs.lines }}) =="
+          docker compose -f infra/docker-compose.yml logs --no-color --tail="${{ inputs.lines }}" "${{ inputs.service }}"

@@ -1,0 +1,26 @@
+name: Stage Smoke Deep
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: HTTP checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "GET /"
+          curl -fsS https://naitilyudei.ru/ >/dev/null
+          echo "OK"
+          echo
+
+          echo "GET /api/docs"
+          curl -fsS https://naitilyudei.ru/api/docs >/dev/null
+          echo "OK"
+          echo
+
+          echo "GET /api/health (if exists)"
+          curl -fsS https://naitilyudei.ru/api/health >/dev/null || true
+          echo "done"
