@@ -2,6 +2,11 @@ name: Stage Smoke Deep
 
 on:
   workflow_dispatch:
+    inputs:
+      env:
+        description: "Environment (dev|prod)"
+        required: true
+        default: "prod"
 
 jobs:
   smoke:
@@ -11,16 +16,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          ENV="${{ inputs.env }}"
+          case "$ENV" in
+            prod) BASE_URL=https://naitilyudei.ru ;;
+            dev) BASE_URL=https://dev.naitilyudei.ru ;;
+            *) echo "Invalid env: $ENV (expected dev|prod)"; exit 1 ;;
+          esac
+
           echo "GET /"
-          curl -fsS https://naitilyudei.ru/ >/dev/null
+          curl -fsS "$BASE_URL/" >/dev/null
           echo "OK"
           echo
 
           echo "GET /api/docs"
-          curl -fsS https://naitilyudei.ru/api/docs >/dev/null
+          curl -fsS "$BASE_URL/api/docs" >/dev/null
           echo "OK"
           echo
 
           echo "GET /api/health (if exists)"
-          curl -fsS https://naitilyudei.ru/api/health >/dev/null || true
+          curl -fsS "$BASE_URL/api/health" >/dev/null || true
           echo "done"
