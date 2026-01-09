@@ -12,6 +12,7 @@ services:
         condition: service_healthy
     environment:
       - DEBUG=${DEBUG:-0}
+      - NLY_ENV=${NLY_ENV:-}
       - SMS_PROVIDER=${SMS_PROVIDER:-mock}
       - STAGE_STATIC_OTP_CODE=${STAGE_STATIC_OTP_CODE:-906090}
       - CONFIG_SOURCE=${CONFIG_SOURCE:-file}
@@ -34,8 +35,13 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-mock}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - DEV_LLM_BASE_URL=${DEV_LLM_BASE_URL:-}
+      - DEV_LLM_API_KEY=${DEV_LLM_API_KEY:-}
+      - DEV_LLM_MODEL=${DEV_LLM_MODEL:-}
+      - PROD_LLM_BASE_URL=${PROD_LLM_BASE_URL:-}
+      - PROD_LLM_API_KEY=${PROD_LLM_API_KEY:-}
+      - PROD_LLM_MODEL=${PROD_LLM_MODEL:-}
       - LLM_REQUIRE_KEY=${LLM_REQUIRE_KEY:-}
       - REQUIRE_LLM=${REQUIRE_LLM:-}
 
@@ -126,6 +132,7 @@ services:
         condition: service_started
     environment:
       - DEBUG=${DEBUG:-0}
+      - NLY_ENV=${NLY_ENV:-}
       - DATABASE_URL=${DATABASE_URL:-postgresql://postgres:postgres@db:5432/nlyudi}
       - S3_PROVIDER=${S3_PROVIDER:-s3}
       - S3_ENDPOINT=${S3_ENDPOINT:-http://minio:9000}
@@ -142,8 +149,13 @@ services:
       - LLM_PROVIDER=${LLM_PROVIDER:-mock}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
-      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - DEV_LLM_BASE_URL=${DEV_LLM_BASE_URL:-}
+      - DEV_LLM_API_KEY=${DEV_LLM_API_KEY:-}
+      - DEV_LLM_MODEL=${DEV_LLM_MODEL:-}
+      - PROD_LLM_BASE_URL=${PROD_LLM_BASE_URL:-}
+      - PROD_LLM_API_KEY=${PROD_LLM_API_KEY:-}
+      - PROD_LLM_MODEL=${PROD_LLM_MODEL:-}
       - LLM_REQUIRE_KEY=${LLM_REQUIRE_KEY:-}
       - REQUIRE_LLM=${REQUIRE_LLM:-}
     command: ["python", "-m", "worker"]

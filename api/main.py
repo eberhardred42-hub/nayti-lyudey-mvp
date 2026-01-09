@@ -1924,7 +1924,7 @@ def log_event(event: str, level: str = "info", **fields):
     except Exception:
         log_events_to_db = True
 
-    if log_events_to_db and event in {"llm_request", "llm_response", "llm_error"}:
+    if log_events_to_db and event in {"llm_request", "llm_response", "llm_error", "llm_ping_request", "llm_ping_response", "llm_ping_error"}:
         try:
             import hashlib
 
@@ -1935,9 +1935,13 @@ def log_event(event: str, level: str = "info", **fields):
                 "request_id",
                 "session_id",
                 "provider",
+                "provider_effective",
                 "model",
                 "mode",
                 "base_url",
+                "status",
+                "status_code",
+                "latency_ms",
                 "flow",
                 "doc_id",
                 "pack_id",
@@ -1949,13 +1953,17 @@ def log_event(event: str, level: str = "info", **fields):
                 "ok",
                 "fallback",
                 "parsed_ok",
+                "error_class",
+                "message_trunc",
+                "reason",
             }
             event_payload = {"level": level, "ts": payload.get("ts")}
             for key in allowed_keys:
                 if key in payload and payload[key] is not None:
                     event_payload[key] = payload[key]
 
-            # No raw text in DB: store only hash + length for errors.
+            # No raw text in DB for generic llm_error: store only hash + length.
+            # For llm_ping_error we store message_trunc explicitly for diagnostics.
             if event == "llm_error":
                 raw_error = str(payload.get("error") or "")
                 event_payload.pop("error", None)

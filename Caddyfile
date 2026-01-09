@@ -5,14 +5,14 @@
 # PROD
 naitilyudei.ru {
   handle_path /api/* {
-    reverse_proxy localhost:8000
+    reverse_proxy 127.0.0.1:8000
   }
 
   handle /health* {
-    reverse_proxy localhost:8000
+    reverse_proxy 127.0.0.1:8000
   }
 
-  reverse_proxy localhost:3000
+  reverse_proxy 127.0.0.1:3000
 }
 
 # DEV
@@ -20,12 +20,12 @@ naitilyudei.ru {
 
 dev.naitilyudei.ru {
   handle_path /api/* {
-    reverse_proxy localhost:8100
+    reverse_proxy 127.0.0.1:8100
   }
 
   handle /health* {
-    reverse_proxy localhost:8100
+    reverse_proxy 127.0.0.1:8100
   }
 
-  reverse_proxy localhost:3100
+  reverse_proxy 127.0.0.1:3100
 }

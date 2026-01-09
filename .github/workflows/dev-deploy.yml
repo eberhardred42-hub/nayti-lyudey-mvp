@@ -9,14 +9,12 @@ jobs:
   deploy:
     runs-on: [self-hosted, stage]
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      LLM_MODEL: ${{ vars.LLM_MODEL }}
-      LLM_BASE_URL: https://openrouter.ai/api/v1
-      LLM_PROVIDER: openai_compat
-      LLM_REQUIRE_KEY: "true"
       DEV_LLM_BASE_URL: ${{ secrets.DEV_LLM_BASE_URL }}
       DEV_LLM_API_KEY: ${{ secrets.DEV_LLM_API_KEY }}
       DEV_LLM_MODEL: ${{ vars.DEV_LLM_MODEL }}
+      NLY_ENV: dev
+      LLM_PROVIDER: openai_compat
+      LLM_REQUIRE_KEY: "true"
 
     steps:
       - name: Deploy DEV from ~/app (git pull + compose up)
@@ -52,26 +50,22 @@ jobs:
           # - also copy to .env so docker compose always picks it up
           RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
 
-          LLM_BASE_URL_EFFECTIVE="${DEV_LLM_BASE_URL:-${LLM_BASE_URL:-}}"
-          LLM_MODEL_EFFECTIVE="${DEV_LLM_MODEL:-${LLM_MODEL:-gpt-4o-mini}}"
-          LLM_API_KEY_EFFECTIVE="${DEV_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}"
-
-          if [ -z "${LLM_API_KEY_EFFECTIVE:-}" ]; then
-            echo "ERROR: DEV_LLM_API_KEY (or OPENROUTER_API_KEY fallback) is not set" >&2
+          if [ -z "${DEV_LLM_API_KEY:-}" ]; then
+            echo "ERROR: DEV_LLM_API_KEY is not set" >&2
             exit 1
           fi
-          if [ -z "${LLM_BASE_URL_EFFECTIVE:-}" ]; then
-            echo "ERROR: DEV_LLM_BASE_URL (or LLM_BASE_URL fallback) is not set" >&2
+          if [ -z "${DEV_LLM_BASE_URL:-}" ]; then
+            echo "ERROR: DEV_LLM_BASE_URL is not set" >&2
             exit 1
           fi
           umask 077
           {
-            printf '%s\n' "LLM_BASE_URL=${LLM_BASE_URL_EFFECTIVE}"
+            printf '%s\n' "NLY_ENV=dev"
             printf '%s\n' "LLM_PROVIDER=openai_compat"
-            printf '%s\n' "LLM_MODEL=${LLM_MODEL_EFFECTIVE}"
-            printf '%s\n' "LLM_API_KEY=${LLM_API_KEY_EFFECTIVE}"
-            printf '%s\n' "OPENROUTER_API_KEY=${LLM_API_KEY_EFFECTIVE}"
             printf '%s\n' "LLM_REQUIRE_KEY=true"
+            printf '%s\n' "DEV_LLM_BASE_URL=${DEV_LLM_BASE_URL}"
+            printf '%s\n' "DEV_LLM_MODEL=${DEV_LLM_MODEL:-gpt-4o-mini}"
+            printf '%s\n' "DEV_LLM_API_KEY=${DEV_LLM_API_KEY}"
           } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
 
@@ -79,15 +73,22 @@ jobs:
           chmod 600 "$APP_DIR/.env" || true
 
           echo "== runtime env written: $RUNTIME_ENV_FILE (redacted) =="
-          sed -E 's/(OPENROUTER_API_KEY=).+/\1***REDACTED***/; s/(LLM_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,20p'
+          sed -E 's/(DEV_LLM_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,30p'
 
-          docker compose -p dev -f infra/docker-compose.yml up -d --build
+          docker compose -p dev -f infra/docker-compose.yml up -d --build --force-recreate
 
       - name: Ensure caddy is running (host network)
         shell: bash
         run: |
           set -euo pipefail
           APP_DIR="$HOME/app"
+
+          if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
+            mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true)"
+            if [ "$mode" != "host" ]; then
+              docker rm -f caddy || true
+            fi
+          fi
 
           if ! docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
             docker run -d --name caddy --restart unless-stopped --network host \
@@ -96,6 +97,27 @@ jobs:
           else
             docker restart caddy
           fi
+
+      - name: Sanity-check domain (blocking)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS -4 https://dev.naitilyudei.ru/api/health/llm \
+              | python3 - <<'PY'
+import json,sys
+j=json.load(sys.stdin)
+assert j.get('ok') is True, j
+PY
+            then
+              echo "Sanity OK"
+              exit 0
+            fi
+            echo "Sanity retry $i/30"
+            sleep 2
+          done
+          echo "Sanity FAILED" >&2
+          exit 1
 
       - name: Smoke checks (DEV) - non blocking
         continue-on-error: true
