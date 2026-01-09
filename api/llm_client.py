@@ -3,9 +3,7 @@ import os
 import time
 import urllib.request
 import urllib.error
-
-from trace import json_fingerprint, text_fingerprint, trace_artifact
-
+import urllib.parse
 
 def _log_event(event: str, level: str = "info", **fields):
     try:
@@ -78,93 +76,10 @@ def current_llm_provider() -> str:
     return str(_llm_settings().get("provider") or "mock")
 
 
-def _trace_llm_request(
-    *,
-    request_id: str,
-    session_id: str,
-    provider: str,
-    model: str,
-    prompt_obj: object,
-    flow: str | None,
-    doc_id: str | None,
-    attempt: int,
-) -> None:
-    fp = json_fingerprint(prompt_obj, limit=1200)
-    payload = {
-        "attempt": int(attempt or 1),
-        "prompt_chars": int(fp.get("full_length") or 0),
-        "prompt_preview": fp.get("preview"),
-        "prompt_sha256": fp.get("sha256"),
-        "prompt_full_length": fp.get("full_length"),
-    }
-    meta = {
-        "provider": provider,
-        "model": model,
-        "flow": flow,
-        "doc_id": doc_id,
-        "attempt": int(attempt or 1),
-    }
-    trace_artifact(session_id=session_id, kind="llm_request", request_id=request_id, payload_json=payload, meta=meta)
-
-
-def _trace_llm_response(
-    *,
-    request_id: str,
-    session_id: str,
-    provider: str,
-    model: str,
-    duration_ms: float | int | None,
-    ok: bool,
-    fallback: bool,
-    parsed_ok: bool,
-    raw_text: str | None,
-    flow: str | None,
-    doc_id: str | None,
-    attempt: int,
-) -> None:
-    fp = text_fingerprint(raw_text or "", limit=1200)
-    payload = {
-        "duration_ms": duration_ms,
-        "ok": bool(ok),
-        "fallback": bool(fallback),
-        "parsed_ok": bool(parsed_ok),
-        "response_chars": int(fp.get("full_length") or 0),
-        "response_preview": fp.get("preview"),
-        "response_sha256": fp.get("sha256"),
-        "response_full_length": fp.get("full_length"),
-    }
-    meta = {
-        "provider": provider,
-        "model": model,
-        "flow": flow,
-        "doc_id": doc_id,
-        "attempt": int(attempt or 1),
-    }
-    trace_artifact(session_id=session_id, kind="llm_response", request_id=request_id, payload_json=payload, meta=meta)
-
-
-def _trace_llm_error(
-    *,
-    request_id: str,
-    session_id: str,
-    provider: str,
-    model: str,
-    duration_ms: float | int | None,
-    error: str,
-    flow: str | None,
-    doc_id: str | None,
-    attempt: int,
-) -> None:
-    err_fp = text_fingerprint(error or "", limit=800)
-    payload = {"duration_ms": duration_ms, "error": err_fp.get("preview"), "error_sha256": err_fp.get("sha256")}
-    meta = {
-        "provider": provider,
-        "model": model,
-        "flow": flow,
-        "doc_id": doc_id,
-        "attempt": int(attempt or 1),
-    }
-    trace_artifact(session_id=session_id, kind="llm_error", request_id=request_id, payload_json=payload, meta=meta)
+def _require_llm_is_real(provider: str) -> None:
+    require_llm = (os.environ.get("REQUIRE_LLM") or "").strip().lower() in {"1", "true", "yes"}
+    if require_llm and provider == "mock":
+        raise RuntimeError("llm_required_but_provider_is_mock")
 
 
 def generate_json_mock(prompt: str, schema_hint: dict, request_id: str, session_id: str):
@@ -329,59 +244,73 @@ def generate_json_messages_observable(
     doc_id: str | None = None,
     attempt: int = 1,
 ) -> dict:
-    """Provider wrapper returning JSON dict; never raises.
+    """Provider wrapper returning JSON dict.
 
-    Persists llm_request/llm_response/llm_error in artifacts.
+    Emits llm_request/llm_response/llm_error via log_event(); persistence is handled centrally.
     """
     s = _llm_settings()
     provider = s["provider"]
 
+    _require_llm_is_real(provider)
+
     start_total = time.perf_counter()
 
-    _trace_llm_request(
-        request_id=request_id,
-        session_id=session_id,
+    prompt_chars = 0
+    try:
+        prompt_chars = sum(len(str(m.get("content") or "")) for m in (messages or []))
+    except Exception:
+        prompt_chars = 0
+
+    _log_event(
+        "llm_request",
         provider=provider,
         model=s["model"],
-        prompt_obj={"messages": messages},
+        request_id=request_id,
+        session_id=session_id,
         flow=flow,
         doc_id=doc_id,
-        attempt=attempt,
+        attempt=int(attempt or 1),
+        prompt_chars=int(prompt_chars),
+        mode="real" if provider != "mock" else "mock",
     )
     try:
         if provider == "openai_compat":
             start = time.perf_counter()
             out = generate_json_openai_compat_messages(messages, request_id=request_id, session_id=session_id)
             duration_ms = round((time.perf_counter() - start) * 1000, 2)
-            _trace_llm_response(
-                request_id=request_id,
-                session_id=session_id,
+            _log_event(
+                "llm_response",
                 provider=provider,
                 model=s["model"],
+                request_id=request_id,
+                session_id=session_id,
+                flow=flow,
+                doc_id=doc_id,
+                attempt=int(attempt or 1),
                 duration_ms=duration_ms,
                 ok=True,
                 fallback=False,
                 parsed_ok=True,
-                raw_text=json.dumps(out, ensure_ascii=False) if isinstance(out, dict) else str(out),
-                flow=flow,
-                doc_id=doc_id,
-                attempt=attempt,
+                llm_response_chars=len(json.dumps(out, ensure_ascii=False)) if isinstance(out, dict) else None,
+                mode="real" if provider != "mock" else "mock",
             )
             return out
 
-        _trace_llm_response(
-            request_id=request_id,
-            session_id=session_id,
+        _log_event(
+            "llm_response",
             provider=provider,
             model=s["model"],
+            request_id=request_id,
+            session_id=session_id,
+            flow=flow,
+            doc_id=doc_id,
+            attempt=int(attempt or 1),
             duration_ms=None,
             ok=False,
             fallback=True,
             parsed_ok=False,
-            raw_text="",
-            flow=flow,
-            doc_id=doc_id,
-            attempt=attempt,
+            llm_response_chars=None,
+            mode="mock",
         )
         return fallback
     except Exception as e:
@@ -392,20 +321,13 @@ def generate_json_messages_observable(
             model=s["model"],
             request_id=request_id,
             session_id=session_id,
-            error=str(e),
-        )
-
-        _trace_llm_error(
-            request_id=request_id,
-            session_id=session_id,
-            provider=provider,
-            model=s["model"],
-            duration_ms=round((time.perf_counter() - start_total) * 1000, 2),
-            error=str(e),
             flow=flow,
             doc_id=doc_id,
-            attempt=attempt,
+            attempt=int(attempt or 1),
+            duration_ms=round((time.perf_counter() - start_total) * 1000, 2),
+            error=str(e),
         )
+        _require_llm_is_real(provider)
         return fallback
 
 
@@ -416,6 +338,8 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
 
     s = _llm_settings()
     provider = s["provider"]
+
+    _require_llm_is_real(provider)
 
     prompt_parts = [
         "Ты помогаешь рекрутеру уточнить вводные. Верни JSON с ключами questions и quick_replies.",
@@ -431,22 +355,10 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
         model=s["model"],
         request_id=request_id,
         session_id=session_id,
+        flow="intro_questions",
+        attempt=1,
         prompt_chars=len(prompt),
-    )
-
-    prompt_fp = text_fingerprint(prompt, limit=1000)
-    trace_artifact(
-        session_id=session_id,
-        kind="llm_request",
-        request_id=request_id,
-        payload_json={
-            "attempt": 1,
-            "prompt_chars": len(prompt),
-            "prompt_preview": prompt_fp.get("preview"),
-            "prompt_sha256": prompt_fp.get("sha256"),
-            "prompt_full_length": len(prompt),
-        },
-        meta={"provider": provider, "model": s["model"], "flow": "intro_questions", "attempt": 1},
+        mode="real" if provider != "mock" else "mock",
     )
 
     schema_hint = {"missing_fields": missing_fields}
@@ -464,20 +376,13 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
             model=s["model"],
             request_id=request_id,
             session_id=session_id,
+            flow="intro_questions",
+            attempt=1,
+            duration_ms=round((time.perf_counter() - start) * 1000, 2),
             error=str(e),
         )
         questions, quick_replies = _template_from_missing(missing_fields)
-        _trace_llm_error(
-            request_id=request_id,
-            session_id=session_id,
-            provider=provider,
-            model=s["model"],
-            duration_ms=round((time.perf_counter() - start) * 1000, 2),
-            error=str(e),
-            flow="intro_questions",
-            doc_id=None,
-            attempt=1,
-        )
+        _require_llm_is_real(provider)
         return {"questions": questions[:3], "quick_replies": quick_replies[:6]}
 
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -487,23 +392,14 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
         model=s["model"],
         request_id=request_id,
         session_id=session_id,
+        flow="intro_questions",
+        attempt=1,
         duration_ms=duration_ms,
         llm_response_chars=len(json.dumps(result)) if isinstance(result, dict) else None,
-    )
-
-    _trace_llm_response(
-        request_id=request_id,
-        session_id=session_id,
-        provider=provider,
-        model=s["model"],
-        duration_ms=duration_ms,
         ok=True,
         fallback=False,
         parsed_ok=isinstance(result, dict),
-        raw_text=json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result),
-        flow="intro_questions",
-        doc_id=None,
-        attempt=1,
+        mode="real" if provider != "mock" else "mock",
     )
 
     if not isinstance(result, dict):
@@ -526,15 +422,54 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
 def health_llm() -> dict:
     s = _llm_settings()
     provider = s["provider"]
+    model = s.get("model")
+    key_present = bool((s.get("api_key") or "").strip())
+    base_url_raw = (s.get("base_url") or "").strip()
+    base_url_host = ""
+    try:
+        if base_url_raw:
+            parsed = urllib.parse.urlparse(base_url_raw)
+            base_url_host = parsed.hostname or ""
+    except Exception:
+        base_url_host = ""
+
+    real_configured = provider == "openai_compat" and key_present and bool(base_url_raw)
+    mode = "real" if real_configured else "mock"
+
     if provider == "mock":
-        return {"ok": True, "provider": "mock", "model": s.get("model")}
+        return {
+            "ok": True,
+            "provider": "mock",
+            "model": model,
+            "base_url": base_url_host,
+            "key_present": key_present,
+            "mode": mode,
+        }
     if provider == "openai_compat":
-        if not s["base_url"] or not s["api_key"]:
+        if not real_configured:
             return {
                 "ok": False,
                 "provider": "openai_compat",
-                "model": s.get("model"),
+                "model": model,
+                "base_url": base_url_host,
+                "key_present": key_present,
+                "mode": mode,
                 "reason": "missing api_key or base_url",
             }
-        return {"ok": True, "provider": "openai_compat", "model": s.get("model")}
-    return {"ok": False, "provider": provider, "model": s.get("model"), "reason": "unsupported provider"}
+        return {
+            "ok": True,
+            "provider": "openai_compat",
+            "model": model,
+            "base_url": base_url_host,
+            "key_present": key_present,
+            "mode": mode,
+        }
+    return {
+        "ok": False,
+        "provider": provider,
+        "model": model,
+        "base_url": base_url_host,
+        "key_present": key_present,
+        "mode": mode,
+        "reason": "unsupported provider",
+    }

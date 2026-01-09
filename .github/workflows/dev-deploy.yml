@@ -8,6 +8,12 @@ on:
 jobs:
   deploy:
     runs-on: [self-hosted, stage]
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_BASE_URL: https://openrouter.ai/api/v1
+      LLM_PROVIDER: openai_compat
+      REQUIRE_LLM: "1"
 
     steps:
       - name: Deploy DEV from ~/app (git pull + compose up)
@@ -39,20 +45,16 @@ jobs:
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
           # LLM/OpenRouter passthrough (optional; empty values are OK)
-          if [ -z "${LLM_PROVIDER:-}" ]; then
-            if [ -n "${OPENROUTER_API_KEY:-}" ] || [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${LLM_API_KEY:-}" ]; then
-              export LLM_PROVIDER=openai_compat
-            else
-              export LLM_PROVIDER=mock
-            fi
-          else
-            export LLM_PROVIDER="$LLM_PROVIDER"
+          # LLM/OpenRouter must be configured (no silent mock)
+          if [ "${REQUIRE_LLM:-0}" = "1" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "ERROR: OPENROUTER_API_KEY is not set, but REQUIRE_LLM=1" >&2
+            exit 1
           fi
-          export LLM_BASE_URL=${LLM_BASE_URL:-}
-          export LLM_API_KEY=${LLM_API_KEY:-}
-          export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-          export OPENAI_API_KEY=${OPENAI_API_KEY:-}
-          export LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+          export LLM_PROVIDER=openai_compat
+          export LLM_BASE_URL=https://openrouter.ai/api/v1
+          export LLM_API_KEY="$OPENROUTER_API_KEY"
+          export OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+          export LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
 
           docker compose -p dev -f infra/docker-compose.yml up -d --build
 
@@ -76,7 +78,13 @@ jobs:
           set -euo pipefail
           curl -fsS https://dev.naitilyudei.ru/ >/dev/null
           curl -fsS https://dev.naitilyudei.ru/api/docs >/dev/null
-          curl -fsS https://dev.naitilyudei.ru/api/health/llm >/dev/null
+          curl -fsS https://dev.naitilyudei.ru/api/health/llm | python3 - <<'PY'
+          import json,sys
+          j=json.load(sys.stdin)
+          if (j.get('provider')=='mock') or (j.get('mode')=='mock') or (not j.get('key_present')):
+            raise SystemExit(f"LLM health is not real: {j}")
+          print('LLM health OK:', j.get('provider'), j.get('model'))
+          PY
           cd "$HOME/app"
           docker compose -p dev -f infra/docker-compose.yml ps
 

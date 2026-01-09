@@ -1912,6 +1912,75 @@ def log_event(event: str, level: str = "info", **fields):
             payload[key] = value.isoformat()
         else:
             payload[key] = value
+
+    # Stage 9.5+: optional DB-backed event persistence for LLM events only.
+    # Default: enabled (LOG_EVENTS_TO_DB=1). Disable with LOG_EVENTS_TO_DB=0.
+    try:
+        log_events_to_db = (os.environ.get("LOG_EVENTS_TO_DB") or "1").strip().lower() not in {"0", "false", "no"}
+    except Exception:
+        log_events_to_db = True
+
+    if log_events_to_db and event in {"llm_request", "llm_response", "llm_error"}:
+        try:
+            import hashlib
+
+            session_id = payload.get("session_id")
+            request_id = payload.get("request_id") or "unknown"
+
+            allowed_keys = {
+                "request_id",
+                "session_id",
+                "provider",
+                "model",
+                "mode",
+                "base_url",
+                "flow",
+                "doc_id",
+                "pack_id",
+                "attempt",
+                "duration_ms",
+                "prompt_chars",
+                "llm_response_chars",
+                "response_chars",
+                "ok",
+                "fallback",
+                "parsed_ok",
+            }
+            event_payload = {"level": level, "ts": payload.get("ts")}
+            for key in allowed_keys:
+                if key in payload and payload[key] is not None:
+                    event_payload[key] = payload[key]
+
+            # No raw text in DB: store only hash + length for errors.
+            if event == "llm_error":
+                raw_error = str(payload.get("error") or "")
+                event_payload.pop("error", None)
+                event_payload["error_length"] = len(raw_error)
+                event_payload["error_sha256"] = hashlib.sha256(raw_error.encode("utf-8", errors="ignore")).hexdigest()
+
+            meta = {
+                "provider": payload.get("provider"),
+                "model": payload.get("model"),
+                "flow": payload.get("flow"),
+                "doc_id": payload.get("doc_id"),
+                "pack_id": payload.get("pack_id"),
+                "attempt": payload.get("attempt"),
+                "mode": payload.get("mode"),
+            }
+            meta = {k: v for k, v in meta.items() if v is not None}
+
+            create_artifact(
+                session_id=session_id,
+                kind=event,
+                format="json",
+                payload_json=event_payload,
+                meta=meta,
+                request_id=str(request_id),
+            )
+        except Exception:
+            # best-effort, never break request flow
+            pass
+
     print(json.dumps(payload, ensure_ascii=False))
 
 

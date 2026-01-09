@@ -6,6 +6,7 @@
 
 - v1.7: Observability — trace-события (intro/LLM/render/S3) теперь пишутся в `artifacts` и видны в `/admin/logs`.
 - v1.7: CI переведён в manual-only; DEV deploy оставляет только быстрые curl-проверки.
+- v1.8: LLM обязателен (OpenRouter) — деплой падает без ключа; `/api/health/llm` теперь показывает provider/model/base_url/key_present/mode.
 
 ## Изменения за 2026-01-08
 

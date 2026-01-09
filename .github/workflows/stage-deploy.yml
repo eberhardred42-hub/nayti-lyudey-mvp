@@ -11,6 +11,12 @@ on:
 jobs:
   deploy:
     runs-on: [self-hosted, stage]
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_BASE_URL: https://openrouter.ai/api/v1
+      LLM_PROVIDER: openai_compat
+      REQUIRE_LLM: "1"
 
     steps:
       - name: Deploy from ~/app (git pull + compose up)
@@ -47,12 +53,16 @@ jobs:
           export REDIS_HOST_PORT=6379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9000}
 
-          # LLM/OpenRouter passthrough (optional; empty values are OK)
-          export LLM_PROVIDER=${LLM_PROVIDER:-mock}
-          export LLM_BASE_URL=${LLM_BASE_URL:-}
-          export LLM_API_KEY=${LLM_API_KEY:-}
-          export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
-          export LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+          # LLM/OpenRouter must be configured (no silent mock)
+          if [ "${REQUIRE_LLM:-0}" = "1" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "ERROR: OPENROUTER_API_KEY is not set, but REQUIRE_LLM=1" >&2
+            exit 1
+          fi
+          export LLM_PROVIDER=openai_compat
+          export LLM_BASE_URL=https://openrouter.ai/api/v1
+          export LLM_API_KEY="$OPENROUTER_API_KEY"
+          export OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
+          export LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
 
           docker compose -p prod -f infra/docker-compose.yml up -d --build
 
