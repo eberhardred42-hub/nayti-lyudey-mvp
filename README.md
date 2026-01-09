@@ -7,6 +7,7 @@
 - v1.7: Observability — trace-события (intro/LLM/render/S3) теперь пишутся в `artifacts` и видны в `/admin/logs`.
 - v1.7: CI переведён в manual-only; DEV deploy оставляет только быстрые curl-проверки.
 - v1.8: LLM обязателен (OpenRouter) — деплой падает без ключа; `/api/health/llm` теперь показывает provider/model/base_url/key_present/mode.
+- v1.10: GitHub Actions — исправлена генерация `.env.runtime` (без ведущих пробелов), чтобы compose стабильно подхватывал `LLM_*`/`OPENROUTER_API_KEY`.
 
 ## Изменения за 2026-01-08
  v1.8: /health/llm теперь показывает key_source/provider_effective/reason; LLM_REQUIRE_KEY=true отключает silent mock и даёт 503 при отсутствии ключа
