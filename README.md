@@ -14,6 +14,8 @@
 
 ## Последние изменения (кратко)
 
+- v2.9: DEV Deploy: исправлен blocking sanity-check локального upstream (убран баг со stdin/heredoc → больше нет ложных `JSONDecodeError`).
+- v2.9: DEV Deploy: проверки теперь безопасно парсят JSON только при 200 + `application/json`, добавлена диагностика при падении локального upstream.
 - v2.8: добавлен ручной workflow диагностики DEV (`DEV Diagnose`).
 - v2.8: DEV Deploy: sanity-check разделён на blocking (локальный upstream) и warn-only (домен), больше нет падений на `JSONDecodeError` при 502.
 - v2.8: DEV Deploy: дефолтная LLM-модель по умолчанию совместима с Groq.
