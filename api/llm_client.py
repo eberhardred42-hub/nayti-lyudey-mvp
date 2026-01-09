@@ -544,3 +544,76 @@ def health_llm() -> dict:
     if provider_effective == "mock" and not resp.get("reason"):
         resp["reason"] = "unknown"
     return resp
+
+
+def llm_ping(*, request_id: str, session_id: str = "llm_ping") -> dict:
+    """Run a single short real completion to verify provider connectivity."""
+    s = _llm_settings()
+    provider = s.get("provider_effective") or s.get("provider") or "mock"
+    model = s.get("model") or ""
+
+    _require_llm_configured(s)
+
+    _log_event(
+        "llm_ping_request",
+        provider=provider,
+        model=model,
+        request_id=request_id,
+        session_id=session_id,
+        base_url=(s.get("base_url") or ""),
+        mode="real" if provider != "mock" else "mock",
+    )
+
+    if provider != "openai_compat":
+        # If mock is effective, treat as unavailable in strict mode.
+        raise LLMUnavailable("provider_effective_mock", "LLM ping requires real provider")
+
+    url = str(s["base_url"]).rstrip("/") + "/chat/completions"
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Reply with OK"},
+            {"role": "user", "content": "Reply with OK"},
+        ],
+        "max_tokens": 2,
+        "temperature": 0,
+    }
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {s['api_key']}")
+
+    start = time.perf_counter()
+    ok = False
+    status = "error"
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            _ = resp.read()
+        ok = True
+        status = "ok"
+    except urllib.error.HTTPError as e:
+        status = f"http_{e.code}"
+        raise RuntimeError(f"http_error {e.code} {e.reason}")
+    except Exception as e:
+        status = "exception"
+        raise RuntimeError(str(e))
+    finally:
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
+        _log_event(
+            "llm_ping_response",
+            provider=provider,
+            model=model,
+            request_id=request_id,
+            session_id=session_id,
+            ok=ok,
+            status=status,
+            latency_ms=latency_ms,
+            base_url=(s.get("base_url") or ""),
+        )
+
+    return {
+        "ok": True,
+        "provider_effective": provider,
+        "model": model,
+        "latency_ms": latency_ms,
+    }

@@ -10,6 +10,18 @@
 - v1.10: GitHub Actions — исправлена генерация runtime env (`.env` на сервере), чтобы compose стабильно подхватывал `LLM_*`/`OPENROUTER_API_KEY`.
 - v2.0: Guest auth без логина — `POST /sessions` выдаёт HttpOnly cookie (Domain=.naitilyudei.ru), `/api/me/documents` для гостя возвращает 200 вместо 401; фронт шлёт cookies через `credentials: "include"`.
 - v2.1: DEV Deploy — smoke checks сделаны non-blocking (warn-only) с ретраями.
+- v2.2: Auth self-heal — при битой/просроченной guest-cookie она сбрасывается и перевыдаётся (без 401); Domain разведен для DEV/PROD. Добавлен ручной `POST /api/health/llm/ping`.
+
+## Как переключить LLM провайдера (через env)
+
+Клиент работает с любым OpenAI-compatible провайдером.
+
+- `LLM_PROVIDER=openai_compat`
+- `LLM_BASE_URL` — базовый URL (например, `https://openrouter.ai/api/v1` или другой совместимый endpoint)
+- `LLM_API_KEY` (или `OPENROUTER_API_KEY`) — ключ
+- `LLM_MODEL` — модель (строка, зависит от провайдера)
+
+Важно: не предполагаем “бесплатность” — провайдер должен быть совместимым и иметь валидные кредиты/ключ.
 
 ## Изменения за 2026-01-08
  v1.8: /health/llm теперь показывает key_source/provider_effective/reason; LLM_REQUIRE_KEY=true отключает silent mock и даёт 503 при отсутствии ключа

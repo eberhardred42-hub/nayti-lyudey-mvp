@@ -1,3 +1,4 @@
+from fastapi import FastAPI, Request, HTTPException, Response
 import json
 import time
 import os
@@ -88,6 +89,7 @@ from llm_client import (
     generate_json_messages,
     generate_json_messages_observable,
     health_llm,
+    llm_ping,
     LLMUnavailable,
 )
 from trace import text_fingerprint, trace_artifact
@@ -2017,11 +2019,15 @@ def _get_user_id(request: Request) -> str | None:
                 return token[5:]
 
     # Cookie auth
+    # Cookie auth (tolerate invalid/expired; self-heal is handled at endpoint level)
     cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
     if cookie_val:
-        user_id = _parse_auth_cookie_user_id(cookie_val)
-        if user_id:
-            return user_id
+        try:
+            user_id = _parse_auth_cookie_user_id(cookie_val)
+            if user_id:
+                return user_id
+        except HTTPException:
+            return None
 
     # Legacy header fallback (older front)
     raw = request.headers.get("X-User-Id")
@@ -2090,15 +2096,50 @@ def _is_https_request(request: Request) -> bool:
 
 
 def _cookie_domain_for_request(request: Request) -> str | None:
-    host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+    # Prefer X-Forwarded-Host when behind proxy
+    host = (request.headers.get("X-Forwarded-Host") or request.headers.get("host") or "")
+    host = host.split(",", 1)[0].split(":", 1)[0].strip().lower()
     if not host:
         return None
     if host in {"localhost", "127.0.0.1"}:
         return None
-    # Share across dev/prod subdomains.
+
+    # DEV/PROD split to avoid signature/secret mismatch issues.
+    if host == "dev.naitilyudei.ru" or host.endswith(".dev.naitilyudei.ru"):
+        # Host-only-ish domain: only DEV
+        return "dev.naitilyudei.ru"
+
     if host == "naitilyudei.ru" or host.endswith(".naitilyudei.ru"):
+        # Share across prod subdomains
         return ".naitilyudei.ru"
+
     return None
+
+
+def _clear_auth_cookie(response: Response, request: Request, *, reason: str) -> None:
+    """Best-effort: clear current auth cookie across likely domains."""
+    request_id = get_request_id_from_request(request)
+    try:
+        log_event(
+            "auth_cookie_invalid_reset",
+            request_id=request_id,
+            reason=reason,
+        )
+    except Exception:
+        pass
+
+    # Clear host-only cookie (no domain)
+    try:
+        response.delete_cookie(key=_auth_cookie_name(), path="/")
+    except Exception:
+        pass
+
+    # Clear for common domains
+    for d in ("dev.naitilyudei.ru", ".naitilyudei.ru", "naitilyudei.ru"):
+        try:
+            response.delete_cookie(key=_auth_cookie_name(), path="/", domain=d)
+        except Exception:
+            pass
 
 
 def _auth_cookie_sig(user_id: str, issued_at: int) -> str:
@@ -2158,9 +2199,20 @@ def _issue_guest_cookie_if_missing(request: Request, response: Response) -> str 
         raise HTTPException(status_code=401, detail="invalid_token")
 
     # If cookie exists, it must be valid; otherwise return 401 (do not mint guest).
+    # If cookie exists but invalid/expired: self-heal (clear + re-issue).
     cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
     if cookie_val:
-        return _parse_auth_cookie_user_id(cookie_val)
+        try:
+            return _parse_auth_cookie_user_id(cookie_val)
+        except HTTPException as e:
+            # Self-heal only for guest cookie failures
+            detail = str(getattr(e, "detail", "") or "")
+            if detail in {"invalid_cookie", "expired_cookie"}:
+                _clear_auth_cookie(response, request, reason=detail)
+            else:
+                _clear_auth_cookie(response, request, reason="invalid_cookie")
+        except Exception:
+            _clear_auth_cookie(response, request, reason="invalid_cookie")
 
     # Already authenticated via legacy header? We'll reuse it but still set cookie.
     user_id = None
@@ -4123,6 +4175,24 @@ def health_db(request: Request):
 @app.get("/health/llm")
 def health_llm_endpoint():
     return health_llm()
+
+
+@app.post("/health/llm/ping")
+def health_llm_ping_endpoint(request: Request):
+    """Manual ping to prove LLM calls reach external provider (real completion, short)."""
+    request_id = get_request_id_from_request(request)
+    try:
+        return llm_ping(request_id=request_id, session_id="llm_ping")
+    except LLMUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e.reason or "llm_unavailable"))
+    except Exception as e:
+        log_event(
+            "llm_ping_error",
+            level="error",
+            request_id=request_id,
+            error=str(e),
+        )
+        raise HTTPException(status_code=502, detail="llm_ping_failed")
 
 
 @app.get("/health/sms")
