@@ -81,7 +81,14 @@ from db import (
     upsert_document_access,
     upsert_document_metadata,
 )
-from llm_client import current_llm_provider, generate_questions_and_quick_replies, generate_json_messages, health_llm
+from llm_client import (
+    current_llm_provider,
+    generate_questions_and_quick_replies,
+    generate_json_messages,
+    generate_json_messages_observable,
+    health_llm,
+)
+from trace import text_fingerprint, trace_artifact
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get, stream_get
 
@@ -3280,6 +3287,21 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
+            # Persist intro user input (truncated + hash only)
+            fp = text_fingerprint(text, limit=1000)
+            trace_artifact(
+                session_id=sid,
+                kind="intro_user_input",
+                request_id=request_id,
+                payload_json={
+                    "text_preview": fp.get("preview"),
+                    "text_length": fp.get("full_length"),
+                    "text_sha256": fp.get("sha256"),
+                    "truncated": fp.get("truncated"),
+                },
+                meta={"flow": "intro", "phase": phase},
+            )
+
         low = (text or "").strip().lower()
 
         if phase == "INTRO_MODE":
@@ -3328,6 +3350,18 @@ def chat_message(body: ChatMessage, request: Request):
                     next_phase = "INTRO_CONFIRM"
 
             brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            # Persist intro state snapshot for /admin/logs
+            try:
+                missing_now = _intro_missing_fields(brief_state)
+            except Exception:
+                missing_now = missing
+            trace_artifact(
+                session_id=sid,
+                kind="intro_state",
+                request_id=request_id,
+                payload_json={"brief_state": brief_state, "missing_fields": missing_now},
+                meta={"flow": "intro", "phase": next_phase},
+            )
             try:
                 update_session(
                     sid,
@@ -3392,6 +3426,13 @@ def chat_message(body: ChatMessage, request: Request):
                 next_phase = "INTRO_CLARIFY"
 
             brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            trace_artifact(
+                session_id=sid,
+                kind="intro_state",
+                request_id=request_id,
+                payload_json={"brief_state": brief_state, "missing_fields": missing},
+                meta={"flow": "intro", "phase": next_phase},
+            )
             try:
                 update_session(
                     sid,
@@ -4707,7 +4748,15 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
         try:
             messages = _build_doc_messages(doc_id=doc_id, profession_query=profession_query, brief_state=brief_state)
             fallback = {"doc_markdown": "", "missing_fields": [], "quality_notes": "fallback"}
-            raw = generate_json_messages(messages=messages, request_id=request_id, session_id=session_id, fallback=fallback)
+            raw = generate_json_messages_observable(
+                messages=messages,
+                request_id=request_id,
+                session_id=session_id,
+                fallback=fallback,
+                flow="doc_generate",
+                doc_id=doc_id,
+                attempt=attempt,
+            )
             m = DocContentResponse.model_validate(raw)
             # Consider empty doc_markdown with empty missing_fields as invalid.
             if (not (m.doc_markdown or "").strip()) and not (m.missing_fields or []):
@@ -5154,7 +5203,15 @@ def documents_retry(document_id: str, request: Request):
         try:
             messages = _build_doc_messages(doc_id=doc_id, profession_query=profession_query, brief_state=brief_state)
             fallback = {"doc_markdown": "", "missing_fields": [], "quality_notes": "fallback"}
-            raw = generate_json_messages(messages=messages, request_id=request_id, session_id=session_id, fallback=fallback)
+            raw = generate_json_messages_observable(
+                messages=messages,
+                request_id=request_id,
+                session_id=session_id,
+                fallback=fallback,
+                flow="doc_generate",
+                doc_id=doc_id,
+                attempt=attempt,
+            )
             m = DocContentResponse.model_validate(raw)
             if (not (m.doc_markdown or "").strip()) and not (m.missing_fields or []):
                 raise RuntimeError("empty_doc_markdown")

@@ -76,15 +76,9 @@ jobs:
           set -euo pipefail
           curl -fsS https://dev.naitilyudei.ru/ >/dev/null
           curl -fsS https://dev.naitilyudei.ru/api/docs >/dev/null
+          curl -fsS https://dev.naitilyudei.ru/api/health/llm >/dev/null
           cd "$HOME/app"
           docker compose -p dev -f infra/docker-compose.yml ps
-
-      - name: Smoke documents v1 (DEV)
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$HOME/app"
-          BASE_URL="https://dev.naitilyudei.ru/api" scripts/smoke-documents-v1-dev.sh
 
       - name: Logs (only if failed)
         if: failure()

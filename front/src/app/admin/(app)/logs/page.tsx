@@ -16,6 +16,7 @@ type LogItem = {
 
 export default function AdminLogsPage() {
   const [items, setItems] = useState<LogItem[]>([]);
+  const [llmBadge, setLlmBadge] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [kind, setKind] = useState("");
@@ -64,9 +65,30 @@ export default function AdminLogsPage() {
     };
   }, [limit]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function loadLlmInfo() {
+      try {
+        const r = await fetch("/api/health/llm", { method: "GET" });
+        const j = await r.json();
+        const provider = String(j?.provider || "");
+        const model = String(j?.model || "");
+        if (!cancelled) setLlmBadge(provider && model ? `LLM: ${provider}/${model}` : provider ? `LLM: ${provider}` : "");
+      } catch {
+        if (!cancelled) setLlmBadge("");
+      }
+    }
+    loadLlmInfo();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <div>
       <h1>Logs</h1>
+
+      {!!llmBadge && <div style={{ marginTop: 6, fontSize: 12, color: "#555" }}>{llmBadge}</div>}
 
       <div style={{ marginTop: 12, display: "flex", gap: 12, alignItems: "end", flexWrap: "wrap" }}>
         <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>

@@ -7,6 +7,10 @@ on:
         description: "Environment (dev|prod)"
         required: true
         default: "prod"
+      documents:
+        description: "Run documents smoke (heavy)"
+        required: false
+        default: "false"
 
 jobs:
   smoke:
@@ -33,6 +37,30 @@ jobs:
           echo "OK"
           echo
 
+          echo "GET /api/health/llm"
+          curl -fsS "$BASE_URL/api/health/llm" >/dev/null
+          echo "OK"
+          echo
+
           echo "GET /api/health (if exists)"
           curl -fsS "$BASE_URL/api/health" >/dev/null || true
           echo "done"
+
+      - name: Documents smoke (manual)
+        if: ${{ inputs.documents == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ENV="${{ inputs.env }}"
+          case "$ENV" in
+            prod) API_BASE=https://naitilyudei.ru/api ;;
+            dev) API_BASE=https://dev.naitilyudei.ru/api ;;
+            *) echo "Invalid env: $ENV (expected dev|prod)"; exit 1 ;;
+          esac
+
+          cd "$HOME/app"
+          if [ "$ENV" = "dev" ]; then
+            BASE_URL="$API_BASE" scripts/smoke-documents-v1-dev.sh
+          else
+            BASE_URL="$API_BASE" scripts/smoke-documents-v1.sh
+          fi

@@ -20,6 +20,7 @@ from db import (
     try_mark_render_job_rendering,
 )
 from storage.s3_client import upload_bytes
+from trace import json_fingerprint, trace_artifact
 
 
 def log_event(event: str, level: str = "info", **fields: Any) -> None:
@@ -118,10 +119,45 @@ def process_message(msg: str) -> None:
     )
 
     try:
+        # render_request (trace) - store markdown truncated + hash only
+        try:
+            md = render_request.get("markdown") if isinstance(render_request, dict) else None
+            fp = json_fingerprint({"markdown": md or ""}, limit=1200)
+            trace_artifact(
+                session_id=session_id,
+                kind="render_request",
+                request_id=request_id,
+                payload_json={
+                    "doc_id": doc_id,
+                    "markdown_chars": int(fp.get("full_length") or 0),
+                    "markdown_preview": fp.get("preview"),
+                    "markdown_sha256": fp.get("sha256"),
+                    "markdown_full_length": fp.get("full_length"),
+                },
+                meta={"doc_id": doc_id, "pack_id": pack_id, "render_job_id": job_id},
+            )
+        except Exception:
+            pass
+
+        render_start = time.perf_counter()
         pdf_bytes = _http_post_json(
             f"{RENDER_URL.rstrip('/')}/render",
             render_request,
             timeout_sec=RENDER_TIMEOUT_SEC,
+        )
+        render_duration_ms = round((time.perf_counter() - render_start) * 1000, 2)
+
+        trace_artifact(
+            session_id=session_id,
+            kind="render_response",
+            request_id=request_id,
+            payload_json={
+                "doc_id": doc_id,
+                "status_code": 200,
+                "duration_ms": render_duration_ms,
+                "pdf_bytes": len(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else None,
+            },
+            meta={"doc_id": doc_id, "pack_id": pack_id, "render_job_id": job_id},
         )
 
         if not pdf_bytes.startswith(b"%PDF"):
@@ -131,12 +167,27 @@ def process_message(msg: str) -> None:
             raise RuntimeError("S3_BUCKET_not_configured")
 
         object_key = f"renders/{job_id}/{(doc_id or 'doc')}.pdf"
+        s3_start = time.perf_counter()
         up = upload_bytes(
             bucket=S3_BUCKET,
             key=object_key,
             data=pdf_bytes,
             content_type="application/pdf",
             request_id=request_id,
+        )
+        s3_duration_ms = round((time.perf_counter() - s3_start) * 1000, 2)
+        trace_artifact(
+            session_id=session_id,
+            kind="s3_put",
+            request_id=request_id,
+            payload_json={
+                "bucket": S3_BUCKET,
+                "key": object_key,
+                "bytes": len(pdf_bytes) if isinstance(pdf_bytes, (bytes, bytearray)) else None,
+                "duration_ms": s3_duration_ms,
+                "ok": True,
+            },
+            meta={"doc_id": doc_id, "pack_id": pack_id, "render_job_id": job_id},
         )
 
         artifact = create_artifact(
@@ -179,6 +230,30 @@ def process_message(msg: str) -> None:
 
     except Exception as e:
         err = str(e)
+
+        # Best-effort trace for failures.
+        if err:
+            trace_artifact(
+                session_id=session_id,
+                kind="render_response",
+                request_id=request_id,
+                payload_json={"doc_id": doc_id, "status_code": None, "duration_ms": None, "error": err[:800]},
+                meta={"doc_id": doc_id, "pack_id": pack_id, "render_job_id": job_id},
+            )
+            trace_artifact(
+                session_id=session_id,
+                kind="s3_put",
+                request_id=request_id,
+                payload_json={
+                    "bucket": S3_BUCKET,
+                    "key": None,
+                    "bytes": None,
+                    "duration_ms": None,
+                    "ok": False,
+                    "error": err[:800],
+                },
+                meta={"doc_id": doc_id, "pack_id": pack_id, "render_job_id": job_id},
+            )
         updated = increment_render_job_attempt(job_id, last_error=err, request_id=request_id)
         attempts = int(updated.get("attempts") or 0)
         max_attempts = int(updated.get("max_attempts") or 0)
