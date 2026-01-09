@@ -9,6 +9,7 @@
 - v1.8: LLM обязателен (OpenRouter) — деплой падает без ключа; `/api/health/llm` теперь показывает provider/model/base_url/key_present/mode.
 - v1.10: GitHub Actions — исправлена генерация runtime env (`.env` на сервере), чтобы compose стабильно подхватывал `LLM_*`/`OPENROUTER_API_KEY`.
 - v2.0: Guest auth без логина — `POST /sessions` выдаёт HttpOnly cookie (Domain=.naitilyudei.ru), `/api/me/documents` для гостя возвращает 200 вместо 401; фронт шлёт cookies через `credentials: "include"`.
+- v2.1: DEV Deploy — smoke checks сделаны non-blocking (warn-only) с ретраями.
 
 ## Изменения за 2026-01-08
  v1.8: /health/llm теперь показывает key_source/provider_effective/reason; LLM_REQUIRE_KEY=true отключает silent mock и даёт 503 при отсутствии ключа
