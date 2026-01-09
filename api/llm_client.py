@@ -67,21 +67,14 @@ def _llm_settings() -> dict:
         api_key = openrouter_api_key
         key_source = "OPENROUTER_API_KEY"
     elif openai_api_key:
-        # Keep backward compatibility (OpenAI key); report as generic.
         api_key = openai_api_key
-        key_source = "LLM_API_KEY"
+        key_source = "OPENAI_API_KEY"
 
     base_url = (
         (os.environ.get("LLM_BASE_URL") or "").strip()
         or (os.environ.get("OPENROUTER_BASE_URL") or "").strip()
         or (os.environ.get("OPENAI_BASE_URL") or "").strip()
     )
-
-    if not base_url:
-        if (os.environ.get("OPENROUTER_API_KEY") or "").strip():
-            base_url = "https://openrouter.ai/api/v1"
-        elif (os.environ.get("OPENAI_API_KEY") or "").strip():
-            base_url = "https://api.openai.com/v1"
 
     model = (os.environ.get("LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 

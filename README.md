@@ -12,6 +12,7 @@
 - v2.1: DEV Deploy — smoke checks сделаны non-blocking (warn-only) с ретраями.
 - v2.2: Auth self-heal — при битой/просроченной guest-cookie она сбрасывается и перевыдаётся (без 401); Domain разведен для DEV/PROD. Добавлен ручной `POST /api/health/llm/ping`.
 - v2.3: DEV “STOP 401” — гостевой auth сделан железобетонным: host-only cookie `__Host-nly_auth` (без Domain) + cleanup legacy `nly_auth`; `POST /api/sessions` и `GET /api/me/documents` никогда не возвращают 401 без Bearer. Добавлен `GET /api/health/auth`.
+- v2.4: LLM провайдер теперь переключается только env-переменными (`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`); OpenRouter больше не “особенный” (это просто base_url). PROD deploy поддерживает `PROD_LLM_*`.
 
 ## Как переключить LLM провайдера (через env)
 
@@ -19,20 +20,31 @@
 
 - `LLM_PROVIDER=openai_compat`
 - `LLM_BASE_URL` — базовый URL (OpenAI-compatible)
-- `LLM_API_KEY` (или `OPENROUTER_API_KEY`) — ключ
+- `LLM_API_KEY` (или `OPENROUTER_API_KEY`) — ключ (но base_url нужно указать явно)
 - `LLM_MODEL` — модель (строка, зависит от провайдера)
+
+Важно: OpenRouter не “особенный”. Если вы задаёте только ключ (`OPENROUTER_API_KEY`/`OPENAI_API_KEY`) без `LLM_BASE_URL`, то LLM будет считаться не настроенным.
 
 Пресеты (задавайте через env, без правки кода):
 - OpenAI: `LLM_BASE_URL=https://api.openai.com/v1`
 - Groq: `LLM_BASE_URL=https://api.groq.com/openai/v1`
 - Together: `LLM_BASE_URL=https://api.together.xyz/v1`
 - Mistral: `LLM_BASE_URL=https://api.mistral.ai/v1`
-- DeepSeek: поставьте `LLM_BASE_URL` по их документации (не хардкодим, чтобы не ошибиться)
+- DeepSeek: `LLM_BASE_URL=https://api.deepseek.com`
+
+Рекомендуемые стартовые модели (пример):
+- Groq: `LLM_MODEL=llama-3.1-8b-instant` (или актуальная из их `/models`)
+- DeepSeek: `LLM_MODEL=deepseek-chat`
 
 DEV деплой ожидает (Secrets/Vars):
 - `DEV_LLM_BASE_URL` (secret)
 - `DEV_LLM_API_KEY` (secret)
 - `DEV_LLM_MODEL` (var)
+
+PROD деплой ожидает (Secrets/Vars):
+- `PROD_LLM_BASE_URL` (secret)
+- `PROD_LLM_API_KEY` (secret)
+- `PROD_LLM_MODEL` (var)
 
 Пруф “реально стучимся наружу”:
 - ручной вызов `POST /api/health/llm/ping` (и workflow `LLM Ping (DEV)`) показывает `latency_ms`/`model`/`base_url`.

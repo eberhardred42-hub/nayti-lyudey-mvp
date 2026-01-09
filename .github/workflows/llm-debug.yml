@@ -15,6 +15,6 @@ jobs:
           cd "$APP_DIR"
 
           docker compose -p dev -f infra/docker-compose.yml exec -T api sh -lc '
-            env | grep -E "^(LLM_|OPENROUTER_)" | \
+            env | grep -E "^(LLM_|OPENROUTER_|OPENAI_)" | \
               sed -E "s/(API_KEY=).+/\1***REDACTED***/" || true
           '
