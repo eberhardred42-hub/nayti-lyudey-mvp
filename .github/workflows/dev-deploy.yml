@@ -50,13 +50,14 @@ jobs:
             echo "ERROR: OPENROUTER_API_KEY is not set" >&2
             exit 1
           fi
-          cat >"$RUNTIME_ENV_FILE" <<EOF
-          LLM_BASE_URL=https://openrouter.ai/api/v1
-          LLM_PROVIDER=openai_compat
-          LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
-          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
-          LLM_REQUIRE_KEY=true
-          EOF
+          umask 077
+          {
+            printf '%s\n' "LLM_BASE_URL=https://openrouter.ai/api/v1"
+            printf '%s\n' "LLM_PROVIDER=openai_compat"
+            printf '%s\n' "LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}"
+            printf '%s\n' "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}"
+            printf '%s\n' "LLM_REQUIRE_KEY=true"
+          } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
 
           docker compose --env-file "$RUNTIME_ENV_FILE" -p dev -f infra/docker-compose.yml up -d --build
