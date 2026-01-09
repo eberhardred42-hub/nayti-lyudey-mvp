@@ -138,6 +138,30 @@ export default function Page() {
     return userId ? { "X-User-Id": userId } : {};
   }
 
+  async function fetchGuestSafe(input: RequestInfo | URL, init: RequestInit): Promise<Response> {
+    const resp = await fetch(input, init);
+    if (resp.status !== 401 && resp.status !== 403) return resp;
+
+    // API: guest routes never 401 unless invalid Bearer was provided.
+    // Tokens are in-memory on API side; after redeploy an old token becomes invalid.
+    const token = getUserToken();
+    if (!token) return resp;
+
+    clearUserSession();
+    setUserTokenState(null);
+
+    const headers0 = (init.headers || {}) as Record<string, string>;
+    const rest: Record<string, string> = { ...headers0 };
+    delete rest.Authorization;
+    return fetch(input, {
+      ...init,
+      headers: {
+        ...rest,
+        ...authHeaders(),
+      },
+    });
+  }
+
   function resetIntroUi() {
     setMessages([]);
     setQuickReplies([]);
@@ -188,7 +212,7 @@ export default function Page() {
     setErrorText(null);
     resetIntroUi();
     try {
-      const r = await fetch("/api/sessions", {
+      const r = await fetchGuestSafe("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
@@ -201,7 +225,7 @@ export default function Page() {
       if (!r.ok || !sid) throw new Error("no_session_id");
       setSessionId(sid);
 
-      const resp = await fetch("/api/chat/message", {
+      const resp = await fetchGuestSafe("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
@@ -238,7 +262,7 @@ export default function Page() {
     setCorrectionText("");
 
     try {
-      const r = await fetch("/api/chat/message", {
+      const r = await fetchGuestSafe("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
