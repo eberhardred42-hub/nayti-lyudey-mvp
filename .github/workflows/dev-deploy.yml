@@ -105,10 +105,10 @@ jobs:
           for i in $(seq 1 30); do
             if curl -fsS -4 https://dev.naitilyudei.ru/api/health/llm \
               | python3 - <<'PY'
-import json,sys
-j=json.load(sys.stdin)
-assert j.get('ok') is True, j
-PY
+          import json,sys
+          j=json.load(sys.stdin)
+          assert j.get('ok') is True, j
+          PY
             then
               echo "Sanity OK"
               exit 0
