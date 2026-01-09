@@ -36,6 +36,8 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_REQUIRE_KEY=${LLM_REQUIRE_KEY:-}
+      - REQUIRE_LLM=${REQUIRE_LLM:-}
 
   ml:
     build: ../ml
@@ -142,6 +144,8 @@ services:
       - LLM_API_KEY=${LLM_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - LLM_REQUIRE_KEY=${LLM_REQUIRE_KEY:-}
+      - REQUIRE_LLM=${REQUIRE_LLM:-}
     command: ["python", "-m", "worker"]
     restart: unless-stopped
 

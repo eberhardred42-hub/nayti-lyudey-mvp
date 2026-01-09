@@ -5,6 +5,12 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
+
+class LLMUnavailable(RuntimeError):
+    def __init__(self, reason: str, message: str = "LLM unavailable"):
+        super().__init__(message)
+        self.reason = reason
+
 def _log_event(event: str, level: str = "info", **fields):
     try:
         from main import log_event as main_log_event  # type: ignore
@@ -44,11 +50,26 @@ def _template_from_missing(missing_fields):
 def _llm_settings() -> dict:
     provider_raw = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
 
-    api_key = (
-        (os.environ.get("LLM_API_KEY") or "").strip()
-        or (os.environ.get("OPENROUTER_API_KEY") or "").strip()
-        or (os.environ.get("OPENAI_API_KEY") or "").strip()
-    )
+    def _bool_env(name: str) -> bool:
+        return (os.environ.get(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    require_key = _bool_env("LLM_REQUIRE_KEY") or _bool_env("REQUIRE_LLM")
+
+    api_key = ""
+    key_source = "none"
+    llm_api_key = (os.environ.get("LLM_API_KEY") or "").strip()
+    openrouter_api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+    openai_api_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if llm_api_key:
+        api_key = llm_api_key
+        key_source = "LLM_API_KEY"
+    elif openrouter_api_key:
+        api_key = openrouter_api_key
+        key_source = "OPENROUTER_API_KEY"
+    elif openai_api_key:
+        # Keep backward compatibility (OpenAI key); report as generic.
+        api_key = openai_api_key
+        key_source = "LLM_API_KEY"
 
     base_url = (
         (os.environ.get("LLM_BASE_URL") or "").strip()
@@ -64,22 +85,61 @@ def _llm_settings() -> dict:
 
     model = (os.environ.get("LLM_MODEL") or "gpt-4o-mini").strip() or "gpt-4o-mini"
 
-    if provider_raw in {"mock", "openai_compat"}:
-        provider = provider_raw
-    else:
-        provider = "openai_compat" if (api_key and base_url) else "mock"
+    key_present = bool(api_key)
 
-    return {"provider": provider, "base_url": base_url, "api_key": api_key, "model": model}
+    # Determine effective provider.
+    provider_effective = "openai_compat"
+    reason = "ok"
+
+    if provider_raw == "mock":
+        provider_effective = "mock"
+        reason = "provider_forced_mock"
+    elif provider_raw == "openai_compat":
+        provider_effective = "openai_compat"
+        reason = "provider_forced_openai_compat"
+    else:
+        # Auto mode
+        if require_key:
+            provider_effective = "openai_compat"
+            reason = "provider_auto_openai_compat"
+        else:
+            if key_present and base_url:
+                provider_effective = "openai_compat"
+                reason = "provider_auto_openai_compat"
+            else:
+                provider_effective = "mock"
+                reason = "missing_api_key" if not key_present else "missing_base_url"
+
+    return {
+        "provider": provider_effective,
+        "provider_raw": provider_raw,
+        "provider_effective": provider_effective,
+        "reason": reason,
+        "require_key": require_key,
+        "base_url": base_url,
+        "api_key": api_key,
+        "key_present": key_present,
+        "key_source": key_source,
+        "model": model,
+    }
 
 
 def current_llm_provider() -> str:
     return str(_llm_settings().get("provider") or "mock")
 
 
-def _require_llm_is_real(provider: str) -> None:
-    require_llm = (os.environ.get("REQUIRE_LLM") or "").strip().lower() in {"1", "true", "yes"}
-    if require_llm and provider == "mock":
-        raise RuntimeError("llm_required_but_provider_is_mock")
+def _require_llm_configured(s: dict) -> None:
+    if not s.get("require_key"):
+        return
+    if s.get("provider_effective") == "mock":
+        # Only allowed if forced explicitly.
+        if (s.get("provider_raw") or "") == "mock":
+            return
+        raise LLMUnavailable("provider_forced_mock", "LLM is required but provider_effective is mock")
+    if not s.get("key_present"):
+        raise LLMUnavailable("missing_api_key", "LLM is not configured: missing_api_key")
+    if not (s.get("base_url") or ""):
+        raise LLMUnavailable("missing_base_url", "LLM is not configured: missing_base_url")
 
 
 def generate_json_mock(prompt: str, schema_hint: dict, request_id: str, session_id: str):
@@ -94,8 +154,9 @@ def generate_json_mock(prompt: str, schema_hint: dict, request_id: str, session_
 
 def generate_json_openai_compat(prompt: str, schema_hint: dict, request_id: str, session_id: str):
     s = _llm_settings()
+    _require_llm_configured(s)
     if not s["base_url"] or not s["api_key"]:
-        raise RuntimeError("missing api_key or base_url")
+        raise LLMUnavailable("missing_api_key", "LLM is not configured")
     url = str(s["base_url"]).rstrip("/") + "/chat/completions"
     body = {
         "model": s["model"],
@@ -160,8 +221,9 @@ def generate_json_openai_compat_messages(messages: list[dict], request_id: str, 
     Must return a JSON object (via response_format).
     """
     s = _llm_settings()
+    _require_llm_configured(s)
     if not s["base_url"] or not s["api_key"]:
-        raise RuntimeError("missing api_key or base_url")
+        raise LLMUnavailable("missing_api_key", "LLM is not configured")
     url = str(s["base_url"]).rstrip("/") + "/chat/completions"
     body = {
         "model": s["model"],
@@ -251,7 +313,7 @@ def generate_json_messages_observable(
     s = _llm_settings()
     provider = s["provider"]
 
-    _require_llm_is_real(provider)
+    _require_llm_configured(s)
 
     start_total = time.perf_counter()
 
@@ -272,6 +334,7 @@ def generate_json_messages_observable(
         attempt=int(attempt or 1),
         prompt_chars=int(prompt_chars),
         mode="real" if provider != "mock" else "mock",
+        base_url=(s.get("base_url") or ""),
     )
     try:
         if provider == "openai_compat":
@@ -293,6 +356,7 @@ def generate_json_messages_observable(
                 parsed_ok=True,
                 llm_response_chars=len(json.dumps(out, ensure_ascii=False)) if isinstance(out, dict) else None,
                 mode="real" if provider != "mock" else "mock",
+                base_url=(s.get("base_url") or ""),
             )
             return out
 
@@ -311,6 +375,7 @@ def generate_json_messages_observable(
             parsed_ok=False,
             llm_response_chars=None,
             mode="mock",
+            base_url=(s.get("base_url") or ""),
         )
         return fallback
     except Exception as e:
@@ -326,8 +391,10 @@ def generate_json_messages_observable(
             attempt=int(attempt or 1),
             duration_ms=round((time.perf_counter() - start_total) * 1000, 2),
             error=str(e),
+            base_url=(s.get("base_url") or ""),
         )
-        _require_llm_is_real(provider)
+        # If LLM is required and misconfigured, surface as 503 upstream.
+        _require_llm_configured(s)
         return fallback
 
 
@@ -339,7 +406,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
     s = _llm_settings()
     provider = s["provider"]
 
-    _require_llm_is_real(provider)
+    _require_llm_configured(s)
 
     prompt_parts = [
         "Ты помогаешь рекрутеру уточнить вводные. Верни JSON с ключами questions и quick_replies.",
@@ -359,6 +426,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
         attempt=1,
         prompt_chars=len(prompt),
         mode="real" if provider != "mock" else "mock",
+        base_url=(s.get("base_url") or ""),
     )
 
     schema_hint = {"missing_fields": missing_fields}
@@ -380,9 +448,10 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
             attempt=1,
             duration_ms=round((time.perf_counter() - start) * 1000, 2),
             error=str(e),
+            base_url=(s.get("base_url") or ""),
         )
         questions, quick_replies = _template_from_missing(missing_fields)
-        _require_llm_is_real(provider)
+        _require_llm_configured(s)
         return {"questions": questions[:3], "quick_replies": quick_replies[:6]}
 
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
@@ -400,6 +469,7 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
         fallback=False,
         parsed_ok=isinstance(result, dict),
         mode="real" if provider != "mock" else "mock",
+        base_url=(s.get("base_url") or ""),
     )
 
     if not isinstance(result, dict):
@@ -421,55 +491,56 @@ def generate_questions_and_quick_replies(context: dict) -> dict:
 
 def health_llm() -> dict:
     s = _llm_settings()
-    provider = s["provider"]
+
+    provider_effective = s.get("provider_effective") or s.get("provider") or "mock"
+    provider_raw = s.get("provider_raw") or ""
     model = s.get("model")
-    key_present = bool((s.get("api_key") or "").strip())
+    key_present = bool(s.get("key_present"))
+    key_source = s.get("key_source") or "none"
+    require_key = bool(s.get("require_key"))
+
     base_url_raw = (s.get("base_url") or "").strip()
-    base_url_host = ""
+    base_url_safe = ""
     try:
         if base_url_raw:
             parsed = urllib.parse.urlparse(base_url_raw)
-            base_url_host = parsed.hostname or ""
+            base_url_safe = urllib.parse.urlunparse(
+                (parsed.scheme or "https", parsed.netloc, parsed.path, "", "", "")
+            )
     except Exception:
-        base_url_host = ""
+        base_url_safe = ""
 
-    real_configured = provider == "openai_compat" and key_present and bool(base_url_raw)
-    mode = "real" if real_configured else "mock"
+    ok = True
+    reason = "ok"
+    if provider_effective == "openai_compat":
+        if not key_present:
+            ok = False
+            reason = "missing_api_key"
+        elif not base_url_raw:
+            ok = False
+            reason = "missing_base_url"
+    elif provider_effective == "mock":
+        # If mock is effective, always explain why.
+        if provider_raw == "mock":
+            reason = "provider_forced_mock"
+        else:
+            reason = s.get("reason") or "unknown"
+    else:
+        ok = False
+        reason = "unsupported_provider"
 
-    if provider == "mock":
-        return {
-            "ok": True,
-            "provider": "mock",
-            "model": model,
-            "base_url": base_url_host,
-            "key_present": key_present,
-            "mode": mode,
-        }
-    if provider == "openai_compat":
-        if not real_configured:
-            return {
-                "ok": False,
-                "provider": "openai_compat",
-                "model": model,
-                "base_url": base_url_host,
-                "key_present": key_present,
-                "mode": mode,
-                "reason": "missing api_key or base_url",
-            }
-        return {
-            "ok": True,
-            "provider": "openai_compat",
-            "model": model,
-            "base_url": base_url_host,
-            "key_present": key_present,
-            "mode": mode,
-        }
-    return {
-        "ok": False,
-        "provider": provider,
+    resp = {
+        "ok": ok,
+        "provider": provider_effective,
+        "provider_effective": provider_effective,
         "model": model,
-        "base_url": base_url_host,
+        "base_url": base_url_safe,
         "key_present": key_present,
-        "mode": mode,
-        "reason": "unsupported provider",
+        "key_source": key_source,
+        "reason": reason,
+        "llm_require_key": require_key,
     }
+
+    if provider_effective == "mock" and not resp.get("reason"):
+        resp["reason"] = "unknown"
+    return resp

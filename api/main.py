@@ -87,6 +87,7 @@ from llm_client import (
     generate_json_messages,
     generate_json_messages_observable,
     health_llm,
+    LLMUnavailable,
 )
 from trace import text_fingerprint, trace_artifact
 from storage.s3_client import health_s3_env, head_bucket_if_debug
@@ -3100,6 +3101,18 @@ def build_clarification_prompt(session_id, kb, profession_query, last_user_messa
         if isinstance(result, dict):
             questions = result.get("questions") or []
             quick_replies = result.get("quick_replies") or []
+    except LLMUnavailable as e:
+        log_event(
+            "llm_error",
+            level="error",
+            request_id=request_id,
+            session_id=session_id,
+            route=str(request.url.path),
+            method=request.method,
+            reason=str(getattr(e, "reason", "llm_unavailable")),
+            error=str(e),
+        )
+        raise HTTPException(status_code=503, detail=f"LLM unavailable: {getattr(e, 'reason', 'missing_api_key')}")
     except Exception as e:
         log_event(
             "llm_error",
@@ -4845,6 +4858,22 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
                 missing_fields_count=len(m.missing_fields or []),
             )
             break
+        except LLMUnavailable as e:
+            # No silent mock in envs where LLM_REQUIRE_KEY=true.
+            log_event(
+                "llm_error",
+                level="error",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                artifact_id=document_id,
+                template_id=template_id,
+                attempt=attempt,
+                reason=str(getattr(e, "reason", "llm_unavailable")),
+                error=str(e),
+            )
+            raise HTTPException(status_code=503, detail=f"LLM unavailable: {getattr(e, 'reason', 'missing_api_key')}")
         except Exception as e:
             log_event(
                 "llm_fail",
@@ -5287,6 +5316,20 @@ def documents_retry(document_id: str, request: Request):
             llm_ok = True
             llm_model = m
             break
+        except LLMUnavailable as e:
+            log_event(
+                "llm_error",
+                level="error",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                artifact_id=document_id,
+                attempt=attempt,
+                reason=str(getattr(e, "reason", "llm_unavailable")),
+                error=str(e),
+            )
+            raise HTTPException(status_code=503, detail=f"LLM unavailable: {getattr(e, 'reason', 'missing_api_key')}")
         except Exception:
             pass
 

@@ -16,7 +16,7 @@ jobs:
       LLM_MODEL: ${{ vars.LLM_MODEL }}
       LLM_BASE_URL: https://openrouter.ai/api/v1
       LLM_PROVIDER: openai_compat
-      REQUIRE_LLM: "1"
+      LLM_REQUIRE_KEY: "true"
 
     steps:
       - name: Deploy from ~/app (git pull + compose up)
@@ -53,18 +53,22 @@ jobs:
           export REDIS_HOST_PORT=6379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9000}
 
-          # LLM/OpenRouter must be configured (no silent mock)
-          if [ "${REQUIRE_LLM:-0}" = "1" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
-            echo "ERROR: OPENROUTER_API_KEY is not set, but REQUIRE_LLM=1" >&2
+          # Deterministic runtime env (no relying on old .env on server)
+          RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
+          if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "ERROR: OPENROUTER_API_KEY is not set" >&2
             exit 1
           fi
-          export LLM_PROVIDER=openai_compat
-          export LLM_BASE_URL=https://openrouter.ai/api/v1
-          export LLM_API_KEY="$OPENROUTER_API_KEY"
-          export OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
-          export LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
+          cat >"$RUNTIME_ENV_FILE" <<EOF
+          LLM_BASE_URL=https://openrouter.ai/api/v1
+          LLM_PROVIDER=openai_compat
+          LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          LLM_REQUIRE_KEY=true
+          EOF
+          chmod 600 "$RUNTIME_ENV_FILE" || true
 
-          docker compose -p prod -f infra/docker-compose.yml up -d --build
+          docker compose --env-file "$RUNTIME_ENV_FILE" -p prod -f infra/docker-compose.yml up -d --build
 
       - name: Ensure caddy is running (host network)
         shell: bash

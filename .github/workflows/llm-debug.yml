@@ -1,0 +1,20 @@
+name: LLM Debug (DEV)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Print LLM env inside DEV api container (redacted)
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP_DIR="$HOME/app"
+          cd "$APP_DIR"
+
+          docker compose -p dev -f infra/docker-compose.yml exec -T api sh -lc '
+            env | grep -E "^(LLM_|OPENROUTER_)" | \
+              sed -E "s/(API_KEY=).+/\1***REDACTED***/" || true
+          '

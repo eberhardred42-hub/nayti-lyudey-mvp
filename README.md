@@ -9,7 +9,7 @@
 - v1.8: LLM обязателен (OpenRouter) — деплой падает без ключа; `/api/health/llm` теперь показывает provider/model/base_url/key_present/mode.
 
 ## Изменения за 2026-01-08
-
+ v1.8: /health/llm теперь показывает key_source/provider_effective/reason; LLM_REQUIRE_KEY=true отключает silent mock и даёт 503 при отсутствии ключа
 - Интро-диалог: добавлен минимальный A/B/C/D сценарий (текст вакансии / своими словами / короткие вопросы / пропустить) с подтверждением и возможностью исправить.
 - Документы: добавлен `POST /documents/generate_pack` — последовательная генерация всего бесплатного `auto_generate`-пака.
 - Документы: идемпотентность по `(user_id, session_id, doc_id)` и `force=true` для принудительной регенерации.

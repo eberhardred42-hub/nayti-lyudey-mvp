@@ -13,7 +13,7 @@ jobs:
       LLM_MODEL: ${{ vars.LLM_MODEL }}
       LLM_BASE_URL: https://openrouter.ai/api/v1
       LLM_PROVIDER: openai_compat
-      REQUIRE_LLM: "1"
+      LLM_REQUIRE_KEY: "true"
 
     steps:
       - name: Deploy DEV from ~/app (git pull + compose up)
@@ -44,19 +44,22 @@ jobs:
           export REDIS_HOST_PORT=16379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
-          # LLM/OpenRouter passthrough (optional; empty values are OK)
-          # LLM/OpenRouter must be configured (no silent mock)
-          if [ "${REQUIRE_LLM:-0}" = "1" ] && [ -z "${OPENROUTER_API_KEY:-}" ]; then
-            echo "ERROR: OPENROUTER_API_KEY is not set, but REQUIRE_LLM=1" >&2
+          # Deterministic runtime env (no relying on old .env on server)
+          RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
+          if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+            echo "ERROR: OPENROUTER_API_KEY is not set" >&2
             exit 1
           fi
-          export LLM_PROVIDER=openai_compat
-          export LLM_BASE_URL=https://openrouter.ai/api/v1
-          export LLM_API_KEY="$OPENROUTER_API_KEY"
-          export OPENROUTER_API_KEY="$OPENROUTER_API_KEY"
-          export LLM_MODEL="${LLM_MODEL:-gpt-4o-mini}"
+          cat >"$RUNTIME_ENV_FILE" <<EOF
+          LLM_BASE_URL=https://openrouter.ai/api/v1
+          LLM_PROVIDER=openai_compat
+          LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+          OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+          LLM_REQUIRE_KEY=true
+          EOF
+          chmod 600 "$RUNTIME_ENV_FILE" || true
 
-          docker compose -p dev -f infra/docker-compose.yml up -d --build
+          docker compose --env-file "$RUNTIME_ENV_FILE" -p dev -f infra/docker-compose.yml up -d --build
 
       - name: Ensure caddy is running (host network)
         shell: bash
@@ -81,9 +84,15 @@ jobs:
           curl -fsS https://dev.naitilyudei.ru/api/health/llm | python3 - <<'PY'
           import json,sys
           j=json.load(sys.stdin)
-          if (j.get('provider')=='mock') or (j.get('mode')=='mock') or (not j.get('key_present')):
+          if not j.get('ok'):
+            raise SystemExit(f"LLM health not ok: {j}")
+          if j.get('provider_effective')!='openai_compat':
+            raise SystemExit(f"LLM provider_effective is not openai_compat: {j}")
+          if not j.get('key_present'):
             raise SystemExit(f"LLM health is not real: {j}")
-          print('LLM health OK:', j.get('provider'), j.get('model'))
+          if j.get('reason')!='ok':
+            raise SystemExit(f"LLM reason is not ok: {j}")
+          print('LLM health OK:', j.get('provider_effective'), j.get('model'), j.get('key_source'))
           PY
           cd "$HOME/app"
           docker compose -p dev -f infra/docker-compose.yml ps
