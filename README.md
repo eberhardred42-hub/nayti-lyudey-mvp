@@ -2,6 +2,25 @@
 
 Версия: см. файл VERSION
 
+## Handover & Daily Product Checkpoints
+
+- [HANDOVER_PROMPT.md](HANDOVER_PROMPT.md)
+- [docs/ops/00_START_HERE.md](docs/ops/00_START_HERE.md)
+
+Daily checkpoints (что считаем прогрессом каждый день):
+- **A — LLM:** `POST /api/health/llm/ping` → 200 и `latency_ms`.
+- **B — Brief:** пройти бриф ≤ 10 вопросов → `ready_to_search=true`.
+- **C — Paid doc + wallet:** сгенерить 1 платный документ → появился `wallet.debit`, документ доступен на скачивание.
+
+## Project health links
+
+DEV:
+- https://dev.naitilyudei.ru/api/health/llm
+- https://dev.naitilyudei.ru/api/health/llm/ping
+- https://dev.naitilyudei.ru/admin/logs
+
+Policy: Every product PR must follow `docs/ops/01_RULES.md` and use the PR template.
+
 ## Изменения за 2026-01-09
 
 - v1.7: Observability — trace-события (intro/LLM/render/S3) теперь пишутся в `artifacts` и видны в `/admin/logs`.
@@ -15,6 +34,7 @@
 - v2.4: LLM провайдер теперь переключается только env-переменными (`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`); OpenRouter больше не “особенный” (это просто base_url). PROD deploy поддерживает `PROD_LLM_*`.
 - v2.5: Workflow `LLM Ping (DEV)` стал запускаться вручную (`workflow_dispatch`), версия поднята до 2.5.
 - v2.6: DEV — фикс 502 в Caddy (IPv6 `localhost`), LLM строго через `DEV_LLM_*`/`PROD_LLM_*` (целевой провайдер: Groq), DEV Deploy получил блокирующий sanity-check на домен.
+- v2.7: Ops: added HANDOVER_PROMPT + docs/ops runbooks/templates + PR template + daily checkpoints.
 
 ## Как переключить LLM провайдера (через env)
 
