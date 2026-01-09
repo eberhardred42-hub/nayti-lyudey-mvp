@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { UserAuthHeader } from "@/components/UserAuthHeader";
-import { getUserToken } from "@/lib/userSession";
+import { clearUserSession, getUserToken } from "@/lib/userSession";
 
 function getErrorMessage(e: unknown, fallback: string) {
   if (e instanceof Error) return e.message || fallback;
@@ -83,16 +83,25 @@ export default function LibraryPage() {
     return { Authorization: token.toLowerCase().startsWith("bearer ") ? token : `Bearer ${token}` };
   }, [token]);
 
+  async function fetchAuthSafe(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const r = await fetch(input, init);
+    if (r.status === 401 || r.status === 403) {
+      clearUserSession();
+      setToken(null);
+    }
+    return r;
+  }
+
   useEffect(() => {
     let cancelled = false;
     async function load() {
       setLoading(true);
       setError(null);
       try {
-        const r = await fetch("/api/me/files", {
+        const r = await fetchAuthSafe("/api/me/files", {
           headers: authHeaders || undefined,
         });
-        const data = await r.json();
+        const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки");
         if (!cancelled) {
           setFiles(data.files || []);
@@ -120,10 +129,10 @@ export default function LibraryPage() {
       setPackLoading(true);
       setPackError(null);
       try {
-        const r = await fetch("/api/me/packs", {
+        const r = await fetchAuthSafe("/api/me/packs", {
           headers: authHeaders || undefined,
         });
-        const data = await r.json();
+        const data = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки паков");
         const nextPacks: PackItem[] = data.packs || [];
         if (!cancelled) {
@@ -155,10 +164,10 @@ export default function LibraryPage() {
     setPackLoading(true);
     setPackError(null);
     try {
-      const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/documents`, {
+      const r = await fetchAuthSafe(`/api/packs/${encodeURIComponent(packId)}/documents`, {
         headers: authHeaders,
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data?.detail || "Ошибка загрузки статусов");
       setPackDocs(data.documents || []);
       sendClientEvent("ui_render_status_opened", { pack_id: packId, docs_count: (data.documents || []).length });
@@ -185,11 +194,11 @@ export default function LibraryPage() {
     setPackLoading(true);
     setPackError(null);
     try {
-      const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render`, {
+      const r = await fetchAuthSafe(`/api/packs/${encodeURIComponent(packId)}/render`, {
         method: "POST",
         headers: authHeaders,
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data?.detail || "Ошибка запуска рендера");
       sendClientEvent("ui_render_pack_ok", { pack_id: packId, jobs_created: data.jobs_created, jobs_skipped: data.jobs_skipped });
       await refreshPackDocuments(packId);
@@ -206,11 +215,12 @@ export default function LibraryPage() {
     setPackLoading(true);
     setPackError(null);
     try {
-      const r = await fetch(`/api/packs/${encodeURIComponent(packId)}/render/${encodeURIComponent(docId)}`, {
+      const r = await fetchAuthSafe(`/api/packs/${encodeURIComponent(packId)}/render/${encodeURIComponent(docId)}`,
+        {
         method: "POST",
         headers: authHeaders || undefined,
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data?.detail || "Ошибка регенерации документа");
       sendClientEvent("ui_render_doc_regenerate_ok", { pack_id: packId, doc_id: docId, job_id: data.job_id });
       await refreshPackDocuments(packId);
@@ -225,10 +235,10 @@ export default function LibraryPage() {
   async function download(fileId: string) {
     sendClientEvent("ui_file_download_clicked", { file_id: fileId });
     try {
-      const r = await fetch(`/api/files/${fileId}/download`, {
+      const r = await fetchAuthSafe(`/api/files/${fileId}/download`, {
         headers: authHeaders || undefined,
       });
-      const data = await r.json();
+      const data = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(data?.detail || "Ошибка скачивания");
       sendClientEvent("ui_file_download_ok", { file_id: fileId });
       if (data?.url) {
