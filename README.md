@@ -14,6 +14,7 @@
 
 ## Последние изменения (кратко)
 
+- v2.11: Intro P0: детерминированный бриф ≤10 вопросов + STOP rule; UI confirm/correct; `intro_done` показывает free previews и locked docs без автогенерации.
 - v2.10: DEV Deploy: добавлен итоговый summary (локал/домен/пинг/смоук) прямо в GitHub Actions run.
 - v2.9: DEV Deploy: исправлен blocking sanity-check локального upstream (убран баг со stdin/heredoc → больше нет ложных `JSONDecodeError`).
 - v2.9: DEV Deploy: проверки теперь безопасно парсят JSON только при 200 + `application/json`, добавлена диагностика при падении локального upstream.

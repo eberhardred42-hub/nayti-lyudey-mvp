@@ -1,4 +1,3 @@
-from fastapi import FastAPI, Request, HTTPException, Response
 import json
 import time
 import os
@@ -93,6 +92,7 @@ from llm_client import (
     LLMUnavailable,
 )
 from trace import text_fingerprint, trace_artifact
+import intro_engine
 from storage.s3_client import health_s3_env, head_bucket_if_debug
 from storage.s3_client import upload_bytes, presign_get, stream_get
 
@@ -3706,55 +3706,209 @@ def chat_message(body: ChatMessage, request: Request):
         brief_state = session.get("brief_state") if isinstance(session.get("brief_state"), dict) else {}
         phase = str(session.get("phase") or "INTRO_P0").strip().upper() or "INTRO_P0"
 
+        def _intro_asked_count(bs: dict) -> int:
+            try:
+                intro = bs.get("intro") if isinstance(bs.get("intro"), dict) else {}
+                return int(intro.get("asked") or 0)
+            except Exception:
+                return 0
+
+        def _intro_reply(payload: dict) -> dict:
+            # Keep backward-compatible keys (reply/assistant_text/brief_state), but prefer new UI contract.
+            question_text = str(payload.get("question_text") or "")
+            out = {
+                "ok": True,
+                "type": payload.get("type"),
+                "progress": payload.get("progress") or {"asked": 0, "max": intro_engine.MAX_INTRO_QUESTIONS, "remaining": intro_engine.MAX_INTRO_QUESTIONS},
+                "target_field": payload.get("target_field"),
+                "question_text": question_text,
+                "propose_value": payload.get("propose_value"),
+                "ui_mode": payload.get("ui_mode"),
+                "brief_snapshot": payload.get("brief_snapshot") or {},
+                "reply": question_text,
+                "assistant_text": question_text,
+                "quick_replies": payload.get("quick_replies") or [],
+                "ready_to_search": bool(payload.get("ready_to_search")),
+                "missing_fields": payload.get("missing_fields") or [],
+                "incomplete_fields": payload.get("incomplete_fields") or [],
+                "brief_state": brief_state,
+                "documents_ready": False,
+                "documents": [],
+            }
+            # intro_done carries docs payload for UI.
+            if out.get("type") == "intro_done":
+                out["next_action"] = "show_documents"
+            return out
+
+        def _intro_free_and_locked_docs(bs: dict) -> tuple[list[dict], list[dict]]:
+            # Product rule: show 2–3 free previews, rest locked (150₽), and do NOT auto-generate.
+            catalog = _load_documents_catalog()
+            items = [it for it in (catalog or []) if isinstance(it, dict)]
+            items.sort(key=lambda x: int((x or {}).get("sort_order") or 0))
+            free_items = items[:3]
+            locked_items = items[3:]
+
+            snap = intro_engine.brief_snapshot_p0(bs)
+            free_docs: list[dict] = []
+            for it in free_items:
+                did = str((it or {}).get("id") or "").strip()
+                title = str((it or {}).get("title") or did)
+                if not did:
+                    continue
+                md = "".join(
+                    [
+                        f"# {title}\n\n",
+                        "## P0 бриф (черновик)\n",
+                        f"- Роль: {snap.get('role_title') or ''}\n",
+                        f"- Уровень: {snap.get('level') or ''}\n",
+                        f"- Локация: {snap.get('location') or ''}\n",
+                        f"- Формат: {snap.get('work_format') or ''}\n",
+                        f"- Бюджет: {snap.get('salary_range') or ''}\n",
+                        f"- Срочность: {snap.get('urgency') or ''}\n",
+                        "\n_Это превью. PDF/платные документы не генерируются до выбора/оплаты._\n",
+                    ]
+                )
+                free_docs.append({"id": did, "title": title, "markdown": md})
+
+            locked_docs: list[dict] = []
+            for it in locked_items:
+                did = str((it or {}).get("id") or "").strip()
+                if not did:
+                    continue
+                locked_docs.append(
+                    {
+                        "id": did,
+                        "title": str((it or {}).get("title") or did),
+                        "description": str((it or {}).get("description") or ""),
+                        "price_rub": 150,
+                        "locked": True,
+                    }
+                )
+            return free_docs, locked_docs
+
+        def _intro_llm_extract(field_name: str, user_text: str, bs: dict, pq: str):
+            # Returns: (brief_patch, propose_value, ui_mode)
+            system = (
+                "Ты помощник, который извлекает значение одного поля брифа. "
+                "Верни строго JSON. Не выбирай следующий вопрос."
+            )
+            user = {
+                "task": "extract_field_value",
+                "field": field_name,
+                "profession_query": pq,
+                "current_brief_state": {k: bs.get(k) for k in intro_engine.P0_ORDER if k in bs},
+                "user_answer": user_text,
+                "output_schema": {
+                    "value": "string|object|array|null",
+                    "confidence": "number 0..1",
+                    "normalized_text": "string|null",
+                },
+            }
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+            ]
+
+            trace_artifact(
+                session_id=sid,
+                kind="intro_llm_extract_request",
+                request_id=request_id,
+                payload_json={
+                    "field": field_name,
+                    "asked_idx": _intro_asked_count(bs),
+                    "messages": text_fingerprint(json.dumps(messages, ensure_ascii=False), limit=800),
+                },
+                meta={"flow": "intro"},
+            )
+
+            out = generate_json_messages_observable(
+                messages,
+                request_id=request_id,
+                session_id=sid,
+                fallback={"value": None, "confidence": 0.0, "normalized_text": None},
+                flow="intro_extract",
+                doc_id=field_name,
+            )
+
+            value = out.get("value")
+            conf = out.get("confidence")
+            try:
+                conf_f = float(conf)
+            except Exception:
+                conf_f = 0.0
+
+            # Build patch.
+            patch: dict = {}
+            if conf_f >= 0.6 and value is not None:
+                patch[field_name] = value
+
+            propose_value = None
+            ui_mode = "free_text"
+            if conf_f >= 0.85 and isinstance(value, str) and 0 < len(value.strip()) <= 80 and field_name not in {"tasks_90d", "must_have"}:
+                propose_value = value.strip()
+                ui_mode = "confirm_correct"
+
+            trace_artifact(
+                session_id=sid,
+                kind="intro_llm_extract_response",
+                request_id=request_id,
+                payload_json={
+                    "field": field_name,
+                    "asked_idx": _intro_asked_count(bs),
+                    "ok": True,
+                    "confidence": conf_f,
+                    "value": (value if isinstance(value, (str, int, float, bool, dict, list)) else str(value)) if value is not None else None,
+                },
+                meta={"flow": "intro"},
+            )
+
+            return patch, propose_value, ui_mode
+
         # STOP rule: once DONE or ready_to_search is set, never call LLM and never ask questions.
         if phase == "DONE" or bool(brief_state.get("ready_to_search")):
             trace_artifact(
                 session_id=sid,
                 kind="intro_stop",
                 request_id=request_id,
-                payload_json={"reason": "already_done"},
+                payload_json={"reason": "already_done", "asked_total": _intro_asked_count(brief_state)},
                 meta={"flow": "intro", "phase": phase},
             )
+            asked = _intro_asked_count(brief_state)
             return {
                 "ok": True,
                 "type": "intro_done",
                 "reply": "Готово. Можно переходить к документам.",
                 "assistant_text": "Готово. Можно переходить к документам.",
+                "progress": intro_engine.progress_dict(asked),
+                "target_field": None,
+                "question_text": "",
+                "propose_value": None,
+                "ui_mode": "free_text",
+                "brief_snapshot": intro_engine.brief_snapshot_p0(brief_state),
                 "quick_replies": [],
                 "brief_patch": {},
                 "brief_state": brief_state,
                 "ready_to_search": True,
                 "next_action": "show_documents",
                 "missing_fields": [],
+                "incomplete_fields": brief_state.get("incomplete_fields") or [],
                 "documents_ready": False,
                 "documents": [],
             }
 
-        # Ensure stable structure.
-        if not isinstance(brief_state, dict):
-            brief_state = {}
-        intro_meta = brief_state.get("intro") if isinstance(brief_state.get("intro"), dict) else {}
-
         # Start flow.
         if msg_type in {"intro_start", "intro"}:
-            missing, chosen = _intro_choose_next_field(brief_state)
-            if not chosen:
-                chosen = "source_mode"
-                missing = P0_ORDER[:]
-            q, qrs = _intro_question_for_field(chosen)
-            intro_meta["current_field"] = chosen
-            brief_state["intro"] = intro_meta
-
+            brief_state, payload = intro_engine.intro_start(brief_state)
+            asked_idx = int(((payload.get("progress") or {}).get("asked") or 0))
             trace_artifact(
                 session_id=sid,
-                kind="intro_missing_fields",
+                kind="intro_question_shown",
                 request_id=request_id,
-                payload_json={"missing": missing, "chosen_field": chosen},
-                meta={"flow": "intro", "phase": "INTRO_P0"},
+                payload_json={"field": payload.get("target_field"), "asked_idx": asked_idx},
+                meta={"flow": "intro"},
             )
-
             try:
-                add_message(sid, "assistant", q, request_id=request_id)
+                add_message(sid, "assistant", str(payload.get("question_text") or ""), request_id=request_id)
                 update_session(
                     sid,
                     chat_state="intro",
@@ -3764,19 +3918,9 @@ def chat_message(body: ChatMessage, request: Request):
                 )
             except Exception:
                 pass
-            return {
-                "ok": True,
-                "type": "intro_question",
-                "reply": q,
-                "assistant_text": q,
-                "quick_replies": qrs,
-                "brief_patch": {},
-                "brief_state": brief_state,
-                "ready_to_search": False,
-                "missing_fields": missing,
-                "documents_ready": False,
-                "documents": [],
-            }
+            resp = _intro_reply(payload)
+            resp["brief_state"] = brief_state
+            return resp
 
         # intro_message
         if text:
@@ -3785,23 +3929,57 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
-        current_field = str(intro_meta.get("current_field") or "").strip()
-        brief_patch: dict = {}
-        if current_field and text:
-            brief_patch = _intro_apply_answer_to_field(brief_state, current_field, text, profession_query)
-            if brief_patch:
-                brief_state = _deep_merge_dict(brief_state, brief_patch)
+        def _llm_extract_wrapper(field_name: str, user_text: str, bs: dict, pq: str):
+            try:
+                return _intro_llm_extract(field_name, user_text, bs, pq)
+            except LLMUnavailable as e:
+                trace_artifact(
+                    session_id=sid,
+                    kind="intro_llm_extract_response",
+                    request_id=request_id,
+                    payload_json={"field": field_name, "ok": False, "error": str(e), "reason": getattr(e, "reason", None)},
+                    meta={"flow": "intro"},
+                )
+                # LLM is a blocker when required.
+                raise HTTPException(status_code=503, detail=f"LLM unavailable: {getattr(e, 'reason', 'unknown')}")
+            except Exception as e:
+                trace_artifact(
+                    session_id=sid,
+                    kind="intro_llm_extract_response",
+                    request_id=request_id,
+                    payload_json={"field": field_name, "ok": False, "error": str(e)},
+                    meta={"flow": "intro"},
+                )
+                # Runtime failure: allow heuristic fallback.
+                return {}, None, "free_text"
 
-        # Next step: recompute missing and deterministically choose next.
-        missing, chosen = _intro_choose_next_field(brief_state)
-        if not chosen:
-            # DONE
-            brief_state["ready_to_search"] = True
+        brief_state, payload = intro_engine.intro_message(
+            brief_state,
+            text,
+            profession_query,
+            _llm_extract_wrapper,
+        )
+
+        asked_idx = int(((payload.get("progress") or {}).get("asked") or 0))
+        if payload.get("type") == "intro_question":
+            trace_artifact(
+                session_id=sid,
+                kind="intro_question_shown",
+                request_id=request_id,
+                payload_json={"field": payload.get("target_field"), "asked_idx": asked_idx},
+                meta={"flow": "intro"},
+            )
+
+        if payload.get("type") == "intro_done":
+            incomplete = payload.get("incomplete_fields") or []
             trace_artifact(
                 session_id=sid,
                 kind="intro_done",
                 request_id=request_id,
-                payload_json={},
+                payload_json={
+                    "asked_total": asked_idx,
+                    "incomplete_fields_count": len(incomplete) if isinstance(incomplete, list) else None,
+                },
                 meta={"flow": "intro", "phase": "DONE"},
             )
 
@@ -3823,78 +4001,34 @@ def chat_message(body: ChatMessage, request: Request):
                 except Exception:
                     pass
 
-            try:
-                update_session(
-                    sid,
-                    chat_state="intro",
-                    phase="DONE",
-                    brief_state=brief_state,
-                    request_id=request_id,
-                )
-            except Exception:
-                pass
-
-            assistant_text = "Готово. Можно переходить к документам."
-            try:
-                add_message(sid, "assistant", assistant_text, request_id=request_id)
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "type": "intro_done",
-                "reply": assistant_text,
-                "assistant_text": assistant_text,
-                "quick_replies": [],
-                "brief_patch": brief_patch,
-                "brief_state": brief_state,
-                "ready_to_search": True,
-                "next_action": "show_documents",
-                "missing_fields": [],
-                "documents_ready": False,
-                "documents": [],
-            }
-
-        # Ask next missing field.
-        q, qrs = _intro_question_for_field(chosen)
-        intro_meta["current_field"] = chosen
-        brief_state["intro"] = intro_meta
-
-        trace_artifact(
-            session_id=sid,
-            kind="intro_missing_fields",
-            request_id=request_id,
-            payload_json={"missing": missing, "chosen_field": chosen},
-            meta={"flow": "intro", "phase": "INTRO_P0"},
-        )
-
         try:
             update_session(
                 sid,
                 chat_state="intro",
-                phase="INTRO_P0",
+                phase=("DONE" if payload.get("type") == "intro_done" else "INTRO_P0"),
                 brief_state=brief_state,
                 request_id=request_id,
             )
         except Exception:
             pass
+
+        assistant_text = "Готово. Бриф готов." if payload.get("type") == "intro_done" else str(payload.get("question_text") or "")
         try:
-            add_message(sid, "assistant", q, request_id=request_id)
+            add_message(sid, "assistant", assistant_text, request_id=request_id)
         except Exception:
             pass
 
-        return {
-            "ok": True,
-            "type": "intro_question",
-            "reply": q,
-            "assistant_text": q,
-            "quick_replies": qrs[:6],
-            "brief_patch": brief_patch,
-            "brief_state": brief_state,
-            "ready_to_search": False,
-            "missing_fields": missing,
-            "documents_ready": False,
-            "documents": [],
-        }
+        resp = _intro_reply(payload)
+        resp["brief_state"] = brief_state
+
+        if resp.get("type") == "intro_done":
+            free_docs, locked_docs = _intro_free_and_locked_docs(brief_state)
+            resp["reply"] = "Бриф готов. Ниже — бесплатные результаты и платные документы (locked)."
+            resp["assistant_text"] = resp["reply"]
+            resp["question_text"] = ""
+            resp["free_documents"] = free_docs
+            resp["locked_documents"] = locked_docs
+        return resp
 
     if msg_type == "start":
         session["state"] = "awaiting_flow"

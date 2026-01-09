@@ -102,6 +102,16 @@
 - Зачем: чтобы проджект/QA могли быстро понять состояние стенда без просмотра всех шагов.
 - Приёмка: в каждом run DEV Deploy внизу виден summary с перечисленными статусами.
 
+### v2.11 — Intro P0: детерминированный бриф ≤10 + paywall UI
+- Фокус: полный DEV user path «ввод роли → бриф ≤10 → free previews + locked docs», без автогенерации до оплаты.
+- Что сделали:
+	- новый движок интро [api/intro_engine.py](../../api/intro_engine.py): детерминированный порядок полей, лимит 10 вопросов, confirm/correct, STOP rule (после `ready_to_search=true` никаких вопросов и LLM вызовов);
+	- /api/chat/message возвращает контракт для UI: `type`, `progress`, `target_field`, `question_text`, `propose_value`, `ui_mode`, `brief_snapshot`; на `intro_done` — `free_documents` и `locked_documents` (150₽) без генерации;
+	- frontend: новый UX брифа и экран `intro_done` (free markdown previews + locked карточки);
+	- добавлены unit-тесты интро-движка и ручной smoke workflow для DEV.
+- Зачем: сделать флоу предсказуемым, проверяемым и соответствующим правилу «не генерим до оплаты».
+- Приёмка: чекпоинты **A** (LLM ping) и **B** (brief ≤10 → `ready_to_search=true`) + ручная проверка отсутствия автогенерации.
+
 ## Шаблон для новой версии
 
 ### vX.Y — <короткий фокус>

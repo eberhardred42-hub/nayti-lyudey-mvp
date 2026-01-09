@@ -1,0 +1,108 @@
+name: Intro Flow Smoke (DEV)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base URL for DEV (no trailing slash), e.g. https://dev.naitilyudei.ru"
+        required: false
+        default: "https://dev.naitilyudei.ru"
+      profession_query:
+        description: "Profession query"
+        required: false
+        default: "Head of Sales"
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Run intro flow (max 10 questions)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="${{ inputs.base_url }}"
+          pq="${{ inputs.profession_query }}"
+
+          api="$base_url/api"
+          echo "Base URL: $base_url"
+          echo "API: $api"
+
+          user_id="gh-smoke-$(date +%s)-$RANDOM"
+          echo "X-User-Id: $user_id"
+
+          echo "== 1) POST /sessions =="
+          session_json=$(curl -fsS -4 -X POST "$api/sessions" \
+            -H 'Content-Type: application/json' \
+            -H "X-User-Id: $user_id" \
+            -d "{\"profession_query\": \"$pq\"}")
+
+          sid=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('session_id','') or '')
+PY
+<<<"$session_json")
+
+          if [ -z "$sid" ]; then
+            echo "ERROR: session_id is empty"
+            echo "$session_json" | head -c 4000
+            exit 1
+          fi
+          echo "session_id=$sid"
+
+          echo "== 2) POST /chat/message (intro_start) =="
+          start_json=$(curl -fsS -4 -X POST "$api/chat/message" \
+            -H 'Content-Type: application/json' \
+            -H "X-User-Id: $user_id" \
+            -d "{\"session_id\": \"$sid\", \"type\": \"intro_start\"}")
+
+          echo "$start_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+
+          echo "== 3) Answer up to 12 turns until intro_done =="
+          done=0
+          for i in $(seq 1 12); do
+            answer="ответ $i"
+            msg_json=$(curl -fsS -4 -X POST "$api/chat/message" \
+              -H 'Content-Type: application/json' \
+              -H "X-User-Id: $user_id" \
+              -d "{\"session_id\": \"$sid\", \"type\": \"intro_message\", \"text\": \"$answer\"}")
+
+            msg_type=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('type','') or '')
+PY
+<<<"$msg_json")
+
+            asked=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+prog=obj.get('progress') or {}
+print(prog.get('asked',''))
+PY
+<<<"$msg_json")
+
+            echo "turn=$i type=$msg_type asked=$asked"
+
+            if [ "$msg_type" = "intro_done" ]; then
+              echo "intro_done reached"
+              echo "$msg_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+              done=1
+              break
+            fi
+          done
+
+          if [ "$done" != "1" ]; then
+            echo "ERROR: intro_done not reached within 12 turns"
+            exit 1
+          fi
+
+      - name: POST /api/health/llm/ping (DEV)
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ inputs.base_url }}/api/health/llm/ping"
+          echo "POST $url"
+          curl -fsS -4 -X POST "$url" \
+            | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'

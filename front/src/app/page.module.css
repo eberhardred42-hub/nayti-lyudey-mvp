@@ -107,6 +107,30 @@
   z-index: 10;
 }
 
+.topQueryRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.topRightMeta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.progressBadge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border: 1px solid #000;
+  border-radius: 9999px;
+  font-size: 12px;
+  background: #fff;
+}
+
 .topQueryLabel {
   font-size: 12px;
   color: #666;
@@ -186,6 +210,27 @@
   border-top: 1px solid #ddd;
   padding: 16px 24px;
   background: #fff;
+}
+
+.secondaryBtn {
+  padding: 8px 16px;
+  font-size: 14px;
+  border: 1px solid #ccc;
+  background: #fff;
+  color: #000;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.secondaryBtn:hover {
+  border-color: #000;
+}
+
+.inlineError {
+  margin-top: 10px;
+  color: #d32f2f;
+  font-size: 12px;
+  max-width: 640px;
 }
 
 .composerRow {
@@ -311,4 +356,149 @@
 .fullPackageBtn:hover {
   background: #000;
   color: #fff;
+}
+
+.confirmBox {
+  border-top: 1px solid #ddd;
+  padding-top: 12px;
+}
+
+.confirmText {
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+
+.confirmActions {
+  display: flex;
+  gap: 10px;
+}
+
+.doneArea {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 2px solid #000;
+}
+
+.doneTitle {
+  font-size: 20px;
+  font-weight: 500;
+  margin: 0 0 12px 0;
+}
+
+.briefBox {
+  padding: 12px 0;
+  border-top: 1px solid #ddd;
+}
+
+.briefTitle {
+  font-size: 14px;
+  margin-bottom: 10px;
+  color: #333;
+}
+
+.briefGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.briefRow {
+  display: grid;
+  grid-template-columns: 160px 1fr;
+  gap: 12px;
+  border-bottom: 1px solid #eee;
+  padding: 8px 0;
+}
+
+.briefKey {
+  font-size: 12px;
+  color: #666;
+}
+
+.briefVal {
+  margin: 0;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+}
+
+.docsSection {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid #ddd;
+}
+
+.docsTitle {
+  font-size: 16px;
+  font-weight: 500;
+  margin: 0 0 10px 0;
+}
+
+.docsList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.docCard {
+  border: 1px solid #eee;
+  padding: 10px 12px;
+}
+
+.docSummary {
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.docMarkdown {
+  margin: 10px 0 0 0;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.lockedGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.lockedCard {
+  border: 1px solid #000;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 140px;
+}
+
+.lockedTitle {
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 6px;
+}
+
+.lockedDesc {
+  font-size: 12px;
+  color: #444;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+
+.lockedFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.lockedPrice {
+  font-size: 14px;
+}
+
+.lockedHint {
+  margin-top: 10px;
+  font-size: 12px;
+  color: #666;
 }
