@@ -78,6 +78,7 @@ from db import (
 from db import (
     get_document_access_map,
     get_document_metadata_map,
+    get_artifact_by_session_kind,
     upsert_document_access,
     upsert_document_metadata,
 )
@@ -2389,6 +2390,137 @@ class IntroDialogueResponse(BaseModel):
     missing_fields: list[str] = []
 
 
+P0_ORDER = [
+    "source_mode",
+    "problem",
+    "hiring_goal",
+    "role_title",
+    "level",
+    "location",
+    "work_format",
+    "salary_range",
+    "urgency",
+    "tasks_90d",
+    "must_have",
+]
+
+
+def _p0_field_present(brief_state: dict, field_name: str) -> bool:
+    bs = brief_state if isinstance(brief_state, dict) else {}
+    v = bs.get(field_name)
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, list):
+        return any(bool(str(x).strip()) for x in v)
+    if isinstance(v, dict):
+        return len(v) > 0
+    if isinstance(v, bool):
+        return True
+    return True
+
+
+def _intro_p0_missing_fields(brief_state: dict) -> list[str]:
+    missing: list[str] = []
+    for field in P0_ORDER:
+        if not _p0_field_present(brief_state, field):
+            missing.append(field)
+    return missing
+
+
+def _intro_choose_next_field(brief_state: dict) -> tuple[list[str], str | None]:
+    missing = _intro_p0_missing_fields(brief_state)
+    chosen = missing[0] if missing else None
+    return missing, chosen
+
+
+def _intro_question_for_field(field_name: str) -> tuple[str, list[str]]:
+    if field_name == "source_mode":
+        return (
+            "Как удобнее дать вводные?",
+            ["A — текст вакансии", "B — своими словами", "C — вопросы", "D — пропустить"],
+        )
+    if field_name == "problem":
+        return ("Какая проблема/контекст у найма? (1–3 фразы)", [])
+    if field_name == "hiring_goal":
+        return ("Какая цель найма? Что должно измениться после выхода человека?", [])
+    if field_name == "role_title":
+        return ("Как называется роль (должность)?", [])
+    if field_name == "level":
+        return ("Какой уровень нужен (jun/mid/senior/lead)?", ["Junior", "Middle", "Senior", "Lead"])
+    if field_name == "location":
+        return ("Локация: город/регион?", ["Москва", "СПб", "Удалённо", "Любой город"])
+    if field_name == "work_format":
+        return ("Формат работы: офис/гибрид/удалёнка?", ["Офис", "Гибрид", "Удалённо"])
+    if field_name == "salary_range":
+        return ("Бюджет/вилка по оплате?", ["Есть вилка", "Обсудим", "Не знаю"])
+    if field_name == "urgency":
+        return ("Срочность: когда нужен человек?", ["Срочно", "1–2 месяца", "3+ месяца"])
+    if field_name == "tasks_90d":
+        return ("Какие 3–5 задач на первые 90 дней? (списком)", [])
+    if field_name == "must_have":
+        return ("Must-have требования: 3–7 пунктов? (списком)", [])
+    return ("Уточни, пожалуйста, вводные.", [])
+
+
+def _intro_apply_answer_to_field(brief_state: dict, field_name: str, text: str, profession_query: str) -> dict:
+    patch: dict = {}
+    t = (text or "").strip()
+    if not t:
+        return patch
+
+    if field_name == "source_mode":
+        mode = _intro_detect_mode(t)
+        if mode == "A":
+            patch[field_name] = "vacancy_text"
+        elif mode == "B":
+            patch[field_name] = "free_text"
+        elif mode == "C":
+            patch[field_name] = "questions"
+        elif mode == "D":
+            patch[field_name] = "skip"
+        else:
+            patch[field_name] = t[:80]
+        return patch
+
+    if field_name == "work_format":
+        wf = parse_work_format(t)
+        patch[field_name] = wf or t[:120]
+        return patch
+
+    if field_name == "location":
+        city, region = parse_location(t)
+        patch[field_name] = city or region or t[:120]
+        return patch
+
+    if field_name == "salary_range":
+        s_min, s_max, s_comment = parse_salary(t)
+        if s_min is not None or s_max is not None:
+            patch[field_name] = {"min": s_min, "max": s_max}
+        else:
+            patch[field_name] = (s_comment or t)[:200]
+        return patch
+
+    if field_name in {"tasks_90d", "must_have"}:
+        lines = [ln.strip() for ln in t.split("\n") if ln.strip()]
+        items: list[str] = []
+        for ln in lines:
+            clean = re.sub(r"^[\-•*]\s*", "", ln)
+            clean = re.sub(r"^\d+[\.)]\s*", "", clean)
+            if clean:
+                items.append(clean[:200])
+        patch[field_name] = items[:10] if items else [t[:200]]
+        return patch
+
+    if field_name == "role_title":
+        patch[field_name] = t[:120] or (profession_query or "")[:120]
+        return patch
+
+    patch[field_name] = t[:500]
+    return patch
+
+
 def _intro_mode_question() -> tuple[str, list[str]]:
     text = (
         "Как удобнее дать вводные?\n"
@@ -3320,37 +3452,70 @@ def chat_message(body: ChatMessage, request: Request):
                 pass
 
         profession_query = str(session.get("profession_query", "") or "")
-        kb = session.get("vacancy_kb") if isinstance(session.get("vacancy_kb"), dict) else make_empty_vacancy_kb()
-        try:
-            update_meta(kb)
-        except Exception:
-            pass
-
         brief_state = session.get("brief_state") if isinstance(session.get("brief_state"), dict) else {}
+        phase = str(session.get("phase") or "INTRO_P0").strip().upper() or "INTRO_P0"
+
+        # STOP rule: once DONE or ready_to_search is set, never call LLM and never ask questions.
+        if phase == "DONE" or bool(brief_state.get("ready_to_search")):
+            trace_artifact(
+                session_id=sid,
+                kind="intro_stop",
+                request_id=request_id,
+                payload_json={"reason": "already_done"},
+                meta={"flow": "intro", "phase": phase},
+            )
+            return {
+                "ok": True,
+                "type": "intro_done",
+                "reply": "Готово. Можно переходить к документам.",
+                "assistant_text": "Готово. Можно переходить к документам.",
+                "quick_replies": [],
+                "brief_patch": {},
+                "brief_state": brief_state,
+                "ready_to_search": True,
+                "next_action": "show_documents",
+                "missing_fields": [],
+                "documents_ready": False,
+                "documents": [],
+            }
+
+        # Ensure stable structure.
+        if not isinstance(brief_state, dict):
+            brief_state = {}
         intro_meta = brief_state.get("intro") if isinstance(brief_state.get("intro"), dict) else {}
 
-        phase = str(session.get("phase") or "INTRO_MODE").strip().upper() or "INTRO_MODE"
-        missing = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
-        missing = [str(x) for x in (missing or []) if str(x).strip()]
-
+        # Start flow.
         if msg_type in {"intro_start", "intro"}:
-            q, qrs = _intro_mode_question()
-            brief_state["intro"] = {"mode": None, "round": 0, "state": "MODE"}
-            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
+            missing, chosen = _intro_choose_next_field(brief_state)
+            if not chosen:
+                chosen = "source_mode"
+                missing = P0_ORDER[:]
+            q, qrs = _intro_question_for_field(chosen)
+            intro_meta["current_field"] = chosen
+            brief_state["intro"] = intro_meta
+
+            trace_artifact(
+                session_id=sid,
+                kind="intro_missing_fields",
+                request_id=request_id,
+                payload_json={"missing": missing, "chosen_field": chosen},
+                meta={"flow": "intro", "phase": "INTRO_P0"},
+            )
+
             try:
                 add_message(sid, "assistant", q, request_id=request_id)
                 update_session(
                     sid,
                     chat_state="intro",
-                    phase="INTRO_MODE",
+                    phase="INTRO_P0",
                     brief_state=brief_state,
-                    vacancy_kb=kb,
                     request_id=request_id,
                 )
             except Exception:
                 pass
             return {
                 "ok": True,
+                "type": "intro_question",
                 "reply": q,
                 "assistant_text": q,
                 "quick_replies": qrs,
@@ -3369,312 +3534,116 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
-            # Persist intro user input (truncated + hash only)
-            fp = text_fingerprint(text, limit=1000)
+        current_field = str(intro_meta.get("current_field") or "").strip()
+        brief_patch: dict = {}
+        if current_field and text:
+            brief_patch = _intro_apply_answer_to_field(brief_state, current_field, text, profession_query)
+            if brief_patch:
+                brief_state = _deep_merge_dict(brief_state, brief_patch)
+
+        # Next step: recompute missing and deterministically choose next.
+        missing, chosen = _intro_choose_next_field(brief_state)
+        if not chosen:
+            # DONE
+            brief_state["ready_to_search"] = True
             trace_artifact(
                 session_id=sid,
-                kind="intro_user_input",
+                kind="intro_done",
                 request_id=request_id,
-                payload_json={
-                    "text_preview": fp.get("preview"),
-                    "text_length": fp.get("full_length"),
-                    "text_sha256": fp.get("sha256"),
-                    "truncated": fp.get("truncated"),
-                },
-                meta={"flow": "intro", "phase": phase},
+                payload_json={},
+                meta={"flow": "intro", "phase": "DONE"},
             )
 
-        low = (text or "").strip().lower()
-
-        if phase == "INTRO_MODE":
-            mode = _intro_detect_mode(text)
-            if not mode:
-                q, qrs = _intro_mode_question()
-                assistant_text = "Не понял вариант. Выбери A/B/C/D.\n\n" + q
-                quick = qrs
-                next_phase = "INTRO_MODE"
-            else:
-                intro_meta = {"mode": mode, "round": 0, "state": "INPUT"}
-                brief_state["intro"] = intro_meta
-                if mode == "A":
-                    assistant_text = "Ок. Вставь, пожалуйста, текст вакансии целиком (можно без правок)."
-                    quick = []
-                    next_phase = "INTRO_VACANCY_TEXT"
-                elif mode == "B":
-                    assistant_text = "Ок. Опиши в 2–4 фразы: кого ищем, ключевые задачи, локация/формат, бюджет (если есть)."
-                    quick = ["Удалённо", "Офис", "Гибрид", "Поехали"]
-                    next_phase = "INTRO_FREE_TEXT"
-                elif mode == "C":
-                    assistant_text, quick, _qs = build_clarification_prompt(
-                        sid, kb, profession_query, last_user_message=text, request=request
-                    )
-                    if "Поехали" not in quick:
-                        quick = (quick or []) + ["Поехали"]
-                    next_phase = "INTRO_CLARIFY"
-                else:
-                    # D: minimal defaults
-                    try:
-                        if isinstance(kb.get("role"), dict) and kb["role"].get("role_title") is None:
-                            kb["role"]["role_title"] = (profession_query or "Специалист")[:120]
-                        if isinstance(kb.get("employment"), dict) and kb["employment"].get("employment_type") is None:
-                            kb["employment"]["employment_type"] = "full-time"
-                        if isinstance(kb.get("company"), dict) and kb["company"].get("work_format") is None:
-                            kb["company"]["work_format"] = "remote"
-                        if isinstance(kb.get("company"), dict) and kb["company"].get("company_location_region") is None:
-                            kb["company"]["company_location_region"] = "любой"
-                        if isinstance(kb.get("compensation"), dict) and kb["compensation"].get("salary_comment") is None:
-                            kb["compensation"]["salary_comment"] = "обсудим"
-                        update_meta(kb)
-                    except Exception:
-                        pass
-                    assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
-                    quick = ["Да, всё верно", "Исправить"]
-                    next_phase = "INTRO_CONFIRM"
-
-            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
-            # Persist intro state snapshot for /admin/logs
+            # Idempotent intro_brief artifact (max 1 per session).
             try:
-                missing_now = _intro_missing_fields(brief_state)
+                existing = get_artifact_by_session_kind(session_id=sid, kind="intro_brief", request_id=request_id)
             except Exception:
-                missing_now = missing
-            trace_artifact(
-                session_id=sid,
-                kind="intro_state",
-                request_id=request_id,
-                payload_json={"brief_state": brief_state, "missing_fields": missing_now},
-                meta={"flow": "intro", "phase": next_phase},
-            )
-            try:
-                update_session(
-                    sid,
-                    chat_state="intro",
-                    phase=next_phase,
-                    brief_state=brief_state,
-                    vacancy_kb=kb,
-                    request_id=request_id,
-                )
-            except Exception:
-                pass
-            try:
-                add_message(sid, "assistant", assistant_text, request_id=request_id)
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "reply": assistant_text,
-                "assistant_text": assistant_text,
-                "quick_replies": quick[:6] if isinstance(quick, list) else [],
-                "brief_patch": {},
-                "brief_state": brief_state,
-                "ready_to_search": False,
-                "missing_fields": missing,
-                "documents_ready": False,
-                "documents": [],
-            }
-
-        if phase in {"INTRO_VACANCY_TEXT", "INTRO_FREE_TEXT", "INTRO_CLARIFY", "INTRO_CORRECT"}:
-            if text:
-                _intro_apply_text_to_kb(kb, text=text, profession_query=profession_query)
-                # Keep the free-form goal if user provided a short statement.
-                if phase in {"INTRO_FREE_TEXT", "INTRO_CLARIFY"}:
-                    if not str(brief_state.get("goal") or "").strip() and len(text.strip()) <= 220:
-                        brief_state["goal"] = text.strip()
-
-            intro_meta = brief_state.get("intro") if isinstance(brief_state.get("intro"), dict) else {}
-            try:
-                intro_meta["round"] = int(intro_meta.get("round") or 0) + 1
-            except Exception:
-                intro_meta["round"] = 1
-            brief_state["intro"] = intro_meta
-
-            missing = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
-            missing = [str(x) for x in (missing or []) if str(x).strip()]
-
-            force_ready = False
-            if any(k in low for k in ["поехали", "хватит", "достаточно"]):
-                force_ready = True
-
-            rounds = int(intro_meta.get("round") or 0)
-            if (not missing) or (len(missing) <= 2) or (rounds >= 2) or force_ready:
-                assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
-                quick = ["Да, всё верно", "Исправить"]
-                next_phase = "INTRO_CONFIRM"
-            else:
-                assistant_text, quick, _qs = build_clarification_prompt(
-                    sid, kb, profession_query, last_user_message=text, request=request
-                )
-                if "Поехали" not in (quick or []):
-                    quick = (quick or []) + ["Поехали"]
-                next_phase = "INTRO_CLARIFY"
-
-            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
-            trace_artifact(
-                session_id=sid,
-                kind="intro_state",
-                request_id=request_id,
-                payload_json={"brief_state": brief_state, "missing_fields": missing},
-                meta={"flow": "intro", "phase": next_phase},
-            )
-            try:
-                update_session(
-                    sid,
-                    chat_state="intro",
-                    phase=next_phase,
-                    brief_state=brief_state,
-                    vacancy_kb=kb,
-                    request_id=request_id,
-                )
-            except Exception:
-                pass
-            try:
-                add_message(sid, "assistant", assistant_text, request_id=request_id)
-            except Exception:
-                pass
-            return {
-                "ok": True,
-                "reply": assistant_text,
-                "assistant_text": assistant_text,
-                "quick_replies": quick[:6] if isinstance(quick, list) else [],
-                "brief_patch": {},
-                "brief_state": brief_state,
-                "ready_to_search": False,
-                "missing_fields": missing,
-                "documents_ready": False,
-                "documents": [],
-            }
-
-        if phase == "INTRO_CONFIRM":
-            # Confirm or ask to correct.
-            is_yes = low.startswith("да") or low in {"ок", "верно", "всё верно", "да, всё верно"}
-            wants_fix = "исправ" in low or "поправ" in low
-
-            if wants_fix:
-                assistant_text = "Ок. Что поправить? Напиши одной фразой (например: 'локация — Москва, офис')."
-                quick = []
-                next_phase = "INTRO_CORRECT"
+                existing = None
+            if not existing:
                 try:
-                    update_session(
-                        sid,
-                        chat_state="intro",
-                        phase=next_phase,
-                        brief_state=brief_state,
-                        vacancy_kb=kb,
+                    create_artifact(
+                        session_id=sid,
+                        kind="intro_brief",
+                        format="json",
+                        payload_json={"title": "Бриф поиска", "brief_state": brief_state},
+                        meta={"title": "Бриф поиска"},
                         request_id=request_id,
                     )
                 except Exception:
                     pass
-                try:
-                    add_message(sid, "assistant", assistant_text, request_id=request_id)
-                except Exception:
-                    pass
-                return {
-                    "ok": True,
-                    "reply": assistant_text,
-                    "assistant_text": assistant_text,
-                    "quick_replies": quick,
-                    "brief_patch": {},
-                    "brief_state": brief_state,
-                    "ready_to_search": False,
-                    "missing_fields": missing,
-                    "documents_ready": False,
-                    "documents": [],
-                }
 
-            if not is_yes and text:
-                # Treat as additional info; go back to clarify.
-                _intro_apply_text_to_kb(kb, text=text, profession_query=profession_query)
-                try:
-                    update_meta(kb)
-                except Exception:
-                    pass
-                brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
-                assistant_text = _intro_summary_text(profession_query, kb) + "\n\nВсе верно?"
-                quick = ["Да, всё верно", "Исправить"]
-                try:
-                    update_session(
-                        sid,
-                        chat_state="intro",
-                        phase="INTRO_CONFIRM",
-                        brief_state=brief_state,
-                        vacancy_kb=kb,
-                        request_id=request_id,
-                    )
-                except Exception:
-                    pass
-                try:
-                    add_message(sid, "assistant", assistant_text, request_id=request_id)
-                except Exception:
-                    pass
-                missing_now = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
-                missing_now = [str(x) for x in (missing_now or []) if str(x).strip()]
-                return {
-                    "ok": True,
-                    "reply": assistant_text,
-                    "assistant_text": assistant_text,
-                    "quick_replies": quick,
-                    "brief_patch": {},
-                    "brief_state": brief_state,
-                    "ready_to_search": False,
-                    "missing_fields": missing_now,
-                    "documents_ready": False,
-                    "documents": [],
-                }
-
-            # Confirmed.
-            brief_state = _brief_state_from_kb(profession_query=profession_query, kb=kb, prev=brief_state)
-            documents = []
-            documents_ready = False
             try:
                 update_session(
                     sid,
                     chat_state="intro",
                     phase="DONE",
                     brief_state=brief_state,
-                    vacancy_kb=kb,
                     request_id=request_id,
                 )
             except Exception:
                 pass
-            try:
-                art = create_artifact(
-                    session_id=sid,
-                    kind="intro_brief",
-                    format="json",
-                    payload_json={"title": "Бриф поиска", "brief_state": brief_state},
-                    meta={"title": "Бриф поиска"},
-                    request_id=request_id,
-                )
-                documents_ready = True
-                documents = [
-                    {
-                        "id": str(art.get("id")),
-                        "kind": "intro_brief",
-                        "title": "Бриф поиска",
-                        "content": brief_state,
-                    }
-                ]
-            except Exception:
-                documents_ready = False
 
-            assistant_text = "Отлично. Запускаю подготовку документов."
+            assistant_text = "Готово. Можно переходить к документам."
             try:
                 add_message(sid, "assistant", assistant_text, request_id=request_id)
             except Exception:
                 pass
-            missing_now = (kb.get("meta") or {}).get("missing_fields") if isinstance(kb.get("meta"), dict) else []
-            missing_now = [str(x) for x in (missing_now or []) if str(x).strip()]
             return {
                 "ok": True,
+                "type": "intro_done",
                 "reply": assistant_text,
                 "assistant_text": assistant_text,
                 "quick_replies": [],
-                "brief_patch": {},
+                "brief_patch": brief_patch,
                 "brief_state": brief_state,
                 "ready_to_search": True,
-                "missing_fields": missing_now,
-                "documents_ready": documents_ready,
-                "documents": documents,
+                "next_action": "show_documents",
+                "missing_fields": [],
+                "documents_ready": False,
+                "documents": [],
             }
+
+        # Ask next missing field.
+        q, qrs = _intro_question_for_field(chosen)
+        intro_meta["current_field"] = chosen
+        brief_state["intro"] = intro_meta
+
+        trace_artifact(
+            session_id=sid,
+            kind="intro_missing_fields",
+            request_id=request_id,
+            payload_json={"missing": missing, "chosen_field": chosen},
+            meta={"flow": "intro", "phase": "INTRO_P0"},
+        )
+
+        try:
+            update_session(
+                sid,
+                chat_state="intro",
+                phase="INTRO_P0",
+                brief_state=brief_state,
+                request_id=request_id,
+            )
+        except Exception:
+            pass
+        try:
+            add_message(sid, "assistant", q, request_id=request_id)
+        except Exception:
+            pass
+
+        return {
+            "ok": True,
+            "type": "intro_question",
+            "reply": q,
+            "assistant_text": q,
+            "quick_replies": qrs[:6],
+            "brief_patch": brief_patch,
+            "brief_state": brief_state,
+            "ready_to_search": False,
+            "missing_fields": missing,
+            "documents_ready": False,
+            "documents": [],
+        }
 
     if msg_type == "start":
         session["state"] = "awaiting_flow"

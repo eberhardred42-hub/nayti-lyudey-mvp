@@ -747,6 +747,67 @@ def list_user_intro_documents(user_id: str, request_id: str = "unknown", limit: 
             raise
 
 
+def get_artifact_by_session_kind(
+    session_id: str,
+    kind: str,
+    request_id: str = "unknown",
+) -> Optional[Dict[str, Any]]:
+    """Return the earliest artifact for session_id+kind (or None)."""
+    sid = (session_id or "").strip()
+    k = (kind or "").strip()
+    if not sid or not k:
+        return None
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="get_artifact_by_session_kind",
+        request_id=request_id,
+        session_id=sid,
+        kind=k,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT id, session_id, kind, format, payload_json, meta, created_at
+                FROM artifacts
+                WHERE session_id = %s AND kind = %s
+                ORDER BY created_at ASC
+                LIMIT 1
+                """,
+                (sid, k),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_artifact_by_session_kind",
+                request_id=request_id,
+                session_id=sid,
+                kind=k,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=1 if row else 0,
+            )
+            if not row:
+                return None
+            out = dict(row)
+            out["payload_json"] = safe_json(out.get("payload_json"), {})
+            out["meta"] = safe_json(out.get("meta"), {})
+            return out
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_artifact_by_session_kind",
+                request_id=request_id,
+                session_id=sid,
+                kind=k,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
 # ============================================================================
 # Message operations
 # ============================================================================
