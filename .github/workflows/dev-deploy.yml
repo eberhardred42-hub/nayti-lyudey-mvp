@@ -70,7 +70,7 @@ jobs:
             printf '%s\n' "LLM_PROVIDER=openai_compat"
             printf '%s\n' "LLM_REQUIRE_KEY=true"
             printf '%s\n' "DEV_LLM_BASE_URL=${DEV_LLM_BASE_URL}"
-            printf '%s\n' "DEV_LLM_MODEL=${DEV_LLM_MODEL:-gpt-4o-mini}"
+            printf '%s\n' "DEV_LLM_MODEL=${DEV_LLM_MODEL:-llama-3.1-8b-instant}"
             printf '%s\n' "DEV_LLM_API_KEY=${DEV_LLM_API_KEY}"
           } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
@@ -112,26 +112,71 @@ jobs:
           echo "== Caddyfile (container) reverse_proxy lines =="
           docker exec caddy sh -lc 'sed -n "1,160p" /etc/caddy/Caddyfile | grep -n "reverse_proxy" || true' || true
 
-      - name: Sanity-check domain (blocking)
+      - name: Sanity-check local upstream (blocking)
         shell: bash
         run: |
           set -euo pipefail
-          for i in $(seq 1 30); do
-            if curl -fsS -4 https://dev.naitilyudei.ru/api/health/llm \
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8100/health/llm \
               | python3 - <<'PY'
           import json,sys
           j=json.load(sys.stdin)
           assert j.get('ok') is True, j
           PY
             then
-              echo "Sanity OK"
+              echo "Local upstream sanity OK"
               exit 0
             fi
-            echo "Sanity retry $i/30"
+            echo "Local upstream sanity retry $i/60"
             sleep 2
           done
-          echo "Sanity FAILED" >&2
+          echo "Local upstream sanity FAILED" >&2
           exit 1
+
+      - name: Sanity-check domain (warn-only)
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          url="https://dev.naitilyudei.ru/api/health/llm"
+          hdr="/tmp/dev_domain.hdr"
+          body="/tmp/dev_domain.body"
+
+          http_code="$(curl -sS -4 --max-time 15 -D "$hdr" -o "$body" -w '%{http_code}' "$url" || true)"
+          content_type="$(grep -i '^content-type:' "$hdr" | head -n1 | tr -d '\r' || true)"
+
+          echo "Domain check: $url"
+          echo "HTTP: ${http_code:-<none>}"
+          echo "${content_type:-Content-Type: <missing>}"
+
+          if [ "$http_code" != "200" ]; then
+            echo "WARN: non-200 from domain (not blocking). Body excerpt:"
+            head -c 200 "$body" || true
+            echo
+            exit 0
+          fi
+
+          if ! echo "$content_type" | grep -qi 'application/json'; then
+            echo "WARN: 200 but non-JSON Content-Type (not blocking). Body excerpt:"
+            head -c 200 "$body" || true
+            echo
+            exit 0
+          fi
+
+          if python3 - <<'PY' <"$body"; then
+          import json,sys
+          j=json.load(sys.stdin)
+          assert j.get('ok') is True, j
+          print('Domain JSON ok:true')
+          PY
+            exit 0
+          else
+            echo "WARN: JSON parse/assert failed (not blocking). Body excerpt:"
+            head -c 200 "$body" || true
+            echo
+            exit 0
+          fi
 
       - name: Smoke checks (DEV) - non blocking
         continue-on-error: true

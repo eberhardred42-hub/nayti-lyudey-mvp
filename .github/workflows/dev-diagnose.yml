@@ -1,0 +1,70 @@
+name: DEV Diagnose
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Context
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "== time =="
+          date -Is
+          echo "== host =="
+          uname -a || true
+          echo "== docker =="
+          docker version || true
+
+      - name: Curl checks (local upstream)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== Local API (DEV) =="
+          curl -sS -o /tmp/api_llm.body -D /tmp/api_llm.hdr -w 'HTTP %{http_code}\n' http://127.0.0.1:8100/health/llm || true
+          head -n 20 /tmp/api_llm.hdr || true
+          echo "-- body (first 200 chars) --"
+          head -c 200 /tmp/api_llm.body || true
+          echo
+
+          echo "== Local FRONT (DEV) =="
+          curl -sS -o /tmp/front.body -D /tmp/front.hdr -w 'HTTP %{http_code}\n' http://127.0.0.1:3100/ || true
+          head -n 20 /tmp/front.hdr || true
+
+      - name: Curl checks (dev domain)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== Domain API (DEV) =="
+          curl -vk -4 --max-time 20 https://dev.naitilyudei.ru/api/health/llm \
+            -o /tmp/dev_domain.body -D /tmp/dev_domain.hdr || true
+          echo "-- headers (first 40 lines) --"
+          sed -n '1,40p' /tmp/dev_domain.hdr || true
+          echo "-- body (first 400 chars) --"
+          head -c 400 /tmp/dev_domain.body || true
+          echo
+
+      - name: Caddy container diagnostics
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== docker ps (caddy) =="
+          docker ps -a | grep -i caddy || true
+
+          echo "== docker inspect caddy (full) =="
+          docker inspect caddy || true
+
+          echo "== docker inspect caddy (network mode + mounts) =="
+          docker inspect -f 'NetworkMode={{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true
+          docker inspect -f '{{ range .Mounts }}{{ .Type }} {{ .Source }} -> {{ .Destination }} (ro={{ .RW }}){{"\n"}}{{ end }}' caddy 2>/dev/null || true
+
+          echo "== docker logs --tail=200 caddy =="
+          docker logs --tail=200 caddy || true
+
+          echo "== caddy validate =="
+          docker exec caddy caddy validate --config /etc/caddy/Caddyfile || true
