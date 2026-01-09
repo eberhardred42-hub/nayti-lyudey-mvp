@@ -99,6 +99,7 @@ export default function Page() {
       const r = await fetch("/api/me/documents", {
         method: "GET",
         headers: authHeaders(),
+        credentials: "include",
         cache: "no-store",
       });
       const data = await readJsonSafe(r);
@@ -134,6 +135,7 @@ export default function Page() {
       const genR = await fetch("/api/documents/generate_pack", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
         body: JSON.stringify({ session_id: sid }),
       });
 
@@ -160,6 +162,7 @@ export default function Page() {
     const r = await fetch(`/api/documents/${documentId}/download`, {
       method: "GET",
       headers: authHeaders(),
+      credentials: "include",
     });
     if (!r.ok) {
       pushAssistantOnce("Не удалось скачать документ. Попробуй ещё раз.");
@@ -214,6 +217,7 @@ export default function Page() {
       const r = await fetch("/api/sessions", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
         body: JSON.stringify({ profession_query: profession.trim() }),
       });
 
@@ -227,6 +231,7 @@ export default function Page() {
       const resp = await fetch("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
         body: JSON.stringify({ session_id: sid, type: "intro_start" }),
       });
       const body = await readJsonSafe(resp);
@@ -261,7 +266,7 @@ export default function Page() {
     setReportLoading(true);
     setReportError(null);
     try {
-      const r = await fetch(`/api/report/free?session_id=${sid}`);
+      const r = await fetch(`/api/report/free?session_id=${sid}`, { credentials: "include" });
       const data = await readJsonSafe(r);
       const dataObj = data && typeof data === "object" ? (data as Record<string, unknown>) : null;
       if (r.ok && dataObj?.free_report && typeof dataObj.free_report === "object") {
@@ -282,6 +287,7 @@ export default function Page() {
       const r = await fetch("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
+        credentials: "include",
         body: JSON.stringify({ session_id: sessionId, type: "intro_message", text }),
       });
       const data = await readJsonSafe(r);

@@ -44,8 +44,8 @@ jobs:
           export REDIS_HOST_PORT=16379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
-          # Deterministic runtime env (no relying on old .env on server)
-          RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
+          # Deterministic runtime env (write to .env so docker compose always picks it up)
+          RUNTIME_ENV_FILE="$APP_DIR/.env"
           if [ -z "${OPENROUTER_API_KEY:-}" ]; then
             echo "ERROR: OPENROUTER_API_KEY is not set" >&2
             exit 1
@@ -60,7 +60,10 @@ jobs:
           } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
 
-          docker compose --env-file "$RUNTIME_ENV_FILE" -p dev -f infra/docker-compose.yml up -d --build
+          echo "== runtime env written: $RUNTIME_ENV_FILE (redacted) =="
+          sed -E 's/(OPENROUTER_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,20p'
+
+          docker compose -p dev -f infra/docker-compose.yml up -d --build
 
       - name: Ensure caddy is running (host network)
         shell: bash
@@ -82,7 +85,9 @@ jobs:
           set -euo pipefail
           curl -fsS https://dev.naitilyudei.ru/ >/dev/null
           curl -fsS https://dev.naitilyudei.ru/api/docs >/dev/null
-          curl -fsS https://dev.naitilyudei.ru/api/health/llm | python3 - <<'PY'
+          PYTHON_BIN=python3
+          command -v python3 >/dev/null 2>&1 || PYTHON_BIN=python
+          curl -fsS https://dev.naitilyudei.ru/api/health/llm | "$PYTHON_BIN" - <<'PY'
           import json,sys
           j=json.load(sys.stdin)
           if not j.get('ok'):

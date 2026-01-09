@@ -6,7 +6,7 @@ import random
 import hashlib
 import hmac
 import urllib.request
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import uuid
@@ -1995,7 +1995,14 @@ def compute_duration_ms(start_time: float) -> float:
 
 
 def _get_user_id(request: Request) -> str | None:
-    # Bearer token has priority, then X-User-Id fallback (used by older front).
+    """Resolve current user_id.
+
+    Priority:
+    1) Bearer token
+    2) Signed auth cookie
+    3) X-User-Id legacy header fallback
+    """
+
     auth = request.headers.get("Authorization") or ""
     if auth.lower().startswith("bearer "):
         token = auth.split(" ", 1)[1].strip()
@@ -2009,6 +2016,14 @@ def _get_user_id(request: Request) -> str | None:
             if token.startswith("mock:") and len(token) > 5:
                 return token[5:]
 
+    # Cookie auth
+    cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
+    if cookie_val:
+        user_id = _parse_auth_cookie_user_id(cookie_val)
+        if user_id:
+            return user_id
+
+    # Legacy header fallback (older front)
     raw = request.headers.get("X-User-Id")
     if raw:
         v = raw.strip()
@@ -2017,10 +2032,177 @@ def _get_user_id(request: Request) -> str | None:
 
 
 def _require_user_id(request: Request) -> str:
+    """Require auth. 401 only when auth was present but invalid, or missing."""
+
+    # If a cookie exists but is invalid/expired, return a reason.
+    cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
+    if cookie_val:
+        try:
+            uid = _parse_auth_cookie_user_id(cookie_val)
+            if uid:
+                return uid
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=401, detail="invalid_cookie")
+
+    # If bearer token exists but invalid, keep 401.
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="invalid_token")
+
     user_id = _get_user_id(request)
     if not user_id:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return user_id
+
+
+# ============================================================================
+# Guest cookie auth (for DEV/PROD without login)
+# ============================================================================
+
+AUTH_COOKIE_MAX_AGE_SEC = 180 * 24 * 3600  # ~180 days
+
+
+def _auth_cookie_name() -> str:
+    return "nly_auth"
+
+
+def _auth_cookie_secret() -> str:
+    # Prefer dedicated secret; fallback to admin salt; last-resort insecure default.
+    v = (os.environ.get("AUTH_COOKIE_SECRET") or "").strip()
+    if v:
+        return v
+    v = (os.environ.get("ADMIN_PASSWORD_SALT") or "").strip()
+    if v:
+        return "cookie:" + v
+    return "cookie:insecure-default"
+
+
+def _is_https_request(request: Request) -> bool:
+    xf = (request.headers.get("X-Forwarded-Proto") or "").strip().lower()
+    if xf:
+        return xf == "https"
+    try:
+        return (request.url.scheme or "").lower() == "https"
+    except Exception:
+        return False
+
+
+def _cookie_domain_for_request(request: Request) -> str | None:
+    host = (request.headers.get("host") or "").split(":", 1)[0].strip().lower()
+    if not host:
+        return None
+    if host in {"localhost", "127.0.0.1"}:
+        return None
+    # Share across dev/prod subdomains.
+    if host == "naitilyudei.ru" or host.endswith(".naitilyudei.ru"):
+        return ".naitilyudei.ru"
+    return None
+
+
+def _auth_cookie_sig(user_id: str, issued_at: int) -> str:
+    msg = f"{user_id}.{issued_at}".encode("utf-8")
+    key = _auth_cookie_secret().encode("utf-8")
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def _make_auth_cookie_value(user_id: str, issued_at: int | None = None) -> str:
+    ts = int(issued_at or int(time.time()))
+    sig = _auth_cookie_sig(user_id, ts)
+    return f"{user_id}.{ts}.{sig}"
+
+
+def _parse_auth_cookie_user_id(cookie_val: str) -> str | None:
+    """Return user_id or raise HTTPException(401, reason) if malformed/invalid/expired."""
+    parts = [p for p in (cookie_val or "").split(".") if p]
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="invalid_cookie")
+    user_id, ts_raw, sig = parts
+
+    try:
+        ts = int(ts_raw)
+    except Exception:
+        raise HTTPException(status_code=401, detail="invalid_cookie")
+
+    age = int(time.time()) - ts
+    if age < 0 or age > AUTH_COOKIE_MAX_AGE_SEC:
+        raise HTTPException(status_code=401, detail="expired_cookie")
+
+    expected = _auth_cookie_sig(user_id, ts)
+    if not hmac.compare_digest(expected, sig):
+        raise HTTPException(status_code=401, detail="invalid_cookie")
+
+    return user_id
+
+
+def _issue_guest_cookie_if_missing(request: Request, response: Response) -> str | None:
+    """Ensure a valid auth entity exists by issuing a guest cookie when missing.
+
+    - If Bearer/cookie auth exists and valid: no-op.
+    - If no auth: reuse X-User-Id if present, else create UUID, then set cookie.
+    - If cookie exists but invalid/expired: do NOT mint a new one here; caller should surface 401.
+    """
+
+    request_id = get_request_id_from_request(request)
+
+    # If Bearer is present, it must be valid; otherwise return 401 (do not mint guest).
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        if token.startswith("mock:") and len(token) > 5:
+            return token[5:]
+        rec = TOKENS.get(token)
+        if isinstance(rec, dict) and (rec.get("user_id") or "").strip():
+            return str(rec.get("user_id")).strip()
+        raise HTTPException(status_code=401, detail="invalid_token")
+
+    # If cookie exists, it must be valid; otherwise return 401 (do not mint guest).
+    cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
+    if cookie_val:
+        return _parse_auth_cookie_user_id(cookie_val)
+
+    # Already authenticated via legacy header? We'll reuse it but still set cookie.
+    user_id = None
+    try:
+        existing = _get_user_id(request)
+        if existing:
+            user_id = existing
+    except HTTPException:
+        raise
+
+    if not user_id:
+        raw = (request.headers.get("X-User-Id") or "").strip()
+        user_id = raw or str(uuid.uuid4())
+
+    try:
+        cookie_val = _make_auth_cookie_value(user_id)
+        domain = _cookie_domain_for_request(request)
+        response.set_cookie(
+            key=_auth_cookie_name(),
+            value=cookie_val,
+            max_age=AUTH_COOKIE_MAX_AGE_SEC,
+            httponly=True,
+            secure=_is_https_request(request),
+            samesite="lax",
+            path="/",
+            domain=domain,
+        )
+        log_event(
+            "auth_guest_issued",
+            request_id=request_id,
+            user=_anon_user_key(user_id),
+            domain=(domain or ""),
+        )
+        return user_id
+    except Exception as e:
+        log_event(
+            "auth_missing",
+            level="warning",
+            request_id=request_id,
+            reason=str(type(e).__name__),
+        )
+        return None
 
 
 # ============================================================================
@@ -4273,11 +4455,14 @@ def generate_free_report(kb, profession_query=""):
 
 
 @app.post("/sessions")
-def create_session_endpoint(body: SessionCreate, request: Request):
+def create_session_endpoint(body: SessionCreate, request: Request, response: Response):
     """Create a new session and persist to database."""
     start_time = time.perf_counter()
     request_id = get_request_id_from_request(request)
     session_id = str(uuid.uuid4())
+
+    # Ensure guest auth is issued early (front always starts with /sessions)
+    user_id_issued = _issue_guest_cookie_if_missing(request, response)
 
     flow = (body.flow or "").strip().lower()
     
@@ -4295,7 +4480,7 @@ def create_session_endpoint(body: SessionCreate, request: Request):
     try:
         kb = make_empty_vacancy_kb()
         db_create_session(session_id, body.profession_query, kb, request_id=request_id)
-        user_id = _get_user_id(request)
+        user_id = user_id_issued or _get_user_id(request)
         if user_id:
             set_session_user(session_id, user_id, request_id=request_id)
         if flow == "intro":
@@ -4570,10 +4755,25 @@ def me_files(request: Request):
 
 
 @app.get("/me/documents")
-def me_documents(request: Request):
+def me_documents(request: Request, response: Response):
     """Auth-required: list intro artifacts + generated PDF documents for current user."""
     request_id = get_request_id_from_request(request)
-    user_id = _require_user_id(request)
+    # Guest-safe: issue cookie when missing; keep 401 for invalid/expired cookie.
+    # If token exists but invalid/expired, keep 401 with reason.
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        uid = _get_user_id(request)
+        if not uid:
+            raise HTTPException(status_code=401, detail="invalid_token")
+        user_id = uid
+    else:
+        user_id = _get_user_id(request)
+    if not user_id:
+        issued = _issue_guest_cookie_if_missing(request, response)
+        if issued:
+            user_id = issued
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
     catalog = _load_documents_catalog()
     title_map = {str((it or {}).get("id") or "").strip(): (it or {}).get("title") for it in (catalog or [])}
 
