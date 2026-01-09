@@ -17,6 +17,19 @@ jobs:
       LLM_REQUIRE_KEY: "true"
 
     steps:
+      - name: Init deploy summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "LOCAL_UPSTREAM=unknown"
+            echo "LOCAL_PING=skipped"
+            echo "LOCAL_PING_INFO="
+            echo "DOMAIN_CHECK=skipped"
+            echo "DOMAIN_HTTP="
+            echo "SMOKE=skipped"
+          } >> "$GITHUB_ENV"
+
       - name: Deploy DEV from ~/app (git pull + compose up)
         shell: bash
         run: |
@@ -128,6 +141,7 @@ jobs:
             if [ "$http_code" = "200" ] && echo "$content_type" | grep -qi 'application/json'; then
               if python3 -c 'import json,sys; j=json.load(sys.stdin); assert j.get("ok") is True, j; print("Local upstream JSON ok:true")' <"$body"; then
                 echo "Local upstream sanity OK"
+                echo "LOCAL_UPSTREAM=ok" >> "$GITHUB_ENV"
                 rm -f "$hdr" "$body" || true
                 exit 0
               fi
@@ -145,6 +159,7 @@ jobs:
           done
 
           echo "Local upstream sanity FAILED" >&2
+          echo "LOCAL_UPSTREAM=fail" >> "$GITHUB_ENV"
           echo "== Diagnostics (local upstream failed) ==" >&2
           cd "$HOME/app" || true
           docker compose -p dev -f infra/docker-compose.yml ps || true
@@ -169,7 +184,12 @@ jobs:
             content_type="$(grep -i '^content-type:' "$hdr" | head -n1 | tr -d '\r' || true)"
 
             if [ "$http_code" = "200" ] && echo "$content_type" | grep -qi 'application/json'; then
-              if python3 -c 'import json,sys; j=json.load(sys.stdin); ok=j.get("ok"); latency=j.get("latency_ms"); base_url=j.get("base_url") or j.get("provider_effective"); model=j.get("model"); print(f"ok={ok} latency_ms={latency} base_url={base_url} model={model}"); assert ok is True, j' <"$body"; then
+              if out="$(python3 -c 'import json,sys; j=json.load(sys.stdin); ok=j.get("ok"); latency=j.get("latency_ms"); base_url=j.get("base_url") or j.get("provider_effective"); model=j.get("model"); print(f"ok={ok} latency_ms={latency} base_url={base_url} model={model}"); assert ok is True, j' <"$body")"; then
+                echo "$out"
+                {
+                  echo "LOCAL_PING=ok"
+                  echo "LOCAL_PING_INFO=$out"
+                } >> "$GITHUB_ENV"
                 rm -f "$hdr" "$body" || true
                 exit 0
               fi
@@ -183,6 +203,7 @@ jobs:
             sleep 2
           done
           echo "WARN: LLM ping failed (non-blocking)"
+          echo "LOCAL_PING=fail" >> "$GITHUB_ENV"
           exit 0
 
       - name: Sanity-check domain (warn-only)
@@ -202,10 +223,16 @@ jobs:
           echo "HTTP: ${http_code:-<none>}"
           echo "${content_type:-Content-Type: <missing>}"
 
+          {
+            echo "DOMAIN_HTTP=${http_code:-}"
+          } >> "$GITHUB_ENV"
+
           if [ "$http_code" != "200" ]; then
             echo "WARN: non-200 from domain (not blocking). Body excerpt:"
             head -c 200 "$body" || true
             echo
+
+            echo "DOMAIN_CHECK=non-200" >> "$GITHUB_ENV"
 
             echo "== Diagnostics (domain non-200) =="
             echo "-- docker inspect caddy (network mode + mount) --"
@@ -227,15 +254,20 @@ jobs:
             echo "WARN: 200 but non-JSON Content-Type (not blocking). Body excerpt:"
             head -c 200 "$body" || true
             echo
+
+            echo "DOMAIN_CHECK=non-json" >> "$GITHUB_ENV"
             exit 0
           fi
 
           if python3 -c 'import json,sys; j=json.load(sys.stdin); assert j.get("ok") is True, j; print("Domain JSON ok:true")' <"$body"; then
+            echo "DOMAIN_CHECK=ok" >> "$GITHUB_ENV"
             exit 0
           else
             echo "WARN: JSON parse/assert failed (not blocking). Body excerpt:"
             head -c 200 "$body" || true
             echo
+
+            echo "DOMAIN_CHECK=json-fail" >> "$GITHUB_ENV"
             exit 0
           fi
 
@@ -247,11 +279,29 @@ jobs:
           for i in $(seq 1 20); do
             if curl -fsS -4 https://dev.naitilyudei.ru/api/health/llm >/dev/null; then
               echo "Smoke OK"
+              echo "SMOKE=ok" >> "$GITHUB_ENV"
               exit 0
             fi
             sleep 1
           done
           echo "Smoke FAILED (warn only)"
+          echo "SMOKE=fail" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## DEV Deploy summary"
+            echo
+            echo "- Commit: $GITHUB_SHA"
+            echo "- Local upstream (blocking): ${LOCAL_UPSTREAM:-unknown}"
+            echo "- LLM ping (warn-only): ${LOCAL_PING:-skipped} ${LOCAL_PING_INFO:-}"
+            echo "- Domain check (warn-only): ${DOMAIN_CHECK:-skipped} (HTTP ${DOMAIN_HTTP:-})"
+            echo "- Smoke (warn-only): ${SMOKE:-skipped}"
+            echo
+            echo "_Note: domain/ping/smoke are warn-only; local upstream blocks deploy._"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Logs (only if failed)
         if: failure()
