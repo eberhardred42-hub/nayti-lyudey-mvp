@@ -13,8 +13,5 @@ jobs:
           set -euo pipefail
           url="https://dev.naitilyudei.ru/api/health/llm/ping"
           echo "POST $url"
-          resp="$(curl -fsS -4 -X POST "$url")"
-          echo "$resp" | python3 - <<'PY'
-import json,sys
-print(json.dumps(json.loads(sys.stdin.read()), ensure_ascii=False, indent=2))
-PY
+          curl -fsS -4 -X POST "$url" \
+            | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
