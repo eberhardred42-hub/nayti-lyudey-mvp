@@ -133,6 +133,34 @@ jobs:
           echo "Local upstream sanity FAILED" >&2
           exit 1
 
+      - name: LLM ping (local upstream) - warn-only
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "== LLM ping via local upstream (costs tokens; warn-only) =="
+          for i in $(seq 1 3); do
+            if curl -fsS --max-time 30 -X POST http://127.0.0.1:8100/health/llm/ping \
+              | python3 - <<'PY'
+          import json,sys
+          j=json.load(sys.stdin)
+          ok=j.get('ok')
+          latency=j.get('latency_ms')
+          base_url=j.get('base_url') or j.get('provider_effective')
+          model=j.get('model')
+          print(f"ok={ok} latency_ms={latency} base_url={base_url} model={model}")
+          assert ok is True, j
+          PY
+            then
+              exit 0
+            fi
+            echo "LLM ping retry $i/3"
+            sleep 2
+          done
+          echo "WARN: LLM ping failed (non-blocking)"
+          exit 0
+
       - name: Sanity-check domain (warn-only)
         continue-on-error: true
         shell: bash
@@ -154,6 +182,20 @@ jobs:
             echo "WARN: non-200 from domain (not blocking). Body excerpt:"
             head -c 200 "$body" || true
             echo
+
+            echo "== Diagnostics (domain non-200) =="
+            echo "-- docker inspect caddy (network mode + mount) --"
+            docker inspect -f 'NetworkMode={{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true
+            docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/etc/caddy/Caddyfile" }}Caddyfile={{ .Source }}{{ end }}{{ end }}' caddy 2>/dev/null || true
+            echo "-- caddy logs (tail 120) --"
+            docker logs --tail=120 caddy || true
+            echo "-- compose ps (dev) --"
+            cd "$HOME/app" || true
+            docker compose -p dev -f infra/docker-compose.yml ps || true
+            echo "-- local curl api/front --"
+            curl -sS -D- -o /dev/null -w 'local api /health/llm HTTP %{http_code}\n' http://127.0.0.1:8100/health/llm || true
+            curl -sS -D- -o /dev/null -w 'local front / HTTP %{http_code}\n' http://127.0.0.1:3100/ || true
+
             exit 0
           fi
 
