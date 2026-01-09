@@ -12,6 +12,12 @@
 - DEV/PROD на одном сервере: [docs/ENVIRONMENTS.md](docs/ENVIRONMENTS.md)
 - Историография версий (что меняли и зачем): [docs/ops/06_VERSION_HISTORIOGRAPHY.md](docs/ops/06_VERSION_HISTORIOGRAPHY.md)
 
+## Последние изменения (кратко)
+
+- v2.8: добавлен ручной workflow диагностики DEV (`DEV Diagnose`).
+- v2.8: DEV Deploy: sanity-check разделён на blocking (локальный upstream) и warn-only (домен), больше нет падений на `JSONDecodeError` при 502.
+- v2.8: DEV Deploy: дефолтная LLM-модель по умолчанию совместима с Groq.
+
 ## Product Vision & User Journey (MVP) — SOURCE OF TRUTH
 
 Что строим: продукт, который помогает нанимать людей через короткий бриф (≤ 10 вопросов) и набор готовых документов.
@@ -68,6 +74,10 @@ bash tests/quick-test.sh
 ```
 
 ## LLM: переключение провайдера (через env)
+
+Коротко (цель на сегодня — Groq, без правок кода):
+- Groq base_url: `https://api.groq.com/openai/v1`
+- Нужные DEV secrets/vars: `DEV_LLM_BASE_URL`, `DEV_LLM_API_KEY`, `DEV_LLM_MODEL`
 
 Клиент работает с любым OpenAI-compatible провайдером. Для стендов DEV/PROD конфигурация берётся **только из secrets/vars** (`DEV_LLM_*` / `PROD_LLM_*`).
 
