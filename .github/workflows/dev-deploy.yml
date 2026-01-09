@@ -85,7 +85,9 @@ jobs:
 
           if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
             mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true)"
-            if [ "$mode" != "host" ]; then
+            caddyfile_src="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/etc/caddy/Caddyfile" }}{{ .Source }}{{ end }}{{ end }}' caddy 2>/dev/null || true)"
+            if [ "$mode" != "host" ] || [ "$caddyfile_src" != "$APP_DIR/Caddyfile" ]; then
+              echo "Recreating caddy (mode=$mode, Caddyfile mount=$caddyfile_src)"
               docker rm -f caddy || true
             fi
           fi
