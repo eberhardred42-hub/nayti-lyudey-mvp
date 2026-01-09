@@ -615,5 +615,6 @@ def llm_ping(*, request_id: str, session_id: str = "llm_ping") -> dict:
         "ok": True,
         "provider_effective": provider,
         "model": model,
+        "base_url": (s.get("base_url") or ""),
         "latency_ms": latency_ms,
     }

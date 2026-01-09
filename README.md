@@ -11,15 +11,31 @@
 - v2.0: Guest auth без логина — `POST /sessions` выдаёт HttpOnly cookie (Domain=.naitilyudei.ru), `/api/me/documents` для гостя возвращает 200 вместо 401; фронт шлёт cookies через `credentials: "include"`.
 - v2.1: DEV Deploy — smoke checks сделаны non-blocking (warn-only) с ретраями.
 - v2.2: Auth self-heal — при битой/просроченной guest-cookie она сбрасывается и перевыдаётся (без 401); Domain разведен для DEV/PROD. Добавлен ручной `POST /api/health/llm/ping`.
+- v2.3: DEV “STOP 401” — гостевой auth сделан железобетонным: host-only cookie `__Host-nly_auth` (без Domain) + cleanup legacy `nly_auth`; `POST /api/sessions` и `GET /api/me/documents` никогда не возвращают 401 без Bearer. Добавлен `GET /api/health/auth`.
 
 ## Как переключить LLM провайдера (через env)
 
 Клиент работает с любым OpenAI-compatible провайдером.
 
 - `LLM_PROVIDER=openai_compat`
-- `LLM_BASE_URL` — базовый URL (например, `https://openrouter.ai/api/v1` или другой совместимый endpoint)
+- `LLM_BASE_URL` — базовый URL (OpenAI-compatible)
 - `LLM_API_KEY` (или `OPENROUTER_API_KEY`) — ключ
 - `LLM_MODEL` — модель (строка, зависит от провайдера)
+
+Пресеты (задавайте через env, без правки кода):
+- OpenAI: `LLM_BASE_URL=https://api.openai.com/v1`
+- Groq: `LLM_BASE_URL=https://api.groq.com/openai/v1`
+- Together: `LLM_BASE_URL=https://api.together.xyz/v1`
+- Mistral: `LLM_BASE_URL=https://api.mistral.ai/v1`
+- DeepSeek: поставьте `LLM_BASE_URL` по их документации (не хардкодим, чтобы не ошибиться)
+
+DEV деплой ожидает (Secrets/Vars):
+- `DEV_LLM_BASE_URL` (secret)
+- `DEV_LLM_API_KEY` (secret)
+- `DEV_LLM_MODEL` (var)
+
+Пруф “реально стучимся наружу”:
+- ручной вызов `POST /api/health/llm/ping` (и workflow `LLM Ping (DEV)`) показывает `latency_ms`/`model`/`base_url`.
 
 Важно: не предполагаем “бесплатность” — провайдер должен быть совместимым и иметь валидные кредиты/ключ.
 

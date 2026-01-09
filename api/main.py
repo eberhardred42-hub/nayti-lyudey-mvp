@@ -2071,6 +2071,12 @@ AUTH_COOKIE_MAX_AGE_SEC = 180 * 24 * 3600  # ~180 days
 
 
 def _auth_cookie_name() -> str:
+    # Host-only cookie: MUST NOT set Domain attribute.
+    # __Host- prefix requires: Secure, Path=/, no Domain.
+    return "__Host-nly_auth"
+
+
+def _legacy_auth_cookie_name() -> str:
     return "nly_auth"
 
 
@@ -2095,29 +2101,30 @@ def _is_https_request(request: Request) -> bool:
         return False
 
 
-def _cookie_domain_for_request(request: Request) -> str | None:
-    # Prefer X-Forwarded-Host when behind proxy
-    host = (request.headers.get("X-Forwarded-Host") or request.headers.get("host") or "")
-    host = host.split(",", 1)[0].split(":", 1)[0].strip().lower()
-    if not host:
-        return None
-    if host in {"localhost", "127.0.0.1"}:
-        return None
+def _clear_legacy_auth_cookies(response: Response, request: Request) -> None:
+    """Best-effort cleanup for older cookie variants that can conflict on DEV.
 
-    # DEV/PROD split to avoid signature/secret mismatch issues.
-    if host == "dev.naitilyudei.ru" or host.endswith(".dev.naitilyudei.ru"):
-        # Host-only-ish domain: only DEV
-        return "dev.naitilyudei.ru"
-
-    if host == "naitilyudei.ru" or host.endswith(".naitilyudei.ru"):
-        # Share across prod subdomains
-        return ".naitilyudei.ru"
-
-    return None
+    Required deletions when issuing guest:
+    - nly_auth (host-only)
+    - nly_auth; Domain=.naitilyudei.ru
+    - nly_auth; Domain=dev.naitilyudei.ru
+    """
+    secure = _is_https_request(request)
+    for d in (None, ".naitilyudei.ru", "dev.naitilyudei.ru"):
+        try:
+            response.delete_cookie(
+                key=_legacy_auth_cookie_name(),
+                path="/",
+                domain=d,
+                secure=secure,
+                samesite="lax",
+            )
+        except Exception:
+            pass
 
 
 def _clear_auth_cookie(response: Response, request: Request, *, reason: str) -> None:
-    """Best-effort: clear current auth cookie across likely domains."""
+    """Clear current host-only cookie (and legacy variants) and log a trace."""
     request_id = get_request_id_from_request(request)
     try:
         log_event(
@@ -2128,18 +2135,16 @@ def _clear_auth_cookie(response: Response, request: Request, *, reason: str) -> 
     except Exception:
         pass
 
-    # Clear host-only cookie (no domain)
+    secure = _is_https_request(request)
+
+    # Clear current host-only cookie (no domain)
     try:
-        response.delete_cookie(key=_auth_cookie_name(), path="/")
+        response.delete_cookie(key=_auth_cookie_name(), path="/", secure=secure, samesite="lax")
     except Exception:
         pass
 
-    # Clear for common domains
-    for d in ("dev.naitilyudei.ru", ".naitilyudei.ru", "naitilyudei.ru"):
-        try:
-            response.delete_cookie(key=_auth_cookie_name(), path="/", domain=d)
-        except Exception:
-            pass
+    # Also clear legacy cookies.
+    _clear_legacy_auth_cookies(response, request)
 
 
 def _auth_cookie_sig(user_id: str, issued_at: int) -> str:
@@ -2177,6 +2182,77 @@ def _parse_auth_cookie_user_id(cookie_val: str) -> str | None:
     return user_id
 
 
+def resolve_user_or_guest(request: Request, response: Response) -> tuple[str, str, str]:
+    """Resolve a user_id.
+
+    Never-401 policy for guest routes:
+    - If Bearer is absent: any cookie errors => treat as missing auth, self-heal by issuing guest cookie, return 200.
+    - 401 is allowed ONLY when Bearer is provided and invalid.
+
+    Returns: (user_id, mode, reason)
+    mode: "user" | "guest"
+    reason: diagnostic string without secrets.
+    """
+
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth.split(" ", 1)[1].strip()
+        if token.startswith("mock:") and len(token) > 5:
+            return token[5:], "user", "bearer_mock"
+        rec = TOKENS.get(token)
+        if isinstance(rec, dict) and (rec.get("user_id") or "").strip():
+            return str(rec.get("user_id")).strip(), "user", "bearer"
+        raise HTTPException(status_code=401, detail="invalid_token")
+
+    # Bearer is absent => always guest-friendly.
+    cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
+    if cookie_val:
+        try:
+            uid = _parse_auth_cookie_user_id(cookie_val)
+            if uid:
+                return uid, "guest", "cookie"
+        except HTTPException as e:
+            detail = str(getattr(e, "detail", "") or "invalid_cookie")
+            _clear_auth_cookie(response, request, reason=detail)
+        except Exception:
+            _clear_auth_cookie(response, request, reason="invalid_cookie")
+
+    # Reuse legacy header if present, but still issue host-only cookie.
+    raw = (request.headers.get("X-User-Id") or "").strip()
+    user_id = raw or str(uuid.uuid4())
+
+    secure = _is_https_request(request)
+    try:
+        cookie_val = _make_auth_cookie_value(user_id)
+        response.set_cookie(
+            key=_auth_cookie_name(),
+            value=cookie_val,
+            max_age=AUTH_COOKIE_MAX_AGE_SEC,
+            httponly=True,
+            secure=secure,
+            samesite="lax",
+            path="/",
+            domain=None,
+        )
+        _clear_legacy_auth_cookies(response, request)
+        log_event(
+            "auth_guest_issued",
+            request_id=get_request_id_from_request(request),
+            user=_anon_user_key(user_id),
+            cookie_name=_auth_cookie_name(),
+        )
+        return user_id, "guest", "guest_issued"
+    except Exception as e:
+        log_event(
+            "auth_missing",
+            level="warning",
+            request_id=get_request_id_from_request(request),
+            reason=str(type(e).__name__),
+        )
+        # Still return a stable ID for request flow.
+        return user_id, "guest", "guest_no_cookie"
+
+
 def _issue_guest_cookie_if_missing(request: Request, response: Response) -> str | None:
     """Ensure a valid auth entity exists by issuing a guest cookie when missing.
 
@@ -2185,76 +2261,9 @@ def _issue_guest_cookie_if_missing(request: Request, response: Response) -> str 
     - If cookie exists but invalid/expired: do NOT mint a new one here; caller should surface 401.
     """
 
-    request_id = get_request_id_from_request(request)
-
-    # If Bearer is present, it must be valid; otherwise return 401 (do not mint guest).
-    auth = (request.headers.get("Authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        token = auth.split(" ", 1)[1].strip()
-        if token.startswith("mock:") and len(token) > 5:
-            return token[5:]
-        rec = TOKENS.get(token)
-        if isinstance(rec, dict) and (rec.get("user_id") or "").strip():
-            return str(rec.get("user_id")).strip()
-        raise HTTPException(status_code=401, detail="invalid_token")
-
-    # If cookie exists, it must be valid; otherwise return 401 (do not mint guest).
-    # If cookie exists but invalid/expired: self-heal (clear + re-issue).
-    cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
-    if cookie_val:
-        try:
-            return _parse_auth_cookie_user_id(cookie_val)
-        except HTTPException as e:
-            # Self-heal only for guest cookie failures
-            detail = str(getattr(e, "detail", "") or "")
-            if detail in {"invalid_cookie", "expired_cookie"}:
-                _clear_auth_cookie(response, request, reason=detail)
-            else:
-                _clear_auth_cookie(response, request, reason="invalid_cookie")
-        except Exception:
-            _clear_auth_cookie(response, request, reason="invalid_cookie")
-
-    # Already authenticated via legacy header? We'll reuse it but still set cookie.
-    user_id = None
-    try:
-        existing = _get_user_id(request)
-        if existing:
-            user_id = existing
-    except HTTPException:
-        raise
-
-    if not user_id:
-        raw = (request.headers.get("X-User-Id") or "").strip()
-        user_id = raw or str(uuid.uuid4())
-
-    try:
-        cookie_val = _make_auth_cookie_value(user_id)
-        domain = _cookie_domain_for_request(request)
-        response.set_cookie(
-            key=_auth_cookie_name(),
-            value=cookie_val,
-            max_age=AUTH_COOKIE_MAX_AGE_SEC,
-            httponly=True,
-            secure=_is_https_request(request),
-            samesite="lax",
-            path="/",
-            domain=domain,
-        )
-        log_event(
-            "auth_guest_issued",
-            request_id=request_id,
-            user=_anon_user_key(user_id),
-            domain=(domain or ""),
-        )
-        return user_id
-    except Exception as e:
-        log_event(
-            "auth_missing",
-            level="warning",
-            request_id=request_id,
-            reason=str(type(e).__name__),
-        )
-        return None
+    # Backward-compatible wrapper for older call-sites.
+    user_id, _mode, _reason = resolve_user_or_guest(request, response)
+    return user_id
 
 
 # ============================================================================
@@ -4177,6 +4186,68 @@ def health_llm_endpoint():
     return health_llm()
 
 
+@app.get("/health/auth")
+def health_auth_endpoint(request: Request):
+    """Auth diagnostics without secrets."""
+    cookie_name_seen = None
+    has_cookie = False
+
+    if (request.cookies.get(_auth_cookie_name()) or "").strip():
+        cookie_name_seen = _auth_cookie_name()
+        has_cookie = True
+    elif (request.cookies.get(_legacy_auth_cookie_name()) or "").strip():
+        cookie_name_seen = _legacy_auth_cookie_name()
+        has_cookie = True
+
+    bearer_present = bool((request.headers.get("Authorization") or "").strip().lower().startswith("bearer "))
+
+    resolved_user_id = None
+    mode = "guest"
+    reason = "missing"
+
+    if bearer_present:
+        auth = (request.headers.get("Authorization") or "").strip()
+        token = auth.split(" ", 1)[1].strip() if " " in auth else ""
+        if token.startswith("mock:") and len(token) > 5:
+            resolved_user_id = token[5:]
+            mode = "user"
+            reason = "bearer_mock"
+        else:
+            rec = TOKENS.get(token)
+            if isinstance(rec, dict) and (rec.get("user_id") or "").strip():
+                resolved_user_id = str(rec.get("user_id")).strip()
+                mode = "user"
+                reason = "bearer"
+            else:
+                resolved_user_id = None
+                mode = "user"
+                reason = "bearer_invalid"
+    else:
+        cookie_val = (request.cookies.get(_auth_cookie_name()) or "").strip()
+        if cookie_val:
+            try:
+                resolved_user_id = _parse_auth_cookie_user_id(cookie_val)
+                mode = "guest"
+                reason = "cookie"
+            except HTTPException as e:
+                resolved_user_id = None
+                mode = "guest"
+                reason = str(getattr(e, "detail", "invalid_cookie") or "invalid_cookie")
+            except Exception:
+                resolved_user_id = None
+                mode = "guest"
+                reason = "invalid_cookie"
+
+    return {
+        "has_cookie": bool(has_cookie),
+        "cookie_name_seen": cookie_name_seen,
+        "bearer_present": bool(bearer_present),
+        "resolved_user_id": resolved_user_id,
+        "mode": mode,
+        "reason": reason,
+    }
+
+
 @app.post("/health/llm/ping")
 def health_llm_ping_endpoint(request: Request):
     """Manual ping to prove LLM calls reach external provider (real completion, short)."""
@@ -4531,8 +4602,8 @@ def create_session_endpoint(body: SessionCreate, request: Request, response: Res
     request_id = get_request_id_from_request(request)
     session_id = str(uuid.uuid4())
 
-    # Ensure guest auth is issued early (front always starts with /sessions)
-    user_id_issued = _issue_guest_cookie_if_missing(request, response)
+    # Ensure auth is resolved/issued early (front always starts with /sessions)
+    user_id, _mode, _reason = resolve_user_or_guest(request, response)
 
     flow = (body.flow or "").strip().lower()
     
@@ -4550,7 +4621,6 @@ def create_session_endpoint(body: SessionCreate, request: Request, response: Res
     try:
         kb = make_empty_vacancy_kb()
         db_create_session(session_id, body.profession_query, kb, request_id=request_id)
-        user_id = user_id_issued or _get_user_id(request)
         if user_id:
             set_session_user(session_id, user_id, request_id=request_id)
         if flow == "intro":
@@ -4828,22 +4898,8 @@ def me_files(request: Request):
 def me_documents(request: Request, response: Response):
     """Auth-required: list intro artifacts + generated PDF documents for current user."""
     request_id = get_request_id_from_request(request)
-    # Guest-safe: issue cookie when missing; keep 401 for invalid/expired cookie.
-    # If token exists but invalid/expired, keep 401 with reason.
-    auth = (request.headers.get("Authorization") or "").strip()
-    if auth.lower().startswith("bearer "):
-        uid = _get_user_id(request)
-        if not uid:
-            raise HTTPException(status_code=401, detail="invalid_token")
-        user_id = uid
-    else:
-        user_id = _get_user_id(request)
-    if not user_id:
-        issued = _issue_guest_cookie_if_missing(request, response)
-        if issued:
-            user_id = issued
-    if not user_id:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    # Never-401 for guest mode: if Bearer is absent, always self-heal and return 200.
+    user_id, _mode, _reason = resolve_user_or_guest(request, response)
     catalog = _load_documents_catalog()
     title_map = {str((it or {}).get("id") or "").strip(): (it or {}).get("title") for it in (catalog or [])}
 

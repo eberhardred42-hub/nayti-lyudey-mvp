@@ -14,6 +14,9 @@ jobs:
       LLM_BASE_URL: https://openrouter.ai/api/v1
       LLM_PROVIDER: openai_compat
       LLM_REQUIRE_KEY: "true"
+      DEV_LLM_BASE_URL: ${{ secrets.DEV_LLM_BASE_URL }}
+      DEV_LLM_API_KEY: ${{ secrets.DEV_LLM_API_KEY }}
+      DEV_LLM_MODEL: ${{ vars.DEV_LLM_MODEL }}
 
     steps:
       - name: Deploy DEV from ~/app (git pull + compose up)
@@ -44,24 +47,39 @@ jobs:
           export REDIS_HOST_PORT=16379
           export S3_PRESIGN_ENDPOINT=${S3_PRESIGN_ENDPOINT:-http://localhost:9100}
 
-          # Deterministic runtime env (write to .env so docker compose always picks it up)
-          RUNTIME_ENV_FILE="$APP_DIR/.env"
-          if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-            echo "ERROR: OPENROUTER_API_KEY is not set" >&2
+          # Deterministic runtime env
+          # - write to .env.runtime (requested)
+          # - also copy to .env so docker compose always picks it up
+          RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
+
+          LLM_BASE_URL_EFFECTIVE="${DEV_LLM_BASE_URL:-${LLM_BASE_URL:-}}"
+          LLM_MODEL_EFFECTIVE="${DEV_LLM_MODEL:-${LLM_MODEL:-gpt-4o-mini}}"
+          LLM_API_KEY_EFFECTIVE="${DEV_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}"
+
+          if [ -z "${LLM_API_KEY_EFFECTIVE:-}" ]; then
+            echo "ERROR: DEV_LLM_API_KEY (or OPENROUTER_API_KEY fallback) is not set" >&2
+            exit 1
+          fi
+          if [ -z "${LLM_BASE_URL_EFFECTIVE:-}" ]; then
+            echo "ERROR: DEV_LLM_BASE_URL (or LLM_BASE_URL fallback) is not set" >&2
             exit 1
           fi
           umask 077
           {
-            printf '%s\n' "LLM_BASE_URL=https://openrouter.ai/api/v1"
+            printf '%s\n' "LLM_BASE_URL=${LLM_BASE_URL_EFFECTIVE}"
             printf '%s\n' "LLM_PROVIDER=openai_compat"
-            printf '%s\n' "LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}"
-            printf '%s\n' "OPENROUTER_API_KEY=${OPENROUTER_API_KEY}"
+            printf '%s\n' "LLM_MODEL=${LLM_MODEL_EFFECTIVE}"
+            printf '%s\n' "LLM_API_KEY=${LLM_API_KEY_EFFECTIVE}"
+            printf '%s\n' "OPENROUTER_API_KEY=${LLM_API_KEY_EFFECTIVE}"
             printf '%s\n' "LLM_REQUIRE_KEY=true"
           } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
 
+          cp "$RUNTIME_ENV_FILE" "$APP_DIR/.env"
+          chmod 600 "$APP_DIR/.env" || true
+
           echo "== runtime env written: $RUNTIME_ENV_FILE (redacted) =="
-          sed -E 's/(OPENROUTER_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,20p'
+          sed -E 's/(OPENROUTER_API_KEY=).+/\1***REDACTED***/; s/(LLM_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,20p'
 
           docker compose -p dev -f infra/docker-compose.yml up -d --build
 
