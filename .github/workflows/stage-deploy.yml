@@ -44,6 +44,12 @@ jobs:
             git reset --hard "${{ inputs.ref }}"
           fi
 
+          # Some hosts may have had Caddyfile locally modified and marked as
+          # skip-worktree/assume-unchanged. Make sure the repo version is applied.
+          git update-index --no-skip-worktree Caddyfile 2>/dev/null || true
+          git update-index --no-assume-unchanged Caddyfile 2>/dev/null || true
+          git checkout -- Caddyfile || true
+
           export FRONT_HOST_PORT=3000
           export API_HOST_PORT=8000
           export ML_HOST_PORT=8001
@@ -92,6 +98,9 @@ jobs:
           set -euo pipefail
           APP_DIR="$HOME/app"
 
+          echo "== Caddyfile (host) reverse_proxy lines =="
+          sed -n '1,160p' "$APP_DIR/Caddyfile" | grep -n 'reverse_proxy' || true
+
           if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
             mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true)"
             caddyfile_src="$(docker inspect -f '{{ range .Mounts }}{{ if eq .Destination "/etc/caddy/Caddyfile" }}{{ .Source }}{{ end }}{{ end }}' caddy 2>/dev/null || true)"
@@ -108,6 +117,9 @@ jobs:
           else
             docker restart caddy
           fi
+
+          echo "== Caddyfile (container) reverse_proxy lines =="
+          docker exec caddy sh -lc 'sed -n "1,160p" /etc/caddy/Caddyfile | grep -n "reverse_proxy" || true' || true
 
       - name: Smoke checks
         shell: bash
