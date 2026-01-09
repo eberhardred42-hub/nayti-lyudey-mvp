@@ -76,11 +76,11 @@
 ## Переменные окружения (OpenRouter)
 Поддерживается OpenAI-совместимый режим:
 - `LLM_PROVIDER=openai_compat`
-- `LLM_BASE_URL=https://openrouter.ai/api/v1` (или иной совместимый)
-- `OPENROUTER_API_KEY=...` (или `LLM_API_KEY=...`)
+- `LLM_BASE_URL=https://api.groq.com/openai/v1` (или иной OpenAI-compatible)
+- `LLM_API_KEY=...`
 - `LLM_MODEL=...`
 
-`OPENROUTER_API_KEY` используется как fallback, если `LLM_API_KEY` пуст.
+Важно: никаких fallback'ов по `OPENROUTER_API_KEY` — используйте явный `LLM_API_KEY`/`DEV_LLM_API_KEY`/`PROD_LLM_API_KEY`.
 
 ## Устойчивость
 Если LLM недоступна/вернула невалидный JSON — backend возвращает fallback-вопрос и **не падает 500**.

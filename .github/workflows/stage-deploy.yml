@@ -12,14 +12,12 @@ jobs:
   deploy:
     runs-on: [self-hosted, stage]
     env:
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      LLM_MODEL: ${{ vars.LLM_MODEL }}
-      LLM_BASE_URL: https://openrouter.ai/api/v1
-      LLM_PROVIDER: openai_compat
-      LLM_REQUIRE_KEY: "true"
       PROD_LLM_BASE_URL: ${{ secrets.PROD_LLM_BASE_URL }}
       PROD_LLM_API_KEY: ${{ secrets.PROD_LLM_API_KEY }}
       PROD_LLM_MODEL: ${{ vars.PROD_LLM_MODEL }}
+      NLY_ENV: prod
+      LLM_PROVIDER: openai_compat
+      LLM_REQUIRE_KEY: "true"
 
     steps:
       - name: Deploy from ~/app (git pull + compose up)
@@ -61,26 +59,22 @@ jobs:
           # - also copy to .env so docker compose always picks it up
           RUNTIME_ENV_FILE="$APP_DIR/.env.runtime"
 
-          LLM_BASE_URL_EFFECTIVE="${PROD_LLM_BASE_URL:-${LLM_BASE_URL:-}}"
-          LLM_MODEL_EFFECTIVE="${PROD_LLM_MODEL:-${LLM_MODEL:-gpt-4o-mini}}"
-          LLM_API_KEY_EFFECTIVE="${PROD_LLM_API_KEY:-${OPENROUTER_API_KEY:-}}"
-
-          if [ -z "${LLM_API_KEY_EFFECTIVE:-}" ]; then
-            echo "ERROR: PROD_LLM_API_KEY (or OPENROUTER_API_KEY fallback) is not set" >&2
+          if [ -z "${PROD_LLM_API_KEY:-}" ]; then
+            echo "ERROR: PROD_LLM_API_KEY is not set" >&2
             exit 1
           fi
-          if [ -z "${LLM_BASE_URL_EFFECTIVE:-}" ]; then
-            echo "ERROR: PROD_LLM_BASE_URL (or LLM_BASE_URL fallback) is not set" >&2
+          if [ -z "${PROD_LLM_BASE_URL:-}" ]; then
+            echo "ERROR: PROD_LLM_BASE_URL is not set" >&2
             exit 1
           fi
           umask 077
           {
-            printf '%s\n' "LLM_BASE_URL=${LLM_BASE_URL_EFFECTIVE}"
+            printf '%s\n' "NLY_ENV=prod"
             printf '%s\n' "LLM_PROVIDER=openai_compat"
-            printf '%s\n' "LLM_MODEL=${LLM_MODEL_EFFECTIVE}"
-            printf '%s\n' "LLM_API_KEY=${LLM_API_KEY_EFFECTIVE}"
-            printf '%s\n' "OPENROUTER_API_KEY=${LLM_API_KEY_EFFECTIVE}"
             printf '%s\n' "LLM_REQUIRE_KEY=true"
+            printf '%s\n' "PROD_LLM_BASE_URL=${PROD_LLM_BASE_URL}"
+            printf '%s\n' "PROD_LLM_MODEL=${PROD_LLM_MODEL:-gpt-4o-mini}"
+            printf '%s\n' "PROD_LLM_API_KEY=${PROD_LLM_API_KEY}"
           } >"$RUNTIME_ENV_FILE"
           chmod 600 "$RUNTIME_ENV_FILE" || true
 
@@ -88,15 +82,22 @@ jobs:
           chmod 600 "$APP_DIR/.env" || true
 
           echo "== runtime env written: $RUNTIME_ENV_FILE (redacted) =="
-          sed -E 's/(OPENROUTER_API_KEY=).+/\1***REDACTED***/; s/(LLM_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,20p'
+          sed -E 's/(PROD_LLM_API_KEY=).+/\1***REDACTED***/' "$RUNTIME_ENV_FILE" | sed -n '1,30p'
 
-          docker compose -p prod -f infra/docker-compose.yml up -d --build
+          docker compose -p prod -f infra/docker-compose.yml up -d --build --force-recreate
 
       - name: Ensure caddy is running (host network)
         shell: bash
         run: |
           set -euo pipefail
           APP_DIR="$HOME/app"
+
+          if docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
+            mode="$(docker inspect -f '{{.HostConfig.NetworkMode}}' caddy 2>/dev/null || true)"
+            if [ "$mode" != "host" ]; then
+              docker rm -f caddy || true
+            fi
+          fi
 
           if ! docker ps -a --format '{{.Names}}' | grep -qx 'caddy'; then
             docker run -d --name caddy --restart unless-stopped --network host \

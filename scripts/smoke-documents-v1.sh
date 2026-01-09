@@ -28,7 +28,7 @@ export RENDER_TIMEOUT_SEC=120
 # - If caller provided any API key and did not force LLM_PROVIDER, use openai_compat.
 # - Otherwise default to mock to keep smoke reliable/offline.
 if [[ -z "${LLM_PROVIDER:-}" ]]; then
-  if [[ -n "${OPENROUTER_API_KEY:-}" || -n "${OPENAI_API_KEY:-}" || -n "${LLM_API_KEY:-}" ]]; then
+  if [[ -n "${OPENAI_API_KEY:-}" || -n "${LLM_API_KEY:-}" ]]; then
     export LLM_PROVIDER=openai_compat
   else
     export LLM_PROVIDER=mock
@@ -37,7 +37,7 @@ fi
 
 export LLM_BASE_URL=${LLM_BASE_URL:-}
 export LLM_API_KEY=${LLM_API_KEY:-}
-export OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+export OPENAI_API_KEY=${OPENAI_API_KEY:-}
 export OPENAI_API_KEY=${OPENAI_API_KEY:-}
 
 TMP_PDF=""

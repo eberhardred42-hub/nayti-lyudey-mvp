@@ -7,23 +7,30 @@
 - v1.7: Observability — trace-события (intro/LLM/render/S3) теперь пишутся в `artifacts` и видны в `/admin/logs`.
 - v1.7: CI переведён в manual-only; DEV deploy оставляет только быстрые curl-проверки.
 - v1.8: LLM обязателен (OpenRouter) — деплой падает без ключа; `/api/health/llm` теперь показывает provider/model/base_url/key_present/mode.
-- v1.10: GitHub Actions — исправлена генерация runtime env (`.env` на сервере), чтобы compose стабильно подхватывал `LLM_*`/`OPENROUTER_API_KEY`.
+- v1.10: GitHub Actions — исправлена генерация runtime env (`.env` на сервере), чтобы compose стабильно подхватывал LLM-конфиг.
 - v2.0: Guest auth без логина — `POST /sessions` выдаёт HttpOnly cookie (Domain=.naitilyudei.ru), `/api/me/documents` для гостя возвращает 200 вместо 401; фронт шлёт cookies через `credentials: "include"`.
 - v2.1: DEV Deploy — smoke checks сделаны non-blocking (warn-only) с ретраями.
 - v2.2: Auth self-heal — при битой/просроченной guest-cookie она сбрасывается и перевыдаётся (без 401); Domain разведен для DEV/PROD. Добавлен ручной `POST /api/health/llm/ping`.
 - v2.3: DEV “STOP 401” — гостевой auth сделан железобетонным: host-only cookie `__Host-nly_auth` (без Domain) + cleanup legacy `nly_auth`; `POST /api/sessions` и `GET /api/me/documents` никогда не возвращают 401 без Bearer. Добавлен `GET /api/health/auth`.
 - v2.4: LLM провайдер теперь переключается только env-переменными (`LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`); OpenRouter больше не “особенный” (это просто base_url). PROD deploy поддерживает `PROD_LLM_*`.
+- v2.5: Workflow `LLM Ping (DEV)` стал запускаться вручную (`workflow_dispatch`), версия поднята до 2.5.
+- v2.6: DEV — фикс 502 в Caddy (IPv6 `localhost`), LLM строго через `DEV_LLM_*`/`PROD_LLM_*` (целевой провайдер: Groq), DEV Deploy получил блокирующий sanity-check на домен.
 
 ## Как переключить LLM провайдера (через env)
 
-Клиент работает с любым OpenAI-compatible провайдером.
+Клиент работает с любым OpenAI-compatible провайдером. Для стендов DEV/PROD конфигурация берётся **только из secrets/vars** (`DEV_LLM_*` / `PROD_LLM_*`).
 
+Общее:
 - `LLM_PROVIDER=openai_compat`
-- `LLM_BASE_URL` — базовый URL (OpenAI-compatible)
-- `LLM_API_KEY` (или `OPENROUTER_API_KEY`) — ключ (но base_url нужно указать явно)
-- `LLM_MODEL` — модель (строка, зависит от провайдера)
+- `NLY_ENV=dev|prod` — выбирает, какие переменные использовать (`DEV_LLM_*` или `PROD_LLM_*`).
 
-Важно: OpenRouter не “особенный”. Если вы задаёте только ключ (`OPENROUTER_API_KEY`/`OPENAI_API_KEY`) без `LLM_BASE_URL`, то LLM будет считаться не настроенным.
+DEV/PROD (через secrets/vars):
+- `DEV_LLM_BASE_URL` / `PROD_LLM_BASE_URL`
+- `DEV_LLM_API_KEY` / `PROD_LLM_API_KEY`
+- `DEV_LLM_MODEL` / `PROD_LLM_MODEL`
+
+Локальная разработка (опционально, для удобства):
+- `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` (если `NLY_ENV` не задан).
 
 Пресеты (задавайте через env, без правки кода):
 - OpenAI: `LLM_BASE_URL=https://api.openai.com/v1`
@@ -301,9 +308,10 @@ LLM обёрнут в `api/llm_client.py` и использует OpenAI-compati
 Ключевые env:
 
 - `LLM_PROVIDER` (`mock` или `openai_compat`)
-- `LLM_BASE_URL`, `LLM_API_KEY`
-- `OPENROUTER_API_KEY`, `OPENAI_API_KEY` (опционально)
-- `LLM_MODEL`
+- `NLY_ENV=dev|prod` — активирует `DEV_LLM_*` или `PROD_LLM_*`
+- `DEV_LLM_BASE_URL`/`DEV_LLM_API_KEY`/`DEV_LLM_MODEL` (DEV)
+- `PROD_LLM_BASE_URL`/`PROD_LLM_API_KEY`/`PROD_LLM_MODEL` (PROD)
+- (локально, если `NLY_ENV` пуст) `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`
 
 Важно: большая часть флоу должна **деградировать**, но не падать при `LLM_PROVIDER=mock`.
 
