@@ -322,24 +322,50 @@ export default function Page() {
     setDocGenBusy(true);
     setErrorText(null);
     try {
+      async function ensureOfferAccepted(tokenValue: string) {
+        await fetch("/api/legal/offer/accept", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${tokenValue}`,
+          },
+          credentials: "include",
+          body: JSON.stringify({}),
+        });
+      }
+
       const results: Array<{ id: string; title: string; status: string; download_url?: string | null }> = [];
       const docIds: string[] = [];
       for (const docId of selected) {
-        const r = await fetch("/api/documents/generate", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-          credentials: "include",
-          body: JSON.stringify({ session_id: sessionId, doc_id: docId }),
-        });
-        const data = await readJsonSafe(r);
-        const obj = asRecord(data);
-        if (!r.ok || !obj) {
+        let attempt = 0;
+        let obj: Record<string, unknown> | null = null;
+        while (attempt < 2) {
+          attempt += 1;
+          const r = await fetch("/api/documents/generate", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+            credentials: "include",
+            body: JSON.stringify({ session_id: sessionId, doc_id: docId }),
+          });
+          const data = await readJsonSafe(r);
+          obj = asRecord(data);
+          if (r.ok && obj) break;
+
           const detail = obj && typeof obj.detail === "string" ? obj.detail : "generate_failed";
-          if (r.status === 412 && detail === "offer_not_accepted") {
-            throw new Error("Нужно принять оферту для платных документов (см. /offer)");
+          if (r.status === 412 && detail === "offer_not_accepted" && attempt === 1) {
+            // Auto-heal: accept offer and retry once.
+            try {
+              await ensureOfferAccepted(token);
+              continue;
+            } catch {
+              throw new Error("Не удалось подтвердить оферту. Откройте /offer и попробуйте ещё раз.");
+            }
           }
           throw new Error(detail);
         }
+
+        if (!obj) throw new Error("generate_failed");
+
         const d = asRecord(obj.document);
         const id = String(d?.id || "");
         if (id) docIds.push(id);
