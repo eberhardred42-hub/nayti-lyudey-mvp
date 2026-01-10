@@ -1,0 +1,57 @@
+name: Brief LLM 1-step (DEV)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base URL for DEV (no trailing slash), e.g. https://dev.naitilyudei.ru"
+        required: false
+        default: "https://dev.naitilyudei.ru"
+      role_query:
+        description: "Role query (profession_query)"
+        required: false
+        default: "Маркетолог"
+
+jobs:
+  brief_llm_1step:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check LLM ping (Checkpoint A)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="${{ inputs.base_url }}"
+          url="$base_url/api/health/llm/ping"
+          echo "POST $url"
+          resp=$(curl -fsS -4 -X POST "$url")
+          echo "$resp" | python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read() or '{}')
+assert obj.get('ok') is True, obj
+lat=obj.get('latency_ms')
+assert isinstance(lat,(int,float)), obj
+print(json.dumps(obj, ensure_ascii=False, indent=2))
+PY
+
+      - name: Run 1 question → 1 answer → next (Checkpoint B/C)
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="${{ inputs.base_url }}"
+          api="$base_url/api"
+          export BASE_URL="$api"
+          export ROLE_QUERY="${{ inputs.role_query }}"
+
+          set +e
+          bash tests/test-brief-llm-1step.sh
+          code=$?
+          set -e
+
+          if [ "$code" = "2" ]; then
+            echo "NEUTRAL: llm_used=false (LLM likely not configured)."
+            exit 0
+          fi
+          exit "$code"

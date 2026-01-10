@@ -73,6 +73,8 @@ MVP флоу:
 
 Manual smoke (без деплоя): workflow `Product Smoke (DEV)`.
 
+Быстрый LLM-чек (без UI): workflow `Brief LLM 1-step (DEV)`.
+
 ## Health / Observability (DEV)
 
 - https://dev.naitilyudei.ru/api/health/llm
