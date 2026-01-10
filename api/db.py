@@ -234,6 +234,37 @@ def init_db():
             )
         """)
 
+        # Wallets: simple balance + immutable ledger.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wallets (
+                user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                balance BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wallet_ledger (
+                id UUID PRIMARY KEY,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                delta BIGINT NOT NULL,
+                reason TEXT NOT NULL,
+                session_id TEXT NULL,
+                doc_id TEXT NULL,
+                request_id TEXT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+            """
+        )
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created
+            ON wallet_ledger(user_id, created_at)
+        """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS admin_sessions (
                 id UUID PRIMARY KEY,
@@ -1918,6 +1949,219 @@ def get_user_by_id(user_id: str, request_id: str = "unknown") -> Optional[Dict[s
                 "db_query_error",
                 level="error",
                 query_name="get_user_by_id",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+# ==========================================================================
+# Wallet
+# ==========================================================================
+
+
+def ensure_wallet(user_id: str, initial_balance: int = 0, request_id: str = "unknown") -> Dict[str, Any]:
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="ensure_wallet", request_id=request_id, user_id=user_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                INSERT INTO wallets (user_id, balance)
+                VALUES (%s, %s)
+                ON CONFLICT (user_id) DO NOTHING
+                RETURNING user_id, balance, updated_at
+                """,
+                (user_id, int(initial_balance)),
+            )
+            row = cur.fetchone()
+            if not row:
+                cur.execute(
+                    """
+                    SELECT user_id, balance, updated_at
+                    FROM wallets
+                    WHERE user_id = %s
+                    """,
+                    (user_id,),
+                )
+                row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="ensure_wallet",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {"user_id": user_id, "balance": 0}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="ensure_wallet",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def get_wallet_balance(user_id: str, request_id: str = "unknown") -> int:
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="get_wallet_balance", request_id=request_id, user_id=user_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute("SELECT balance FROM wallets WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="get_wallet_balance",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            if not row:
+                return 0
+            try:
+                return int(row.get("balance") or 0)
+            except Exception:
+                return 0
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="get_wallet_balance",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def wallet_seed_if_missing(user_id: str, seed_balance: int, request_id: str = "unknown") -> Dict[str, Any]:
+    """Seed wallet balance on first login if wallet is missing."""
+    start = time.perf_counter()
+    _log_event("db_query_start", query_name="wallet_seed_if_missing", request_id=request_id, user_id=user_id)
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            conn.autocommit = False
+            cur.execute("SELECT user_id, balance FROM wallets WHERE user_id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone()
+            seeded = False
+            if not row:
+                cur.execute(
+                    "INSERT INTO wallets (user_id, balance) VALUES (%s, %s) RETURNING user_id, balance",
+                    (user_id, int(seed_balance)),
+                )
+                row = cur.fetchone()
+                seeded = True
+            conn.commit()
+            _log_event(
+                "db_query_ok",
+                query_name="wallet_seed_if_missing",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            out = dict(row) if row else {"user_id": user_id, "balance": int(seed_balance)}
+            out["seeded"] = seeded
+            return out
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="wallet_seed_if_missing",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def wallet_debit(
+    user_id: str,
+    amount: int,
+    reason: str,
+    session_id: str | None = None,
+    doc_id: str | None = None,
+    request_id: str = "unknown",
+) -> Dict[str, Any]:
+    """Atomically debit wallet and write ledger entry. Raises ValueError on insufficient funds."""
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="wallet_debit",
+        request_id=request_id,
+        user_id=user_id,
+        amount=int(amount),
+        reason=str(reason or ""),
+        session_id=session_id,
+        doc_id=doc_id,
+    )
+    amt = int(amount)
+    if amt <= 0:
+        raise ValueError("amount_must_be_positive")
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            conn.autocommit = False
+            cur.execute("SELECT balance FROM wallets WHERE user_id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                cur.execute("INSERT INTO wallets (user_id, balance) VALUES (%s, 0)", (user_id,))
+                balance = 0
+            else:
+                balance = int(row.get("balance") or 0)
+
+            if balance < amt:
+                raise ValueError("insufficient_funds")
+
+            new_balance = balance - amt
+            cur.execute(
+                "UPDATE wallets SET balance = %s, updated_at = now() WHERE user_id = %s",
+                (new_balance, user_id),
+            )
+
+            ledger_id = str(uuid.uuid4())
+            cur.execute(
+                """
+                INSERT INTO wallet_ledger (id, user_id, delta, reason, session_id, doc_id, request_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (ledger_id, user_id, -amt, str(reason or "debit"), session_id, doc_id, request_id),
+            )
+
+            conn.commit()
+            _log_event(
+                "db_query_ok",
+                query_name="wallet_debit",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return {"ok": True, "user_id": user_id, "amount": amt, "balance": new_balance, "ledger_id": ledger_id}
+        except ValueError:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="wallet_debit",
                 request_id=request_id,
                 duration_ms=round((time.perf_counter() - start) * 1000, 2),
                 error=str(e),

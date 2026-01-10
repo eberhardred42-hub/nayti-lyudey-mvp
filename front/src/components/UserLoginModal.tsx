@@ -35,6 +35,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
   const [phone, setPhone] = useState("");
   const [code, setCode] = useState("");
   const [otpRequested, setOtpRequested] = useState(false);
+  const [offerAccepted, setOfferAccepted] = useState(false);
   const [adminStage, setAdminStage] = useState<"none" | "offer" | "pin">("none");
   const [adminPassword, setAdminPassword] = useState("");
   const [loading, setLoading] = useState(false);
@@ -42,7 +43,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
   const [info, setInfo] = useState<string | null>(null);
 
   const canRequest = useMemo(() => !!phone.trim() && !loading, [phone, loading]);
-  const canVerify = useMemo(() => !!phone.trim() && !!code.trim() && !loading, [phone, code, loading]);
+  const canVerify = useMemo(() => !!phone.trim() && !!code.trim() && offerAccepted && !loading, [phone, code, offerAccepted, loading]);
 
   useEffect(() => {
     if (!open) return;
@@ -54,6 +55,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
   function resetStateAfterClose() {
     setOtpRequested(false);
     setCode("");
+    setOfferAccepted(false);
     setAdminStage("none");
     setAdminPassword("");
     setInfo(null);
@@ -67,7 +69,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
     setError(null);
     setInfo(null);
     try {
-      const r = await fetch("/api/auth/otp/request", {
+      const r = await fetch("/api/auth/request_code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: phone.trim() }),
@@ -75,7 +77,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
       const data = (await r.json()) as { detail?: string };
       if (!r.ok) throw new Error(data?.detail || "Не удалось запросить код");
       setOtpRequested(true);
-      setInfo("Код отправлен. Введите его и нажмите «Войти». ");
+      setInfo("Код отправлен. Введите его, примите оферту и нажмите «Войти». ");
     } catch (e: unknown) {
       setError(getErrorMessage(e, "Ошибка"));
     } finally {
@@ -88,7 +90,7 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
     setError(null);
     setInfo(null);
     try {
-      const r = await fetch("/api/auth/otp/verify", {
+      const r = await fetch("/api/auth/verify_code", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ phone: phone.trim(), code: code.trim() }),
@@ -209,6 +211,20 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
                 style={{ display: "block", width: "100%", marginTop: 6, padding: 8 }}
                 autoComplete="one-time-code"
               />
+            </label>
+          ) : null}
+
+          {adminStage === "none" ? (
+            <label style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+              <input
+                type="checkbox"
+                checked={offerAccepted}
+                onChange={(e) => setOfferAccepted(e.target.checked)}
+                disabled={loading}
+              />
+              <span>
+                Принимаю условия <a href="/offer" target="_blank" rel="noreferrer">оферты</a>
+              </span>
             </label>
           ) : null}
 

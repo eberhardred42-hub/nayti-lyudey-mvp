@@ -14,6 +14,7 @@
 
 ## Последние изменения (кратко)
 
+- v2.12: DEV E2E journey: entry modes (A/C) + offer checkbox auth + /me balance + paid doc debit(150) + artifacts in /admin/logs + Product Smoke workflow.
 - v2.11: Intro P0: детерминированный бриф ≤10 вопросов + STOP rule; UI confirm/correct; `intro_done` показывает free previews и locked docs без автогенерации.
 - v2.10: DEV Deploy: добавлен итоговый summary (локал/домен/пинг/смоук) прямо в GitHub Actions run.
 - v2.9: DEV Deploy: исправлен blocking sanity-check локального upstream (убран баг со stdin/heredoc → больше нет ложных `JSONDecodeError`).
@@ -42,6 +43,25 @@ MVP флоу:
 - **A — LLM:** `POST /api/health/llm/ping` → 200 и есть `latency_ms` (реальный запрос наружу).
 - **B — Brief:** пройти бриф ≤ 10 вопросов → `ready_to_search=true`.
 - **C — Paid doc + wallet:** сгенерить 1 платный документ → появился `wallet.debit`, документ доступен на скачивание.
+
+## Быстрая проверка в браузере (DEV, 3–7 минут)
+
+1) Откройте DEV UI: https://dev.naitilyudei.ru
+2) Выберите режим:
+	- **Есть текст вакансии** (Mode A) → вставьте текст вакансии в ответ на первый вопрос.
+	- **Нет текста — отвечу на вопросы** (Mode C).
+3) Введите роль (например: Head of Sales) и нажмите **«Найти людей»**.
+4) Доведите интро до `Бриф готов` (≤ 10 вопросов).
+5) В блоке платных документов:
+	- выберите 1 документ → нажмите **«Купить и сгенерировать»**;
+	- если вы не залогинены, откроется модалка.
+6) В модалке логина:
+	- введите телефон и код, поставьте галочку принятия оферты (ссылка `/offer`).
+7) После генерации:
+	- обновите баланс (кнопка «Обновить») — должен уменьшиться на 150;
+	- откройте https://dev.naitilyudei.ru/admin/logs и убедитесь, что есть событие `wallet_debit`.
+
+Manual smoke (без деплоя): workflow `Product Smoke (DEV)`.
 
 ## Health / Observability (DEV)
 

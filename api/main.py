@@ -2281,6 +2281,10 @@ def _issue_guest_cookie_if_missing(request: Request, response: Response) -> str 
 OTP_LATEST: dict[str, str] = {}
 TOKENS: dict[str, dict] = {}
 
+OTP_TTL_SEC = 5 * 60
+ADMIN_SEED_PHONE_DIGITS = "89062592834"
+ADMIN_SEED_BALANCE = 1_000_000
+
 
 class OtpRequest(BaseModel):
     phone: str
@@ -2291,8 +2295,35 @@ class OtpVerify(BaseModel):
     code: str
 
 
-@app.post("/auth/otp/request")
-def auth_otp_request(body: OtpRequest, request: Request):
+def _otp_key(phone_e164: str) -> str:
+    return f"otp:{phone_e164}"
+
+
+def _digits_only(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+
+def _otp_store(phone_e164: str, code: str) -> None:
+    try:
+        _redis_client().setex(_otp_key(phone_e164), OTP_TTL_SEC, code)
+    except Exception:
+        # best-effort; keep in-memory fallback for debug
+        pass
+    OTP_LATEST[phone_e164] = code
+
+
+def _otp_load(phone_e164: str) -> str | None:
+    try:
+        v = _redis_client().get(_otp_key(phone_e164))
+        if v:
+            return str(v)
+    except Exception:
+        pass
+    return OTP_LATEST.get(phone_e164)
+
+
+@app.post("/auth/request_code")
+def auth_request_code(body: OtpRequest, request: Request):
     request_id = get_request_id_from_request(request)
     provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
     phone_raw = (body.phone or "").strip()
@@ -2300,28 +2331,99 @@ def auth_otp_request(body: OtpRequest, request: Request):
 
     stage_static_code = (os.environ.get("STAGE_STATIC_OTP_CODE") or "").strip()
     if provider == "mock" and stage_static_code:
-        # Stage-only convenience: when SMS_PROVIDER=mock and STAGE_STATIC_OTP_CODE is set,
-        # issue the same 6-digit code for everyone.
-        OTP_LATEST[phone_e164] = stage_static_code
-        log_event("auth_otp_requested", request_id=request_id, provider=provider)
-        return {"ok": True}
+        code = stage_static_code
+    else:
+        # Minimal mock: deterministic-ish code to avoid additional deps.
+        code = str(int(time.time()))[-6:].rjust(6, "0")
 
-    def _digits(s: str) -> str:
-        return "".join(ch for ch in s if ch.isdigit())
-
-    # Backward-compatible convenience: fixed code for a fixed phone.
-    static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
-    static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
-    if provider == "mock" and static_code and _digits(phone_raw) == _digits(static_phone):
-        OTP_LATEST[phone_e164] = static_code
-        log_event("auth_otp_requested", request_id=request_id, provider=provider)
-        return {"ok": True}
-
-    # Minimal mock: always generate a code; in real mode we would send SMS.
-    code = str(int(time.time()))[-6:].rjust(6, "0")
-    OTP_LATEST[phone_e164] = code
-    log_event("auth_otp_requested", request_id=request_id, provider=provider)
+    _otp_store(phone_e164, code)
+    log_event("auth_otp_issued", request_id=request_id, provider=provider)
+    trace_artifact(
+        session_id=None,
+        kind="auth_otp_issued",
+        request_id=request_id,
+        payload_json={
+            "provider": provider,
+            "phone_e164": _mask_phone(phone_e164),
+        },
+        meta={"flow": "auth"},
+    )
     return {"ok": True}
+
+
+@app.post("/auth/verify_code")
+def auth_verify_code(body: OtpVerify, request: Request):
+    request_id = get_request_id_from_request(request)
+    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
+    phone_raw = (body.phone or "").strip()
+    phone_e164 = _normalize_phone_e164(phone_raw)
+    code = (body.code or "").strip()
+
+    stage_static_code = (os.environ.get("STAGE_STATIC_OTP_CODE") or "").strip()
+    if provider == "mock" and stage_static_code:
+        if not hmac.compare_digest(code, stage_static_code):
+            raise HTTPException(status_code=401, detail="Invalid code")
+    else:
+        expected = _otp_load(phone_e164)
+        if (not expected) or (not hmac.compare_digest(code, expected)):
+            raise HTTPException(status_code=401, detail="Invalid code")
+
+    # Stable UUID for this phone (server-side; no PII in user_id).
+    user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
+    token = str(uuid.uuid4())
+    TOKENS[token] = {"user_id": user_id, "phone_e164": phone_e164}
+
+    try:
+        ensure_user(user_id=user_id, phone_e164=phone_e164, request_id=request_id)
+        ensure_wallet(user_id=user_id, initial_balance=0, request_id=request_id)
+    except Exception:
+        # best-effort
+        pass
+
+    # Seed admin wallet on first login (DEV only path).
+    try:
+        if _digits_only(phone_raw) == ADMIN_SEED_PHONE_DIGITS:
+            seeded_row = wallet_seed_if_missing(user_id=user_id, seed_balance=ADMIN_SEED_BALANCE, request_id=request_id)
+            if bool((seeded_row or {}).get("seeded")):
+                log_event("wallet_seed_admin", request_id=request_id, user_id=user_id, balance=int((seeded_row or {}).get("balance") or ADMIN_SEED_BALANCE))
+                trace_artifact(
+                    session_id=None,
+                    kind="wallet_seed_admin",
+                    request_id=request_id,
+                    payload_json={
+                        "user_id": user_id,
+                        "balance": int((seeded_row or {}).get("balance") or ADMIN_SEED_BALANCE),
+                    },
+                    meta={"flow": "wallet"},
+                )
+    except Exception:
+        pass
+
+    log_event("auth_verified", request_id=request_id)
+    trace_artifact(
+        session_id=None,
+        kind="auth_verified",
+        request_id=request_id,
+        payload_json={
+            "provider": provider,
+            "user_id": user_id,
+            "phone_e164": _mask_phone(phone_e164),
+        },
+        meta={"flow": "auth"},
+    )
+    allow = _admin_phone_allowlist()
+    return {
+        "ok": True,
+        "token": token,
+        "user_id": user_id,
+        "is_admin_candidate": (phone_e164 in allow),
+    }
+
+
+@app.post("/auth/otp/request")
+def auth_otp_request(body: OtpRequest, request: Request):
+    # Backward-compatible alias.
+    return auth_request_code(body, request)
 
 
 @app.get("/debug/otp/latest")
@@ -2339,49 +2441,8 @@ def debug_otp_latest(phone: str, request: Request):
 
 @app.post("/auth/otp/verify")
 def auth_otp_verify(body: OtpVerify, request: Request):
-    request_id = get_request_id_from_request(request)
-    provider = (os.environ.get("SMS_PROVIDER") or "mock").strip().lower()
-    phone_raw = (body.phone or "").strip()
-    phone_e164 = _normalize_phone_e164(phone_raw)
-    code = (body.code or "").strip()
-
-    stage_static_code = (os.environ.get("STAGE_STATIC_OTP_CODE") or "").strip()
-    if provider == "mock" and stage_static_code:
-        if not hmac.compare_digest(code, stage_static_code):
-            raise HTTPException(status_code=401, detail="Invalid code")
-    else:
-        expected = OTP_LATEST.get(phone_e164)
-
-        def _digits(s: str) -> str:
-            return "".join(ch for ch in s if ch.isdigit())
-
-        static_phone = (os.environ.get("STATIC_OTP_PHONE") or "89062592834").strip()
-        static_code = (os.environ.get("STATIC_OTP_CODE") or "1573").strip()
-
-        if not expected or code != expected:
-            if provider == "mock" and static_code and _digits(phone_raw) == _digits(static_phone):
-                if not hmac.compare_digest(code, static_code):
-                    raise HTTPException(status_code=401, detail="Invalid code")
-            else:
-                raise HTTPException(status_code=401, detail="Invalid code")
-
-    # Stable UUID for this phone (server-side; no PII in user_id).
-    user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
-    token = str(uuid.uuid4())
-    TOKENS[token] = {"user_id": user_id, "phone_e164": phone_e164}
-    try:
-        ensure_user(user_id=user_id, phone_e164=phone_e164, request_id=request_id)
-    except Exception:
-        # best-effort
-        pass
-    log_event("auth_otp_verified", request_id=request_id)
-    allow = _admin_phone_allowlist()
-    return {
-        "ok": True,
-        "token": token,
-        "user_id": user_id,
-        "is_admin_candidate": (phone_e164 in allow),
-    }
+    # Backward-compatible alias.
+    return auth_verify_code(body, request)
 
 
 @app.post("/legal/offer/accept")
@@ -2625,6 +2686,7 @@ except Exception as e:
 class SessionCreate(BaseModel):
     profession_query: str
     flow: str | None = None
+    entry_mode: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -3788,6 +3850,88 @@ def chat_message(body: ChatMessage, request: Request):
 
         def _intro_llm_extract(field_name: str, user_text: str, bs: dict, pq: str):
             # Returns: (brief_patch, propose_value, ui_mode)
+            if field_name == "vacancy_text":
+                system = (
+                    "Ты помощник, который извлекает P0 бриф из текста вакансии. "
+                    "Верни строго JSON. Не придумывай. "
+                    "Если поле неизвестно — ставь null. "
+                    "Сформируй список uncertain_fields для тех полей, где нужно подтверждение/уточнение."
+                )
+                user = {
+                    "task": "extract_p0_from_vacancy_text",
+                    "profession_query": pq,
+                    "vacancy_text": user_text,
+                    "output_schema": {
+                        "p0": {f: "string|object|array|null" for f in intro_engine.P0_ORDER},
+                        "uncertain_fields": "array of field names from P0_ORDER",
+                    },
+                }
+                messages = [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+                ]
+
+                trace_artifact(
+                    session_id=sid,
+                    kind="intro_llm_extract_request",
+                    request_id=request_id,
+                    payload_json={
+                        "field": field_name,
+                        "asked_idx": _intro_asked_count(bs),
+                        "messages": text_fingerprint(json.dumps(messages, ensure_ascii=False), limit=800),
+                    },
+                    meta={"flow": "intro"},
+                )
+
+                out = generate_json_messages_observable(
+                    messages,
+                    request_id=request_id,
+                    session_id=sid,
+                    fallback={"p0": {}, "uncertain_fields": []},
+                    flow="intro_extract",
+                    doc_id=field_name,
+                )
+
+                p0 = out.get("p0") if isinstance(out, dict) else None
+                uncertain = out.get("uncertain_fields") if isinstance(out, dict) else None
+                p0_dict = p0 if isinstance(p0, dict) else {}
+                uncertain_list = uncertain if isinstance(uncertain, list) else []
+
+                patch: dict = {"vacancy_text": (user_text or "")[:5000]}
+                for f in intro_engine.P0_ORDER:
+                    v = p0_dict.get(f)
+                    if v is None:
+                        continue
+                    if isinstance(v, str) and not v.strip():
+                        continue
+                    patch[f] = v
+
+                # Build confirm queue for uncertain fields that have extracted values.
+                queue: list[dict] = []
+                for f in uncertain_list:
+                    ff = str(f or "").strip()
+                    if ff in intro_engine.P0_ORDER and (ff in patch):
+                        queue.append({"field": ff, "value": patch.get(ff), "propose": str(patch.get(ff))[:120]})
+                if queue:
+                    patch["__pending_queue"] = queue
+
+                trace_artifact(
+                    session_id=sid,
+                    kind="intro_llm_extract_response",
+                    request_id=request_id,
+                    payload_json={
+                        "field": field_name,
+                        "asked_idx": _intro_asked_count(bs),
+                        "ok": True,
+                        "extracted_fields": [k for k in patch.keys() if k in intro_engine.P0_ORDER],
+                        "pending_queue_len": len(queue),
+                    },
+                    meta={"flow": "intro"},
+                )
+
+                # For vacancy_text we don't use single-field propose_value; confirmations are via queue.
+                return patch, None, "free_text"
+
             system = (
                 "Ты помощник, который извлекает значение одного поля брифа. "
                 "Верни строго JSON. Не выбирай следующий вопрос."
@@ -4748,6 +4892,9 @@ def create_session_endpoint(body: SessionCreate, request: Request, response: Res
     user_id, _mode, _reason = resolve_user_or_guest(request, response)
 
     flow = (body.flow or "").strip().lower()
+    entry_mode = (body.entry_mode or "").strip().upper() or "C"
+    if entry_mode not in {"A", "B", "C", "D"}:
+        entry_mode = "C"
     
     # Create in-memory session for backward compatibility
     SESSIONS[session_id] = {
@@ -4766,7 +4913,11 @@ def create_session_endpoint(body: SessionCreate, request: Request, response: Res
         if user_id:
             set_session_user(session_id, user_id, request_id=request_id)
         if flow == "intro":
-            update_session(session_id, chat_state="intro", phase="INTRO", brief_state={}, request_id=request_id)
+            pq = (body.profession_query or "").strip()
+            brief0 = {"entry_mode": entry_mode}
+            if pq:
+                brief0["role_title"] = pq
+            update_session(session_id, chat_state="intro", phase="INTRO", brief_state=brief0, request_id=request_id)
     except Exception as e:
         log_event(
             "db_error",
@@ -5007,6 +5158,28 @@ def render_jobs_status(job_id: str, request: Request):
     }
 
 
+@app.get("/me")
+def me_get(request: Request):
+    """Auth-required (Bearer): return current user + wallet balance."""
+    request_id = get_request_id_from_request(request)
+    user = _require_bearer_user(request)
+    user_id = str((user or {}).get("user_id") or "").strip()
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        ensure_wallet(user_id=user_id, initial_balance=0, request_id=request_id)
+    except Exception:
+        pass
+    try:
+        bal = int(get_wallet_balance(user_id=user_id, request_id=request_id) or 0)
+    except Exception:
+        bal = 0
+
+    log_event("me_ok", request_id=request_id, user_id=user_id, balance=bal)
+    return {"ok": True, "user": {"id": user_id}, "balance": bal}
+
+
 @app.get("/me/files")
 def me_files(request: Request):
     """Auth-required: list files that belong to current user."""
@@ -5133,8 +5306,6 @@ class DocumentGeneratePackBody(BaseModel):
 @app.post("/documents/generate")
 def documents_generate(body: DocumentGenerateBody, request: Request):
     request_id = get_request_id_from_request(request)
-    user_id = _require_user_id(request)
-
     session_id = (body.session_id or "").strip()
     doc_id = (body.doc_id or "").strip()
     if not session_id or not doc_id:
@@ -5143,6 +5314,18 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
     cat = _catalog_item(doc_id)
     if not cat:
         raise HTTPException(status_code=404, detail="Document not found in catalog")
+
+    is_free = True
+    if isinstance(cat, dict) and cat.get("is_free") is not None:
+        is_free = bool(cat.get("is_free"))
+
+    if is_free:
+        user_id = _require_user_id(request)
+    else:
+        user = _require_bearer_user(request)
+        user_id = str((user or {}).get("user_id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
     sess = get_session(session_id, request_id=request_id)
     if not sess:
@@ -5245,6 +5428,50 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
                 "created_at": to_iso(row.get("created_at")),
             },
         }
+
+    # Paid docs: debit only when we're actually going to generate (not cached, not needs_input).
+    if not is_free:
+        try:
+            ensure_wallet(user_id=user_id, initial_balance=0, request_id=request_id)
+        except Exception:
+            pass
+        try:
+            debit = wallet_debit(
+                user_id=user_id,
+                amount=150,
+                reason="paid_doc_generate",
+                session_id=session_id,
+                doc_id=doc_id,
+                request_id=request_id,
+            )
+            log_event(
+                "wallet_debit",
+                request_id=request_id,
+                user_id=user_id,
+                session_id=session_id,
+                doc_id=doc_id,
+                amount=150,
+                balance=(debit or {}).get("balance"),
+                ledger_id=(debit or {}).get("ledger_id"),
+            )
+            trace_artifact(
+                session_id=session_id,
+                kind="wallet_debit",
+                request_id=request_id,
+                payload_json={
+                    "user_id": user_id,
+                    "amount": 150,
+                    "reason": "paid_doc_generate",
+                    "doc_id": doc_id,
+                    "balance": (debit or {}).get("balance"),
+                    "ledger_id": (debit or {}).get("ledger_id"),
+                },
+                meta={"flow": "wallet"},
+            )
+        except ValueError as e:
+            if str(e) == "insufficient_funds":
+                raise HTTPException(status_code=402, detail="Insufficient balance")
+            raise HTTPException(status_code=400, detail=str(e))
 
     # Create pending doc row
     row = create_document_record(
@@ -6516,6 +6743,16 @@ async def events_client(request: Request):
         client_event=event,
         props=props,
     )
+    try:
+        trace_artifact(
+            session_id=(str(body.get("session_id")) if isinstance(body, dict) and body.get("session_id") else None),
+            kind="client_event",
+            request_id=request_id,
+            payload_json={"event": event, "props": props},
+            meta={"flow": "client"},
+        )
+    except Exception:
+        pass
     return {"ok": True}
 
 

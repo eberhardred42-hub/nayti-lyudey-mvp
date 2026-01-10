@@ -49,6 +49,47 @@
   padding: 20px;
 }
 
+.modeCards {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  margin: 16px 0;
+}
+
+@media (min-width: 820px) {
+  .modeCards {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.modeCard {
+  text-align: left;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: #fff;
+  padding: 14px;
+  cursor: pointer;
+}
+
+.modeCard:hover {
+  border-color: rgba(0, 0, 0, 0.22);
+}
+
+.modeCardActive {
+  border-color: rgba(0, 0, 0, 0.5);
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.08);
+}
+
+.modeTitle {
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.modeDesc {
+  font-size: 14px;
+  color: rgba(0, 0, 0, 0.7);
+  line-height: 1.35;
+}
+
 .searchBox {
   width: 100%;
   max-width: 600px;
@@ -491,6 +532,33 @@
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.lockedSelect {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  user-select: none;
+}
+
+.lockedActions {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+}
+
+.balanceRow {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 10px 0 12px;
+}
+
+.downloadLink {
+  margin-left: 12px;
 }
 
 .lockedPrice {

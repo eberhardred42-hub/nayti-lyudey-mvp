@@ -28,6 +28,8 @@ type IntroResponse = {
 
 type View = "start" | "intro" | "done";
 
+type EntryMode = "A" | "C";
+
 function asRecord(v: unknown): Record<string, unknown> | null {
   if (!v || typeof v !== "object") return null;
   return v as Record<string, unknown>;
@@ -74,6 +76,7 @@ function renderValue(v: unknown): string {
 export default function Page() {
   const [view, setView] = useState<View>("start");
   const [profession, setProfession] = useState("");
+  const [entryMode, setEntryMode] = useState<EntryMode | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
 
   const [loginOpen, setLoginOpen] = useState(false);
@@ -92,6 +95,11 @@ export default function Page() {
   const [lockedDocs, setLockedDocs] = useState<
     Array<{ id: string; title: string; description?: string; price_rub: number; locked: boolean }>
   >([]);
+
+  const [selectedPaidDocIds, setSelectedPaidDocIds] = useState<string[]>([]);
+  const [meBalance, setMeBalance] = useState<number | null>(null);
+  const [docGenBusy, setDocGenBusy] = useState(false);
+  const [generatedDocs, setGeneratedDocs] = useState<Array<{ id: string; title: string; status: string; download_url?: string | null }>>([]);
 
   const [loading, setLoading] = useState(false);
   const [errorText, setErrorText] = useState<string | null>(null);
@@ -130,6 +138,11 @@ export default function Page() {
     if (correctionMode) return correctionText.trim().length > 0;
     return input.trim().length > 0;
   }, [loading, sessionId, view, correctionMode, correctionText, input]);
+
+  const canStart = useMemo(() => {
+    if (loading) return false;
+    return Boolean(profession.trim()) && Boolean(entryMode);
+  }, [loading, profession, entryMode]);
 
   function authHeaders(): Record<string, string> {
     const token = getUserToken();
@@ -173,7 +186,43 @@ export default function Page() {
     setBriefSnapshot(null);
     setFreeDocs([]);
     setLockedDocs([]);
+    setSelectedPaidDocIds([]);
+    setMeBalance(null);
+    setGeneratedDocs([]);
     setErrorText(null);
+  }
+
+  async function emitClientEvent(event: string, props?: Record<string, unknown>) {
+    try {
+      await fetch("/api/events/client", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ event, props: props || {}, session_id: sessionId || undefined }),
+      });
+    } catch {
+      // best-effort
+    }
+  }
+
+  async function loadMeBalance() {
+    const token = getUserToken();
+    if (!token) {
+      setMeBalance(null);
+      return;
+    }
+    try {
+      const r = await fetch("/api/me", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${token}` },
+        credentials: "include",
+      });
+      const data = await readJsonSafe(r);
+      const obj = asRecord(data);
+      const bal = obj && typeof obj.balance === "number" ? obj.balance : null;
+      if (r.ok) setMeBalance(bal);
+    } catch {
+      // ignore
+    }
   }
 
   function applyIntroResponse(resp: IntroResponse) {
@@ -208,6 +257,7 @@ export default function Page() {
 
   async function startIntro() {
     if (!profession.trim()) return;
+    if (!entryMode) return;
     setLoading(true);
     setErrorText(null);
     resetIntroUi();
@@ -216,7 +266,7 @@ export default function Page() {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
-        body: JSON.stringify({ profession_query: profession.trim() }),
+        body: JSON.stringify({ profession_query: profession.trim(), entry_mode: entryMode }),
       });
 
       const data = await readJsonSafe(r);
@@ -247,6 +297,59 @@ export default function Page() {
       setSessionId(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function ensureLoggedInForPaidAction() {
+    const token = getUserToken();
+    if (token) return true;
+    await emitClientEvent("auth_modal_required", { reason: "paid_docs" });
+    setLoginOpen(true);
+    return false;
+  }
+
+  async function generateSelectedPaidDocs() {
+    if (!sessionId) return;
+    const ok = await ensureLoggedInForPaidAction();
+    if (!ok) return;
+
+    const token = getUserToken();
+    if (!token) return;
+
+    const selected = selectedPaidDocIds.slice(0);
+    if (!selected.length) return;
+
+    setDocGenBusy(true);
+    setErrorText(null);
+    try {
+      const results: Array<{ id: string; title: string; status: string; download_url?: string | null }> = [];
+      for (const docId of selected) {
+        const r = await fetch("/api/documents/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+          credentials: "include",
+          body: JSON.stringify({ session_id: sessionId, doc_id: docId }),
+        });
+        const data = await readJsonSafe(r);
+        const obj = asRecord(data);
+        if (!r.ok || !obj) {
+          const detail = obj && typeof obj.detail === "string" ? obj.detail : "generate_failed";
+          throw new Error(detail);
+        }
+        const d = asRecord(obj.document);
+        results.push({
+          id: String(d?.id || ""),
+          title: String(d?.title || docId),
+          status: String(d?.status || ""),
+          download_url: typeof d?.download_url === "string" ? String(d.download_url) : null,
+        });
+      }
+      setGeneratedDocs(results);
+      await loadMeBalance();
+    } catch (e) {
+      setErrorText(String(e));
+    } finally {
+      setDocGenBusy(false);
     }
   }
 
@@ -342,7 +445,10 @@ export default function Page() {
       <UserLoginModal
         open={loginOpen}
         onClose={() => setLoginOpen(false)}
-        onLoggedIn={() => setUserTokenState(getUserToken())}
+        onLoggedIn={() => {
+          setUserTokenState(getUserToken());
+          void loadMeBalance();
+        }}
       />
 
       {view === "start" ? (
@@ -355,11 +461,33 @@ export default function Page() {
               placeholder="Кого ищете? Например: Head of Sales"
               disabled={loading}
               onKeyDown={(e) => {
-                if (e.key === "Enter") void startIntro();
+                if (e.key === "Enter" && canStart) void startIntro();
               }}
             />
-            <button className={styles.searchBtn} disabled={loading || !profession.trim()} onClick={() => void startIntro()}>
-              {loading ? "Запускаю…" : "Начать"}
+          </div>
+
+          <div className={styles.modeCards}>
+            <button
+              className={`${styles.modeCard} ${entryMode === "A" ? styles.modeCardActive : ""}`}
+              disabled={loading}
+              onClick={() => setEntryMode("A")}
+            >
+              <div className={styles.modeTitle}>Есть текст вакансии</div>
+              <div className={styles.modeDesc}>Вставьте текст — извлеку требования и уточню спорное</div>
+            </button>
+            <button
+              className={`${styles.modeCard} ${entryMode === "C" ? styles.modeCardActive : ""}`}
+              disabled={loading}
+              onClick={() => setEntryMode("C")}
+            >
+              <div className={styles.modeTitle}>Нет текста — отвечу на вопросы</div>
+              <div className={styles.modeDesc}>До 10 вопросов, чтобы собрать P0 бриф</div>
+            </button>
+          </div>
+
+          <div className={styles.searchBox}>
+            <button className={styles.searchBtn} disabled={!canStart} onClick={() => void startIntro()}>
+              {loading ? "Запускаю…" : "Найти людей"}
             </button>
           </div>
           {errorText ? <div className={styles.inlineError}>{errorText}</div> : null}
@@ -398,6 +526,20 @@ export default function Page() {
               </div>
             ))}
 
+            {briefRows.length && view !== "done" ? (
+              <div className={styles.briefBox}>
+                <div className={styles.briefTitle}>Черновик брифа (P0)</div>
+                <div className={styles.briefGrid}>
+                  {briefRows.map((row) => (
+                    <div key={row.k} className={styles.briefRow}>
+                      <div className={styles.briefKey}>{briefLabel(row.k)}</div>
+                      <pre className={styles.briefVal}>{row.v}</pre>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
             {view === "done" ? (
               <div className={styles.doneArea}>
                 <h3 className={styles.doneTitle}>Бриф готов</h3>
@@ -433,6 +575,21 @@ export default function Page() {
                 {lockedDocs.length ? (
                   <div className={styles.docsSection}>
                     <h4 className={styles.docsTitle}>Платные документы</h4>
+                    {userToken ? (
+                      <div className={styles.balanceRow}>
+                        Баланс: <b>{meBalance === null ? "—" : `${meBalance} ₽`}</b>
+                        <button className={styles.secondaryBtn} disabled={loading || docGenBusy} onClick={() => void loadMeBalance()}>
+                          Обновить
+                        </button>
+                      </div>
+                    ) : (
+                      <div className={styles.lockedHint}>
+                        Для покупки/генерации нужна авторизация.
+                        <button className={styles.secondaryBtn} onClick={() => setLoginOpen(true)}>
+                          Войти
+                        </button>
+                      </div>
+                    )}
                     <div className={styles.lockedGrid}>
                       {lockedDocs.map((d) => (
                         <div key={d.id} className={styles.lockedCard}>
@@ -440,14 +597,59 @@ export default function Page() {
                           {d.description ? <div className={styles.lockedDesc}>{d.description}</div> : null}
                           <div className={styles.lockedFooter}>
                             <div className={styles.lockedPrice}>{d.price_rub} ₽</div>
-                            <button className={styles.fullPackageBtn} onClick={() => setPayModalOpen(true)}>
-                              Купить
-                            </button>
+                            <label className={styles.lockedSelect}>
+                              <input
+                                type="checkbox"
+                                checked={selectedPaidDocIds.includes(d.id)}
+                                onChange={(e) => {
+                                  const checked = e.target.checked;
+                                  setSelectedPaidDocIds((prev) => {
+                                    const s = new Set(prev);
+                                    if (checked) s.add(d.id);
+                                    else s.delete(d.id);
+                                    return Array.from(s);
+                                  });
+                                }}
+                              />
+                              Выбрать
+                            </label>
                           </div>
                         </div>
                       ))}
                     </div>
-                    <div className={styles.lockedHint}>PDF/пакеты не генерируются до выбора и оплаты.</div>
+                    <div className={styles.lockedActions}>
+                      <button
+                        className={styles.fullPackageBtn}
+                        disabled={!selectedPaidDocIds.length || docGenBusy}
+                        onClick={() => void generateSelectedPaidDocs()}
+                      >
+                        {docGenBusy ? "Генерирую…" : `Купить и сгенерировать (${selectedPaidDocIds.length})`}
+                      </button>
+                      <button className={styles.secondaryBtn} disabled={docGenBusy} onClick={() => setSelectedPaidDocIds([])}>
+                        Сбросить
+                      </button>
+                    </div>
+
+                    {generatedDocs.length ? (
+                      <div className={styles.docsSection}>
+                        <h4 className={styles.docsTitle}>Результат</h4>
+                        <div className={styles.docsList}>
+                          {generatedDocs.map((d) => (
+                            <div key={d.id} className={styles.docCard}>
+                              <div className={styles.docSummary}>{d.title}</div>
+                              <div className={styles.lockedHint}>
+                                Статус: {d.status}
+                                {d.download_url ? (
+                                  <a className={styles.downloadLink} href={d.download_url} target="_blank" rel="noreferrer">
+                                    Скачать
+                                  </a>
+                                ) : null}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 ) : null}
               </div>

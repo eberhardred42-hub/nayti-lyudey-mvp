@@ -1,0 +1,219 @@
+name: Product Smoke (DEV)
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: "Base URL for DEV (no trailing slash), e.g. https://dev.naitilyudei.ru"
+        required: false
+        default: "https://dev.naitilyudei.ru"
+      profession_query:
+        description: "Profession query"
+        required: false
+        default: "Head of Sales"
+      otp_phone:
+        description: "Phone to login (admin phone for seed)"
+        required: false
+        default: "89062592834"
+      otp_code:
+        description: "OTP code (use STAGE_STATIC_OTP_CODE in DEV, or read from logs)"
+        required: false
+        default: "000000"
+      admin_password:
+        description: "Admin PIN/password for /admin/login"
+        required: false
+        default: "1573"
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, stage]
+    steps:
+      - name: LLM ping
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="${{ inputs.base_url }}"
+          url="$base_url/api/health/llm/ping"
+          echo "POST $url"
+          curl -fsS -4 -X POST "$url" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+
+      - name: Mode C intro to done
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_url="${{ inputs.base_url }}"
+          api="$base_url/api"
+          pq="${{ inputs.profession_query }}"
+
+          user_id="gh-smoke-$(date +%s)-$RANDOM"
+          echo "X-User-Id: $user_id"
+
+          session_json=$(curl -fsS -4 -X POST "$api/sessions" \
+            -H 'Content-Type: application/json' \
+            -H "X-User-Id: $user_id" \
+            -d "{\"profession_query\": \"$pq\", \"entry_mode\": \"C\"}")
+
+          sid=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('session_id','') or '')
+PY
+<<<"$session_json")
+
+          if [ -z "$sid" ]; then
+            echo "ERROR: session_id is empty"
+            echo "$session_json" | head -c 4000
+            exit 1
+          fi
+          echo "session_id=$sid" >> "$GITHUB_ENV"
+          echo "session_id=$sid"
+
+          start_json=$(curl -fsS -4 -X POST "$api/chat/message" \
+            -H 'Content-Type: application/json' \
+            -H "X-User-Id: $user_id" \
+            -d "{\"session_id\": \"$sid\", \"type\": \"intro_start\"}")
+
+          echo "$start_json" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin), ensure_ascii=False, indent=2))'
+
+          done=0
+          for i in $(seq 1 12); do
+            msg_json=$(curl -fsS -4 -X POST "$api/chat/message" \
+              -H 'Content-Type: application/json' \
+              -H "X-User-Id: $user_id" \
+              -d "{\"session_id\": \"$sid\", \"type\": \"intro_message\", \"text\": \"ответ $i\"}")
+
+            msg_type=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('type','') or '')
+PY
+<<<"$msg_json")
+
+            asked=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+prog=obj.get('progress') or {}
+print(prog.get('asked',''))
+PY
+<<<"$msg_json")
+
+            echo "turn=$i type=$msg_type asked=$asked"
+            if [ "$msg_type" = "intro_done" ]; then
+              done=1
+              break
+            fi
+          done
+
+          if [ "$done" != "1" ]; then
+            echo "ERROR: intro_done not reached within 12 turns"
+            exit 1
+          fi
+
+      - name: Login via OTP + seed wallet + generate paid doc + verify in admin logs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_url="${{ inputs.base_url }}"
+          api="$base_url/api"
+          phone="${{ inputs.otp_phone }}"
+          code="${{ inputs.otp_code }}"
+          admin_password="${{ inputs.admin_password }}"
+          sid="${{ env.session_id }}"
+
+          echo "== request_code =="
+          curl -fsS -4 -X POST "$api/auth/request_code" \
+            -H 'Content-Type: application/json' \
+            -d "{\"phone\":\"$phone\"}" >/dev/null
+
+          echo "== verify_code =="
+          verify_json=$(curl -fsS -4 -X POST "$api/auth/verify_code" \
+            -H 'Content-Type: application/json' \
+            -d "{\"phone\":\"$phone\",\"code\":\"$code\"}")
+
+          token=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('token','') or '')
+PY
+<<<"$verify_json")
+
+          if [ -z "$token" ]; then
+            echo "ERROR: no token in verify response"
+            echo "$verify_json" | head -c 4000
+            exit 1
+          fi
+
+          echo "== /me =="
+          me_json=$(curl -fsS -4 -X GET "$api/me" -H "Authorization: Bearer $token")
+          echo "$me_json" | python3 -c 'import json,sys; obj=json.load(sys.stdin); bal=obj.get("balance"); assert isinstance(bal,(int,float)); print("balance=",bal)'
+
+          echo "== pick a paid doc from /documents/catalog =="
+          cat_json=$(curl -fsS -4 "$api/documents/catalog")
+          paid_doc=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+items=obj.get('items') or []
+for it in items:
+    if isinstance(it, dict) and it.get('is_free') is False:
+        print(it.get('id') or '')
+        raise SystemExit(0)
+print('')
+PY
+<<<"$cat_json")
+
+          if [ -z "$paid_doc" ]; then
+            echo "ERROR: no paid doc in catalog"
+            exit 1
+          fi
+          echo "paid_doc=$paid_doc"
+
+          echo "== generate paid doc (should debit 150) =="
+          gen_json=$(curl -fsS -4 -X POST "$api/documents/generate" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $token" \
+            -d "{\"session_id\":\"$sid\",\"doc_id\":\"$paid_doc\"}")
+
+          echo "$gen_json" | python3 -c 'import json,sys; obj=json.load(sys.stdin); assert obj.get("ok") is True; print("generate ok")'
+
+          echo "== admin login =="
+          admin_json=$(curl -fsS -4 -X POST "$api/admin/login" \
+            -H 'Content-Type: application/json' \
+            -H "Authorization: Bearer $token" \
+            -d "{\"admin_password\":\"$admin_password\"}")
+
+          admin_token=$(python3 - <<'PY'
+import json,sys
+obj=json.loads(sys.stdin.read())
+print(obj.get('admin_token','') or '')
+PY
+<<<"$admin_json")
+
+          if [ -z "$admin_token" ]; then
+            echo "ERROR: no admin_token"
+            echo "$admin_json" | head -c 2000
+            exit 1
+          fi
+
+          echo "== check /admin/logs for wallet_debit =="
+          logs_json=$(curl -fsS -4 "$api/admin/logs?kind=wallet_debit&limit=50" -H "X-Admin-Token: $admin_token")
+
+          echo "$logs_json" | python3 - <<'PY'
+import json,sys
+obj=json.load(sys.stdin)
+items=obj.get('items') or []
+ok=False
+for it in items:
+    if not isinstance(it, dict):
+        continue
+    if it.get('kind') != 'wallet_debit':
+        continue
+    p = it.get('payload_json') or {}
+    if isinstance(p, dict) and int(p.get('amount') or 0) == 150:
+        ok=True
+        break
+if not ok:
+    raise SystemExit('wallet_debit(150) not found in admin logs')
+print('wallet_debit found')
+PY
+

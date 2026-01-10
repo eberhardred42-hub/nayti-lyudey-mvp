@@ -28,6 +28,17 @@ P0_ORDER: List[str] = [
 ]
 
 
+def init_brief_state(profession_query: str, entry_mode: str = "C") -> JsonDict:
+    pq = (profession_query or "").strip()
+    em = (entry_mode or "").strip().upper() or "C"
+    if em not in {"A", "B", "C", "D"}:
+        em = "C"
+    bs: JsonDict = {"entry_mode": em}
+    if pq:
+        bs["role_title"] = pq
+    return bs
+
+
 def _p0_field_present(brief_state: object, field_name: str) -> bool:
     bs = _as_json_dict(brief_state)
     v = bs.get(field_name)
@@ -53,15 +64,25 @@ def p0_missing_fields(brief_state: object) -> List[str]:
 
 
 def choose_next_field(brief_state: object) -> Tuple[List[str], Optional[str]]:
-    missing = p0_missing_fields(brief_state)
+    bs = _as_json_dict(brief_state)
+    entry_mode = str(bs.get("entry_mode") or "").strip().upper()
+    if entry_mode == "A" and not _p0_field_present(bs, "vacancy_text"):
+        missing = p0_missing_fields(bs)
+        return (["vacancy_text"] + missing), "vacancy_text"
+    missing = p0_missing_fields(bs)
     return missing, (missing[0] if missing else None)
 
 
 def question_for_field(field_name: str) -> Tuple[str, List[str]]:
+    if field_name == "vacancy_text":
+        return (
+            "Вставьте текст вакансии (можно без контактов). Я извлеку ключевые требования и уточню спорные места.",
+            [],
+        )
     if field_name == "source_mode":
         return (
-            "Как удобнее дать вводные?",
-            ["A — текст вакансии", "B — своими словами", "C — вопросы", "D — пропустить"],
+            "Откуда у вас задача на найм?",
+            ["Новая вакансия", "Замена", "Рост команды", "Другое"],
         )
     if field_name == "problem":
         return ("Какая проблема/контекст у найма? (1–3 фразы)", [])
@@ -288,6 +309,15 @@ def intro_start(brief_state: object) -> Tuple[JsonDict, JsonDict]:
     return bs, resp
 
 
+def _next_pending_item(intro: JsonDict) -> Optional[JsonDict]:
+    q = intro.get("pending_queue")
+    if not isinstance(q, list) or not q:
+        return None
+    item = q.pop(0)
+    intro["pending_queue"] = q
+    return item if isinstance(item, dict) else None
+
+
 def intro_message(
     brief_state: object,
     text: str,
@@ -334,6 +364,29 @@ def intro_message(
         intro.pop("pending", None)
         current_field = pf
 
+        # If there is a pending queue, continue confirmations without consuming a question.
+        nxt = _next_pending_item(intro)
+        if nxt and str(nxt.get("field") or ""):
+            nf = str(nxt.get("field") or "")
+            intro["pending"] = {"field": nf, "value": nxt.get("value"), "propose": nxt.get("propose")}
+            _set_intro_meta(bs, intro)
+
+            bs2 = deep_merge_dict(bs, brief_patch) if brief_patch else bs
+            propose = str(nxt.get("propose") or nxt.get("value") or "").strip()
+            resp_q: JsonDict = {
+                "type": "intro_question",
+                "progress": progress_dict(asked),
+                "target_field": nf,
+                "question_text": f"Понял(а): {propose}. Подтвердить?",
+                "propose_value": propose or None,
+                "ui_mode": "confirm_correct",
+                "brief_snapshot": brief_snapshot_p0(bs2),
+                "missing_fields": p0_missing_fields(bs2),
+                "quick_replies": ["Да", "Исправить"],
+                "ready_to_search": False,
+            }
+            return bs2, resp_q
+
     elif current_field and text:
         if llm_extract:
             llm_patch, propose_value, ui_mode = llm_extract(current_field, text, bs, profession_query)
@@ -341,6 +394,14 @@ def intro_message(
                 brief_patch = llm_patch
             else:
                 brief_patch = apply_answer_heuristic(bs, current_field, text, profession_query)
+
+            # Support multi-field confirm queue (used by entry_mode=A vacancy_text extraction).
+            queue = None
+            if isinstance(llm_patch, dict) and isinstance(llm_patch.get("__pending_queue"), list):
+                queue = cast(list, llm_patch.get("__pending_queue"))
+                brief_patch = dict(llm_patch)
+                brief_patch.pop("__pending_queue", None)
+                intro["pending_queue"] = queue
 
             # If we have a proposed value, we pause and ask for confirmation in the same turn.
             if propose_value is not None and ui_mode == "confirm_correct":
@@ -361,6 +422,29 @@ def intro_message(
                     "ready_to_search": False,
                 }
                 return deep_merge_dict(bs, brief_patch), resp
+
+            # If we have a queued confirmation, ask for the first item.
+            if isinstance(intro.get("pending_queue"), list) and intro.get("pending_queue") and not intro.get("pending"):
+                nxt = _next_pending_item(intro)
+                if nxt and str(nxt.get("field") or ""):
+                    nf = str(nxt.get("field") or "")
+                    propose = str(nxt.get("propose") or nxt.get("value") or "").strip()
+                    intro["pending"] = {"field": nf, "value": nxt.get("value"), "propose": propose}
+                    _set_intro_meta(bs, intro)
+                    bs2 = deep_merge_dict(bs, brief_patch)
+                    resp_q: JsonDict = {
+                        "type": "intro_question",
+                        "progress": progress_dict(asked),
+                        "target_field": nf,
+                        "question_text": f"Понял(а): {propose}. Подтвердить?",
+                        "propose_value": propose or None,
+                        "ui_mode": "confirm_correct",
+                        "brief_snapshot": brief_snapshot_p0(bs2),
+                        "missing_fields": p0_missing_fields(bs2),
+                        "quick_replies": ["Да", "Исправить"],
+                        "ready_to_search": False,
+                    }
+                    return bs2, resp_q
 
         else:
             brief_patch = apply_answer_heuristic(bs, current_field, text, profession_query)
