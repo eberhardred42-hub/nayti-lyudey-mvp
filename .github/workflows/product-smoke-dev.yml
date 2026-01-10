@@ -148,6 +148,12 @@ PY
           me_json=$(curl -fsS -4 -X GET "$api/me" -H "Authorization: Bearer $token")
           echo "$me_json" | python3 -c 'import json,sys; obj=json.load(sys.stdin); bal=obj.get("balance"); assert isinstance(bal,(int,float)); print("balance=",bal)'
 
+          echo "== accept offer (required for paid docs) =="
+          curl -fsS -4 -X POST "$api/legal/offer/accept" \
+            -H "Authorization: Bearer $token" \
+            -H 'Content-Type: application/json' \
+            -d '{}' >/dev/null
+
           echo "== pick a paid doc from /documents/catalog =="
           cat_json=$(curl -fsS -4 "$api/documents/catalog")
           paid_doc=$(python3 - <<'PY'

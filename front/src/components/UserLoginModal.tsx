@@ -103,6 +103,20 @@ export function UserLoginModal({ open, onClose, onLoggedIn }: Props) {
       if (data.user_id) setUserId(String(data.user_id));
       if (data.role) setUserRole(String(data.role));
 
+      // Persist offer acceptance server-side (required for paid docs).
+      try {
+        await fetch("/api/legal/offer/accept", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${String(data.token)}`,
+          },
+          body: JSON.stringify({}),
+        });
+      } catch {
+        // best-effort
+      }
+
       const candidate = Boolean(data.is_admin_candidate);
       onLoggedIn?.();
 

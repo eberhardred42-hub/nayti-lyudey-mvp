@@ -52,6 +52,8 @@ from db import (
 from db import (
     ensure_user,
     get_user_by_id,
+    mark_offer_accepted,
+    is_offer_accepted,
     create_admin_session,
     get_admin_session_by_token_hash,
     revoke_admin_session,
@@ -417,6 +419,10 @@ def _require_bearer_user(request: Request) -> dict:
         return {"user_id": user_id, "phone_e164": phone_e164}
 
     rec = TOKENS.get(token)
+    if not rec:
+        rec = _token_load(token)
+        if rec:
+            TOKENS[token] = rec
     if not rec:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return rec
@@ -2282,8 +2288,34 @@ OTP_LATEST: dict[str, str] = {}
 TOKENS: dict[str, dict] = {}
 
 OTP_TTL_SEC = 5 * 60
+TOKEN_TTL_SEC = 30 * 24 * 3600
 ADMIN_SEED_PHONE_DIGITS = "89062592834"
 ADMIN_SEED_BALANCE = 1_000_000
+
+
+def _token_key(token: str) -> str:
+    return f"token:{token}"
+
+
+def _token_store(token: str, rec: dict) -> None:
+    try:
+        _redis_client().setex(_token_key(token), TOKEN_TTL_SEC, json.dumps(rec, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def _token_load(token: str) -> dict | None:
+    try:
+        raw = _redis_client().get(_token_key(token))
+        if not raw:
+            return None
+        try:
+            obj = json.loads(str(raw))
+        except Exception:
+            return None
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
 class OtpRequest(BaseModel):
@@ -2371,7 +2403,9 @@ def auth_verify_code(body: OtpVerify, request: Request):
     # Stable UUID for this phone (server-side; no PII in user_id).
     user_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "nly:phone:" + phone_e164))
     token = str(uuid.uuid4())
-    TOKENS[token] = {"user_id": user_id, "phone_e164": phone_e164}
+    rec = {"user_id": user_id, "phone_e164": phone_e164}
+    TOKENS[token] = rec
+    _token_store(token, rec)
 
     try:
         ensure_user(user_id=user_id, phone_e164=phone_e164, request_id=request_id)
@@ -2448,8 +2482,27 @@ def auth_otp_verify(body: OtpVerify, request: Request):
 @app.post("/legal/offer/accept")
 def legal_offer_accept(request: Request):
     request_id = get_request_id_from_request(request)
-    _ = _require_user_id(request)
-    log_event("legal_offer_accepted", request_id=request_id)
+    user = _require_bearer_user(request)
+    user_id = str((user or {}).get("user_id") or "").strip()
+    phone_e164 = str((user or {}).get("phone_e164") or "").strip()
+    if not user_id or not phone_e164:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    try:
+        ensure_user(user_id=user_id, phone_e164=phone_e164, request_id=request_id)
+    except Exception:
+        pass
+    try:
+        mark_offer_accepted(user_id=user_id, request_id=request_id)
+    except Exception:
+        pass
+    trace_artifact(
+        session_id=None,
+        kind="legal_offer_accepted",
+        request_id=request_id,
+        payload_json={"user_id": user_id},
+        meta={"flow": "legal"},
+    )
+    log_event("legal_offer_accepted", request_id=request_id, user_id=user_id)
     return {"ok": True}
 
 
@@ -5326,6 +5379,16 @@ def documents_generate(body: DocumentGenerateBody, request: Request):
         user_id = str((user or {}).get("user_id") or "").strip()
         if not user_id:
             raise HTTPException(status_code=401, detail="Unauthorized")
+
+        # Paid docs require explicit offer acceptance.
+        try:
+            if not is_offer_accepted(user_id=user_id, request_id=request_id):
+                raise HTTPException(status_code=412, detail="offer_not_accepted")
+        except HTTPException:
+            raise
+        except Exception:
+            # If DB is unavailable, fail closed.
+            raise HTTPException(status_code=503, detail="offer_check_unavailable")
 
     sess = get_session(session_id, request_id=request_id)
     if not sess:

@@ -323,6 +323,7 @@ export default function Page() {
     setErrorText(null);
     try {
       const results: Array<{ id: string; title: string; status: string; download_url?: string | null }> = [];
+      const docIds: string[] = [];
       for (const docId of selected) {
         const r = await fetch("/api/documents/generate", {
           method: "POST",
@@ -334,11 +335,16 @@ export default function Page() {
         const obj = asRecord(data);
         if (!r.ok || !obj) {
           const detail = obj && typeof obj.detail === "string" ? obj.detail : "generate_failed";
+          if (r.status === 412 && detail === "offer_not_accepted") {
+            throw new Error("Нужно принять оферту для платных документов (см. /offer)");
+          }
           throw new Error(detail);
         }
         const d = asRecord(obj.document);
+        const id = String(d?.id || "");
+        if (id) docIds.push(id);
         results.push({
-          id: String(d?.id || ""),
+          id,
           title: String(d?.title || docId),
           status: String(d?.status || ""),
           download_url: typeof d?.download_url === "string" ? String(d.download_url) : null,
@@ -346,6 +352,41 @@ export default function Page() {
       }
       setGeneratedDocs(results);
       await loadMeBalance();
+
+      // Poll /me/documents to surface ready/download_url automatically.
+      if (docIds.length) {
+        for (let i = 0; i < 15; i++) {
+          await new Promise((res) => setTimeout(res, 2000));
+          const r = await fetch("/api/me/documents", {
+            method: "GET",
+            headers: { Authorization: `Bearer ${token}` },
+            credentials: "include",
+            cache: "no-store",
+          });
+          const data = await readJsonSafe(r);
+          const obj = asRecord(data);
+          const docs = obj && Array.isArray(obj.documents) ? (obj.documents as Array<Record<string, unknown>>) : [];
+          if (!r.ok || !docs.length) continue;
+
+          setGeneratedDocs((prev) => {
+            const byId = new Map<string, Record<string, unknown>>();
+            for (const it of docs) {
+              const id = typeof it.id === "string" ? it.id : "";
+              if (id) byId.set(id, it);
+            }
+            return prev.map((p) => {
+              const hit = byId.get(p.id);
+              if (!hit) return p;
+              const status = typeof hit.status === "string" ? hit.status : p.status;
+              const download = typeof hit.download_url === "string" ? hit.download_url : p.download_url;
+              return { ...p, status, download_url: download };
+            });
+          });
+
+          const done = docs.filter((d) => docIds.includes(String(d.id || ""))).every((d) => String(d.status || "") === "ready");
+          if (done) break;
+        }
+      }
     } catch (e) {
       setErrorText(String(e));
     } finally {

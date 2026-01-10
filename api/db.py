@@ -234,6 +234,14 @@ def init_db():
             )
         """)
 
+        # Offer acceptance (MVP legal gate for paid docs).
+        cur.execute(
+            """
+            ALTER TABLE users
+            ADD COLUMN IF NOT EXISTS offer_accepted_at TIMESTAMPTZ NULL
+            """
+        )
+
         # Wallets: simple balance + immutable ledger.
         cur.execute(
             """
@@ -1929,7 +1937,7 @@ def get_user_by_id(user_id: str, request_id: str = "unknown") -> Optional[Dict[s
         try:
             cur.execute(
                 """
-                SELECT id, phone_e164, created_at
+                SELECT id, phone_e164, created_at, offer_accepted_at
                 FROM users
                 WHERE id = %s
                 """,
@@ -1954,6 +1962,54 @@ def get_user_by_id(user_id: str, request_id: str = "unknown") -> Optional[Dict[s
                 error=str(e),
             )
             raise
+
+
+def mark_offer_accepted(user_id: str, request_id: str = "unknown") -> Dict[str, Any]:
+    start = time.perf_counter()
+    _log_event(
+        "db_query_start",
+        query_name="mark_offer_accepted",
+        request_id=request_id,
+        user_id=user_id,
+    )
+    with get_db_connection() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                UPDATE users
+                SET offer_accepted_at = COALESCE(offer_accepted_at, now())
+                WHERE id = %s
+                RETURNING id, offer_accepted_at
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            _log_event(
+                "db_query_ok",
+                query_name="mark_offer_accepted",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                rowcount=cur.rowcount,
+            )
+            return dict(row) if row else {}
+        except Exception as e:
+            _log_event(
+                "db_query_error",
+                level="error",
+                query_name="mark_offer_accepted",
+                request_id=request_id,
+                duration_ms=round((time.perf_counter() - start) * 1000, 2),
+                error=str(e),
+            )
+            raise
+
+
+def is_offer_accepted(user_id: str, request_id: str = "unknown") -> bool:
+    u = get_user_by_id(user_id=user_id, request_id=request_id)
+    if not u:
+        return False
+    return u.get("offer_accepted_at") is not None
 
 
 # ==========================================================================
