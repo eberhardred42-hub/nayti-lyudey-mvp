@@ -14,7 +14,7 @@
 
 ## Последние изменения (кратко)
 
-- v2.15: UX insufficient funds: считаем стоимость выбранного, подгружаем баланс, дизейблим покупку при нехватке.
+- v3.0: P0 Brief LLM loop: Mode C работает как 1 вопрос → 1 ответ → следующий вопрос (LLM), с флагом `llm_used`.
 - v2.12: DEV E2E journey: entry modes (A/C) + offer checkbox auth + /me balance + paid doc debit(150) + artifacts in /admin/logs + Product Smoke workflow.
 - v2.11: Intro P0: детерминированный бриф ≤10 вопросов + STOP rule; UI confirm/correct; `intro_done` показывает free previews и locked docs без автогенерации.
 - v2.10: DEV Deploy: добавлен итоговый summary (локал/домен/пинг/смоук) прямо в GitHub Actions run.
@@ -44,6 +44,15 @@ MVP флоу:
 - **A — LLM:** `POST /api/health/llm/ping` → 200 и есть `latency_ms` (реальный запрос наружу).
 - **B — Brief:** пройти бриф ≤ 10 вопросов → `ready_to_search=true`.
 - **C — Paid doc + wallet:** сгенерить 1 платный документ → появился `wallet.debit`, документ доступен на скачивание.
+
+## P0 Brief: LLM-driven flow
+
+Цель итерации: пройти самый первый реальный LLM-цикл на DEV: **вопрос → ответ → следующий вопрос**.
+
+Чекпоинты (ручная проверка):
+- `POST https://dev.naitilyudei.ru/api/health/llm/ping` → `200` и JSON `{ ok:true, latency_ms:<number> }`.
+- UI: роль “Маркетолог” → режим “Нет текста — отвечу на вопросы” → “Найти людей” → виден непустой текст вопроса.
+- Ответить любым текстом → виден второй непустой вопрос, отличный от первого (и рядом с сообщением ассистента есть бейдж `LLM`).
 
 ## Быстрая проверка в браузере (DEV, 3–7 минут)
 

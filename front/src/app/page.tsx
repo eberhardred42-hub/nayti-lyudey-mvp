@@ -5,7 +5,7 @@ import styles from "./page.module.css";
 import { clearUserSession, getOrCreateUserId, getUserToken } from "@/lib/userSession";
 import { UserLoginModal } from "@/components/UserLoginModal";
 
-type Msg = { role: "user" | "assistant"; text: string };
+type Msg = { role: "user" | "assistant"; text: string; llm_used?: boolean };
 
 type IntroProgress = { asked: number; max: number; remaining: number };
 
@@ -149,7 +149,7 @@ export default function Page() {
 
   const canStart = useMemo(() => {
     if (loading) return false;
-    return Boolean(profession.trim()) && Boolean(entryMode);
+    return profession.trim().length >= 2 && Boolean(entryMode);
   }, [loading, profession, entryMode]);
 
   function authHeaders(): Record<string, string> {
@@ -239,7 +239,8 @@ export default function Page() {
       (typeof resp.assistant_text === "string" && resp.assistant_text) ||
       (typeof resp.question_text === "string" && resp.question_text) ||
       "";
-    if (assistantText) setMessages((m) => [...m, { role: "assistant", text: assistantText }]);
+    const llmUsed = Boolean((resp as unknown as Record<string, unknown>)?.llm_used);
+    if (assistantText) setMessages((m) => [...m, { role: "assistant", text: assistantText, llm_used: llmUsed }]);
 
     setQuickReplies(Array.isArray(resp.quick_replies) ? resp.quick_replies.map(String).filter(Boolean) : []);
     setProgress(resp.progress && typeof resp.progress === "object" ? (resp.progress as IntroProgress) : null);
@@ -283,21 +284,40 @@ export default function Page() {
       if (!r.ok || !sid) throw new Error("no_session_id");
       setSessionId(sid);
 
-      const resp = await fetchGuestSafe("/api/chat/message", {
+      // 1) Start intro on backend (also allows tests to pass profession_query here).
+      const resp1 = await fetchGuestSafe("/api/chat/message", {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         credentials: "include",
-        body: JSON.stringify({ session_id: sid, type: "intro_start" }),
+        body: JSON.stringify({ session_id: sid, type: "intro_start", profession_query: profession.trim() }),
       });
 
-      const body = await readJsonSafe(resp);
-      const bodyObj = asRecord(body);
-      if (!resp.ok || !bodyObj) {
-        const detail = bodyObj && typeof bodyObj.detail === "string" ? bodyObj.detail : "";
+      const body1 = await readJsonSafe(resp1);
+      const bodyObj1 = asRecord(body1);
+      if (!resp1.ok || !bodyObj1) {
+        const detail = bodyObj1 && typeof bodyObj1.detail === "string" ? bodyObj1.detail : "";
         throw new Error(detail || "intro_start_failed");
       }
 
-      applyIntroResponse(bodyObj as unknown as IntroResponse);
+      // 2) For Mode C, immediately send exact mode string expected by backend mode detector.
+      if (entryMode === "C") {
+        const resp2 = await fetchGuestSafe("/api/chat/message", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders() },
+          credentials: "include",
+          body: JSON.stringify({ session_id: sid, type: "intro_message", text: "Нет текста — отвечу на вопросы" }),
+        });
+        const body2 = await readJsonSafe(resp2);
+        const bodyObj2 = asRecord(body2);
+        if (!resp2.ok || !bodyObj2) {
+          const detail = bodyObj2 && typeof bodyObj2.detail === "string" ? bodyObj2.detail : "";
+          throw new Error(detail || "intro_start_failed");
+        }
+        applyIntroResponse(bodyObj2 as unknown as IntroResponse);
+      } else {
+        // Mode A (vacancy text): show backend's first question (paste vacancy text).
+        applyIntroResponse(bodyObj1 as unknown as IntroResponse);
+      }
     } catch (e) {
       setErrorText(String(e));
       setMessages([{ role: "assistant", text: "Сервис временно недоступен. Попробуй ещё раз." }]);
@@ -613,6 +633,7 @@ export default function Page() {
                 key={idx}
                 className={`${styles.message} ${m.role === "user" ? styles.messageUser : styles.messageAssistant}`}
               >
+                {m.role === "assistant" && m.llm_used ? <span className={styles.llmPill}>LLM</span> : null}
                 {m.text}
               </div>
             ))}

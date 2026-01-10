@@ -2746,6 +2746,7 @@ class ChatMessage(BaseModel):
     session_id: str
     type: str
     text: str | None = None
+    profession_query: str | None = None
 
 
 class IntroDialogueResponse(BaseModel):
@@ -2754,6 +2755,7 @@ class IntroDialogueResponse(BaseModel):
     brief_patch: dict = {}
     ready_to_search: bool = False
     missing_fields: list[str] = []
+    llm_used: bool = False
 
 
 P0_ORDER = [
@@ -3817,9 +3819,194 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 pass
 
+        # Allow tests/clients to pass profession_query on intro_start.
+        if msg_type in {"intro_start", "intro"}:
+            pq_in = (getattr(body, "profession_query", None) or "").strip() if hasattr(body, "profession_query") else ""
+            if pq_in:
+                session["profession_query"] = pq_in
+
         profession_query = str(session.get("profession_query", "") or "")
         brief_state = session.get("brief_state") if isinstance(session.get("brief_state"), dict) else {}
         phase = str(session.get("phase") or "INTRO_P0").strip().upper() or "INTRO_P0"
+
+        def _brief_llm_state(bs: dict) -> dict:
+            v = bs.get("llm_brief")
+            return v if isinstance(v, dict) else {}
+
+        BRIEF_LLM_FIELDS = [
+            "role_title",
+            "level",
+            "location",
+            "work_format",
+            "salary_range",
+            "urgency",
+            "problem",
+            "hiring_goal",
+            "tasks_90d",
+            "must_have",
+            "nice_to_have",
+            "red_flags",
+        ]
+
+        def _field_present(bs: dict, name: str) -> bool:
+            v = bs.get(name)
+            if v is None:
+                return False
+            if isinstance(v, str):
+                return bool(v.strip())
+            if isinstance(v, list):
+                return any(bool(str(x).strip()) for x in v)
+            if isinstance(v, dict):
+                return len(v) > 0
+            return True
+
+        def _missing_fields(bs: dict) -> list[str]:
+            out: list[str] = []
+            for f in BRIEF_LLM_FIELDS:
+                if not _field_present(bs, f):
+                    out.append(f)
+            return out
+
+        def _normalize_mode_text(t: str) -> str:
+            return (t or "").strip().lower()
+
+        def _is_mode_questions_text(t: str) -> bool:
+            low = _normalize_mode_text(t)
+            return "нет" in low and "вопрос" in low
+
+        def _is_mode_vacancy_text(t: str) -> bool:
+            low = _normalize_mode_text(t)
+            return "есть" in low and "текст" in low and "ваканс" in low
+
+        def _llm_brief_next_question(
+            *,
+            bs: dict,
+            last_user_message: str,
+            request_id: str,
+            session_id: str,
+        ) -> tuple[str, list[str], bool]:
+            # Ensure minimal known brief.
+            pq = (profession_query or "").strip()
+            if pq and not _field_present(bs, "role_title"):
+                bs["role_title"] = pq
+
+            st = _brief_llm_state(bs)
+            asked_fields = st.get("asked_fields") if isinstance(st.get("asked_fields"), list) else []
+            asked_fields = [str(x) for x in asked_fields if str(x).strip()]
+
+            missing = _missing_fields(bs)
+            # Always allow role_title to be treated as known once set.
+            missing = [f for f in missing if f != "role_title"]
+
+            # Choose next field to focus on (subset is OK for iteration 1).
+            next_field = None
+            for f in ["level", "location", "salary_range", "work_format", "urgency"]:
+                if f in missing and f not in asked_fields:
+                    next_field = f
+                    break
+            if not next_field:
+                for f in missing:
+                    if f not in asked_fields:
+                        next_field = f
+                        break
+
+            missing_for_llm = [next_field] if next_field else missing[:3]
+
+            llm_meta = health_llm()
+            provider_effective = str(llm_meta.get("provider_effective") or llm_meta.get("provider") or "mock")
+            model = str(llm_meta.get("model") or "")
+
+            start_llm = time.perf_counter()
+            try:
+                out = generate_questions_and_quick_replies(
+                    {
+                        "request_id": request_id,
+                        "session_id": session_id,
+                        "profession_query": pq,
+                        "last_user_message": last_user_message,
+                        "missing_fields": missing_for_llm,
+                    }
+                )
+                latency_ms = round((time.perf_counter() - start_llm) * 1000, 2)
+                questions = out.get("questions") if isinstance(out, dict) else None
+                q_list = questions if isinstance(questions, list) else []
+                q_strs = [str(x).strip() for x in q_list if isinstance(x, str) and str(x).strip()]
+                quick = out.get("quick_replies") if isinstance(out, dict) else None
+                qr_list = quick if isinstance(quick, list) else []
+                qr_strs = [str(x).strip() for x in qr_list if isinstance(x, str) and str(x).strip()][:6]
+
+                last_q = str(st.get("last_question") or "")
+                question = q_strs[0] if q_strs else ""
+                if question and last_q and question == last_q and len(q_strs) > 1:
+                    question = q_strs[1]
+                if not question or len(question) < 10:
+                    # Guaranteed non-empty fallback.
+                    question = "Уточни, пожалуйста: какой уровень нужен и где искать кандидата?"
+                    qr_strs = qr_strs or ["Junior", "Middle", "Senior", "Москва", "Удалённо"][:6]
+
+                llm_used = provider_effective != "mock"
+
+                log_event(
+                    "llm_brief_question",
+                    request_id=request_id,
+                    session_id=session_id,
+                    question_idx=int(st.get("question_count") or 0) + 1,
+                    provider_effective=provider_effective,
+                    model=model,
+                    latency_ms=latency_ms,
+                )
+                trace_artifact(
+                    session_id=session_id,
+                    kind="llm_brief_question",
+                    request_id=request_id,
+                    payload_json={
+                        "question_idx": int(st.get("question_count") or 0) + 1,
+                        "provider_effective": provider_effective,
+                        "model": model,
+                        "latency_ms": latency_ms,
+                        "missing_fields": missing_for_llm,
+                    },
+                    meta={"flow": "brief_llm"},
+                )
+
+                # Update state
+                st2 = dict(st)
+                st2["phase"] = "brief_llm"
+                st2["question_count"] = int(st.get("question_count") or 0) + 1
+                st2["last_question"] = question
+                st2["last_quick_replies"] = qr_strs
+                if next_field and next_field not in asked_fields:
+                    asked_fields.append(next_field)
+                st2["asked_fields"] = asked_fields
+                bs["llm_brief"] = st2
+                return question, qr_strs, llm_used
+            except Exception as e:
+                latency_ms = round((time.perf_counter() - start_llm) * 1000, 2)
+                log_event(
+                    "llm_brief_error",
+                    level="error",
+                    request_id=request_id,
+                    session_id=session_id,
+                    provider_effective=str(llm_meta.get("provider_effective") or "mock"),
+                    model=model,
+                    latency_ms=latency_ms,
+                    error_class=e.__class__.__name__,
+                    reason=str(e)[:300],
+                )
+                trace_artifact(
+                    session_id=session_id,
+                    kind="llm_brief_error",
+                    request_id=request_id,
+                    payload_json={
+                        "provider_effective": str(llm_meta.get("provider_effective") or "mock"),
+                        "model": model,
+                        "latency_ms": latency_ms,
+                        "error_class": e.__class__.__name__,
+                        "reason": str(e)[:300],
+                    },
+                    meta={"flow": "brief_llm"},
+                )
+                return "Не получилось обратиться к LLM, попробуйте ещё раз.", [], False
 
         def _intro_asked_count(bs: dict) -> int:
             try:
@@ -3828,7 +4015,7 @@ def chat_message(body: ChatMessage, request: Request):
             except Exception:
                 return 0
 
-        def _intro_reply(payload: dict) -> dict:
+        def _intro_reply(payload: dict, *, llm_used: bool = False) -> dict:
             # Keep backward-compatible keys (reply/assistant_text/brief_state), but prefer new UI contract.
             question_text = str(payload.get("question_text") or "")
             out = {
@@ -3849,6 +4036,7 @@ def chat_message(body: ChatMessage, request: Request):
                 "brief_state": brief_state,
                 "documents_ready": False,
                 "documents": [],
+                "llm_used": bool(llm_used),
             }
             # intro_done carries docs payload for UI.
             if out.get("type") == "intro_done":
@@ -4095,6 +4283,41 @@ def chat_message(body: ChatMessage, request: Request):
 
         # Start flow.
         if msg_type in {"intro_start", "intro"}:
+            # If entry_mode is questions, we can start LLM-driven flow immediately.
+            em = str((brief_state or {}).get("entry_mode") or "").strip().upper() or "C"
+            if em == "C":
+                q, qrs, llm_used = _llm_brief_next_question(
+                    bs=brief_state,
+                    last_user_message="",
+                    request_id=request_id,
+                    session_id=sid,
+                )
+                payload = {
+                    "type": "intro_question",
+                    "question_text": q,
+                    "target_field": None,
+                    "progress": {"asked": int(_brief_llm_state(brief_state).get("question_count") or 0), "max": intro_engine.MAX_INTRO_QUESTIONS, "remaining": 0},
+                    "quick_replies": qrs,
+                    "ui_mode": "free_text",
+                    "brief_snapshot": intro_engine.brief_snapshot_p0(brief_state),
+                    "ready_to_search": False,
+                    "missing_fields": _missing_fields(brief_state),
+                }
+                try:
+                    add_message(sid, "assistant", q, request_id=request_id)
+                    update_session(
+                        sid,
+                        chat_state="brief_llm",
+                        phase="INTRO_P0",
+                        brief_state=brief_state,
+                        request_id=request_id,
+                    )
+                except Exception:
+                    pass
+                resp = _intro_reply(payload, llm_used=llm_used)
+                resp["brief_state"] = brief_state
+                return resp
+
             brief_state, payload = intro_engine.intro_start(brief_state)
             asked_idx = int(((payload.get("progress") or {}).get("asked") or 0))
             trace_artifact(
@@ -4115,7 +4338,7 @@ def chat_message(body: ChatMessage, request: Request):
                 )
             except Exception:
                 pass
-            resp = _intro_reply(payload)
+            resp = _intro_reply(payload, llm_used=False)
             resp["brief_state"] = brief_state
             return resp
 
@@ -4125,6 +4348,65 @@ def chat_message(body: ChatMessage, request: Request):
                 add_message(sid, "user", text, request_id=request_id)
             except Exception:
                 pass
+
+        # LLM brief loop: for questions mode, every user answer triggers next LLM question.
+        em = str((brief_state or {}).get("entry_mode") or "").strip().upper() or "C"
+        if em == "C":
+            # If user message is just mode selection, don't treat it as an answer; return cached question or generate if missing.
+            st = _brief_llm_state(brief_state)
+            if _is_mode_questions_text(text) or _is_mode_vacancy_text(text):
+                last_q = str(st.get("last_question") or "")
+                last_qrs = st.get("last_quick_replies") if isinstance(st.get("last_quick_replies"), list) else []
+                if last_q and len(last_q) >= 10:
+                    payload = {
+                        "type": "intro_question",
+                        "question_text": last_q,
+                        "target_field": None,
+                        "progress": {"asked": int(st.get("question_count") or 0), "max": intro_engine.MAX_INTRO_QUESTIONS, "remaining": 0},
+                        "quick_replies": [str(x) for x in last_qrs if str(x).strip()][:6],
+                        "ui_mode": "free_text",
+                        "brief_snapshot": intro_engine.brief_snapshot_p0(brief_state),
+                        "ready_to_search": False,
+                        "missing_fields": _missing_fields(brief_state),
+                    }
+                    resp = _intro_reply(payload, llm_used=(str(health_llm().get("provider_effective") or "mock") != "mock"))
+                    resp["brief_state"] = brief_state
+                    return resp
+
+            q, qrs, llm_used = _llm_brief_next_question(
+                bs=brief_state,
+                last_user_message=text,
+                request_id=request_id,
+                session_id=sid,
+            )
+            payload = {
+                "type": "intro_question",
+                "question_text": q,
+                "target_field": None,
+                "progress": {"asked": int(_brief_llm_state(brief_state).get("question_count") or 0), "max": intro_engine.MAX_INTRO_QUESTIONS, "remaining": 0},
+                "quick_replies": qrs,
+                "ui_mode": "free_text",
+                "brief_snapshot": intro_engine.brief_snapshot_p0(brief_state),
+                "ready_to_search": False,
+                "missing_fields": _missing_fields(brief_state),
+            }
+            try:
+                update_session(
+                    sid,
+                    chat_state="brief_llm",
+                    phase="INTRO_P0",
+                    brief_state=brief_state,
+                    request_id=request_id,
+                )
+            except Exception:
+                pass
+            try:
+                add_message(sid, "assistant", q, request_id=request_id)
+            except Exception:
+                pass
+            resp = _intro_reply(payload, llm_used=llm_used)
+            resp["brief_state"] = brief_state
+            return resp
 
         def _llm_extract_wrapper(field_name: str, user_text: str, bs: dict, pq: str):
             try:
@@ -4215,7 +4497,7 @@ def chat_message(body: ChatMessage, request: Request):
         except Exception:
             pass
 
-        resp = _intro_reply(payload)
+        resp = _intro_reply(payload, llm_used=False)
         resp["brief_state"] = brief_state
 
         if resp.get("type") == "intro_done":

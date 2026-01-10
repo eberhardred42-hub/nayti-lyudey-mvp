@@ -210,6 +210,19 @@
   border-bottom: 1px solid #ccc;
 }
 
+.llmPill {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  margin-right: 8px;
+  background: rgba(16, 185, 129, 0.12);
+  color: #047857;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  vertical-align: middle;
+}
+
 .freeReportBox {
   margin-top: 16px;
   padding: 16px 0;
