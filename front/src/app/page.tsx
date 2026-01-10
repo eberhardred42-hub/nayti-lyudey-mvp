@@ -131,6 +131,14 @@ export default function Page() {
     correctionRef.current?.focus();
   }, [correctionMode]);
 
+  useEffect(() => {
+    if (view !== "done") return;
+    if (!userToken) return;
+    if (!lockedDocs.length) return;
+    if (meBalance !== null) return;
+    void loadMeBalance();
+  }, [view, userToken, lockedDocs.length, meBalance]);
+
   const canSend = useMemo(() => {
     if (loading) return false;
     if (!sessionId) return false;
@@ -480,6 +488,22 @@ export default function Page() {
     return keys.map((k) => ({ k, v: renderValue(snap[k]) }));
   }, [briefSnapshot]);
 
+  const selectedPaidDocsCostRub = useMemo(() => {
+    if (!selectedPaidDocIds.length) return 0;
+    const byId = new Map<string, number>();
+    for (const d of lockedDocs) byId.set(String(d.id), Number(d.price_rub || 0));
+    return selectedPaidDocIds.reduce((sum, id) => {
+      const price = byId.get(id);
+      // Fallback for safety; backend price is currently fixed, but UI should not hard-fail.
+      const rub = typeof price === "number" && price > 0 ? price : 150;
+      return sum + rub;
+    }, 0);
+  }, [selectedPaidDocIds, lockedDocs]);
+
+  const balanceKnown = Boolean(userToken) && meBalance !== null;
+  const insufficientFunds = balanceKnown && selectedPaidDocsCostRub > (meBalance as number);
+  const shortfallRub = insufficientFunds ? selectedPaidDocsCostRub - (meBalance as number) : 0;
+
   return (
     <div className={styles.container}>
       <div className={styles.topRightActions}>
@@ -687,7 +711,11 @@ export default function Page() {
                     <div className={styles.lockedActions}>
                       <button
                         className={styles.fullPackageBtn}
-                        disabled={!selectedPaidDocIds.length || docGenBusy}
+                        disabled={
+                          !selectedPaidDocIds.length ||
+                          docGenBusy ||
+                          (userToken ? meBalance === null || insufficientFunds : false)
+                        }
                         onClick={() => void generateSelectedPaidDocs()}
                       >
                         {docGenBusy ? "Генерирую…" : `Купить и сгенерировать (${selectedPaidDocIds.length})`}
@@ -696,6 +724,21 @@ export default function Page() {
                         Сбросить
                       </button>
                     </div>
+
+                    {selectedPaidDocIds.length ? (
+                      <div className={styles.lockedHint}>
+                        Стоимость выбранного: <b>{selectedPaidDocsCostRub} ₽</b>
+                        {userToken && meBalance === null ? (
+                          <> · Загружаю баланс…</>
+                        ) : null}
+                        {insufficientFunds ? (
+                          <>
+                            <br />
+                            Недостаточно средств: на балансе <b>{meBalance} ₽</b>, не хватает <b>{shortfallRub} ₽</b>.
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
 
                     {generatedDocs.length ? (
                       <div className={styles.docsSection}>

@@ -14,7 +14,7 @@
 
 ## Последние изменения (кратко)
 
-- v2.14: Offer auto-heal: при 412 offer_not_accepted UI сам подтверждает оферту через API и повторяет генерацию.
+- v2.15: UX insufficient funds: считаем стоимость выбранного, подгружаем баланс, дизейблим покупку при нехватке.
 - v2.12: DEV E2E journey: entry modes (A/C) + offer checkbox auth + /me balance + paid doc debit(150) + artifacts in /admin/logs + Product Smoke workflow.
 - v2.11: Intro P0: детерминированный бриф ≤10 вопросов + STOP rule; UI confirm/correct; `intro_done` показывает free previews и locked docs без автогенерации.
 - v2.10: DEV Deploy: добавлен итоговый summary (локал/домен/пинг/смоук) прямо в GitHub Actions run.
