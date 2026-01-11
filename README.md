@@ -109,6 +109,29 @@ docker compose -f infra/docker-compose.yml up --build
 bash tests/quick-test.sh
 ```
 
+## Как включить LLM локально
+
+По умолчанию (без LLM-настроек) backend работает в режиме `mock`.
+
+1) Скопируйте пример окружения:
+
+```bash
+cp .env.example .env
+```
+
+2) Заполните в `.env`:
+
+- `LLM_PROVIDER=openai_compat`
+- `LLM_BASE_URL=https://api.openai.com/v1` (или другой OpenAI-compatible)
+- `LLM_API_KEY=...`
+- `LLM_MODEL=gpt-4o-mini`
+
+3) Проверьте статус:
+
+- `GET /api/health/llm` (через UI прокси) или `GET /health/llm` (на backend напрямую)
+
+Ожидание при корректной настройке: `provider_effective=openai_compat` и `ok=true`.
+
 ## LLM: переключение провайдера (через env)
 
 Коротко (цель на сегодня — Groq, без правок кода):

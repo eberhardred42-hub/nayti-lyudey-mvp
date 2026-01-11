@@ -21,6 +21,51 @@
   z-index: 50;
 }
 
+.llmBanner {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  max-width: min(720px, calc(100vw - 32px - 110px));
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px solid rgba(0, 0, 0, 0.2);
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(6px);
+  z-index: 40;
+}
+
+.llmBannerWarn {
+  border-color: rgba(200, 80, 0, 0.45);
+}
+
+.llmBannerOk {
+  border-color: rgba(0, 120, 60, 0.35);
+}
+
+.llmBannerText {
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.85);
+  line-height: 1.35;
+}
+
+.llmBannerClose {
+  width: 32px;
+  height: 32px;
+  border-radius: 9999px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.llmBannerClose:hover {
+  background: rgba(0, 0, 0, 0.06);
+}
+
 .iconCircleBtn {
   width: 44px;
   height: 44px;

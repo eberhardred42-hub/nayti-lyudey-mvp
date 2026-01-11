@@ -32,7 +32,7 @@ services:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379/0}
       - RENDER_URL=${RENDER_URL:-http://render:8000}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
-      - LLM_PROVIDER=${LLM_PROVIDER:-mock}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
@@ -146,7 +146,7 @@ services:
       - RENDER_URL=${RENDER_URL:-http://render:8000}
       - RENDER_TIMEOUT_SEC=${RENDER_TIMEOUT_SEC:-120}
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
-      - LLM_PROVIDER=${LLM_PROVIDER:-mock}
+      - LLM_PROVIDER=${LLM_PROVIDER:-}
       - LLM_BASE_URL=${LLM_BASE_URL:-}
       - LLM_API_KEY=${LLM_API_KEY:-}
       - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}

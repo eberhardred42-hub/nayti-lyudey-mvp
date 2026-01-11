@@ -30,6 +30,16 @@ type View = "start" | "intro" | "done";
 
 type EntryMode = "A" | "C";
 
+type LlmHealth = {
+  ok?: boolean;
+  provider_effective?: string;
+  provider?: string;
+  reason?: string;
+  model?: string;
+  base_url?: string;
+  key_present?: boolean;
+};
+
 function asRecord(v: unknown): Record<string, unknown> | null {
   if (!v || typeof v !== "object") return null;
   return v as Record<string, unknown>;
@@ -105,6 +115,9 @@ export default function Page() {
   const [errorText, setErrorText] = useState<string | null>(null);
   const [payModalOpen, setPayModalOpen] = useState(false);
 
+  const [llmHealth, setLlmHealth] = useState<LlmHealth | null>(null);
+  const [llmBannerDismissed, setLlmBannerDismissed] = useState(false);
+
   const boxRef = useRef<HTMLDivElement | null>(null);
   const correctionRef = useRef<HTMLInputElement | null>(null);
 
@@ -117,6 +130,30 @@ export default function Page() {
     return () => {
       window.removeEventListener("storage", sync);
       window.removeEventListener("nly-auth-changed", sync);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const dismissed = window.localStorage.getItem("nly_llm_banner_dismissed") === "1";
+    if (dismissed) setLlmBannerDismissed(true);
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/health/llm", { method: "GET", cache: "no-store" });
+        const data = await readJsonSafe(r);
+        const obj = asRecord(data);
+        if (!obj) return;
+        if (cancelled) return;
+        setLlmHealth(obj as LlmHealth);
+      } catch {
+        // ignore
+      }
+    })();
+
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -526,6 +563,45 @@ export default function Page() {
 
   return (
     <div className={styles.container}>
+      {view === "start" && llmHealth && !llmBannerDismissed ? (
+        <div
+          className={`${styles.llmBanner} ${
+            String(llmHealth.provider_effective || llmHealth.provider || "mock") === "mock"
+              ? styles.llmBannerWarn
+              : styles.llmBannerOk
+          }`}
+          role="status"
+        >
+          <div className={styles.llmBannerText}>
+            {String(llmHealth.provider_effective || llmHealth.provider || "mock") === "mock" ? (
+              <>
+                ИИ выключен: provider=mock (reason={String(llmHealth.reason || "unknown")}). Включите LLM_* в env.
+              </>
+            ) : (
+              <>
+                ИИ включен: provider={String(llmHealth.provider_effective || llmHealth.provider || "unknown")}
+                {llmHealth.model ? ` (model=${String(llmHealth.model)})` : ""}
+              </>
+            )}
+          </div>
+          <button
+            type="button"
+            className={styles.llmBannerClose}
+            aria-label="Скрыть уведомление"
+            onClick={() => {
+              setLlmBannerDismissed(true);
+              try {
+                window.localStorage.setItem("nly_llm_banner_dismissed", "1");
+              } catch {
+                // ignore
+              }
+            }}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
+
       <div className={styles.topRightActions}>
         <button
           className={styles.iconCircleBtn}
